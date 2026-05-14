@@ -1,0 +1,90 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Reset & base ─────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #0D1117;
+  color: #E6EDF3;
+  font-family: 'Outfit', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #161B22; }
+::-webkit-scrollbar-thumb { background: #30363D; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #7B42BC; }
+
+/* ── Layout: 3-panel split ────────────────────────────────────────────────── */
+.split-panel {
+  display: flex;
+  overflow: hidden;
+}
+.panel-left {
+  width: 260px;
+  min-width: 260px;
+  overflow-y: auto;
+  border-right: 1px solid #30363D;
+  background: #161B22;
+}
+.panel-center {
+  flex: 1;
+  overflow-y: auto;
+  background: #0D1117;
+  min-width: 0;
+}
+.panel-right {
+  width: 480px;
+  min-width: 380px;
+  border-left: 1px solid #30363D;
+  background: #161B22;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Animations ───────────────────────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.2s ease forwards; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@keyframes pulse-border {
+  0%, 100% { border-color: #7B42BC; }
+  50%       { border-color: #9F6FD0; }
+}
+
+/* ── Code / mono areas ────────────────────────────────────────────────────── */
+.code-area {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+/* ── Form inputs (global resets for select/input inside dark panels) ─────── */
+input[type="text"],
+input[type="number"],
+input[type="email"],
+textarea,
+select {
+  color: #E6EDF3;
+  background: #0D1117;
+  border: 1px solid #30363D;
+  border-radius: 6px;
+  font-family: 'Outfit', sans-serif;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: #7B42BC;
+}
+select option { background: #161B22; }
+
+/* ── Utility helpers ──────────────────────────────────────────────────────── */
+.text-muted  { color: #8B949E; }
+.text-accent { color: #7B42BC; }
