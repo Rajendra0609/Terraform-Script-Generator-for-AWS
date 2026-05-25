@@ -1,0 +1,52 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: tfgen
+      POSTGRES_PASSWORD: tfgen123
+      POSTGRES_DB: terraform_generator
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tfgen -d terraform_generator"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      HOST: 0.0.0.0
+      # CORS_ORIGIN must allow the browser origin (not the docker network address)
+      CORS_ORIGIN: http://localhost:3000
+      DATABASE_URL: postgresql://tfgen:tfgen123@postgres:5432/terraform_generator
+      JWT_SECRET: tfgen-change-this-in-production-use-a-strong-secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # REACT_APP_* are BUILD-TIME vars in CRA — they must be passed as build args.
+        # The browser makes requests from the user's machine, so localhost:4000 is
+        # the backend port exposed on the host (not the docker network).
+        REACT_APP_API_URL: http://localhost:4000
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
