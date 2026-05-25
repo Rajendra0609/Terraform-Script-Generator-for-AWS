@@ -2,7 +2,7 @@ name: Node.js CI with Docker
 
 on:
   push:
-    branches: [ "bugs_fix1" ]
+    branches: [ "Rajendra0609-patch-1" ]
   pull_request:
     branches: [ "Rajendra0609-patch-1" ]
 
