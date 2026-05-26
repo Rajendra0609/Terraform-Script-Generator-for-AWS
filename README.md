@@ -528,7 +528,7 @@ tfgen_v14_fixed/
     ├── PRODUCT_ROADMAP.md
     └── screenshots/           ← UI screenshots used in this README
 ```
-
+npm install -D tailwindcss postcss autoprefixer
 ---
 
 ## 📜 License
