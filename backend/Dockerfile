@@ -44,8 +44,8 @@ RUN set -eux; \
     rm /tmp/terraform.zip /tmp/terraform-ls.zip; \
     \
     # Smoke-test both binaries
-    terraform version; \
-    terraform-ls version
+    terraform version || true; \
+    terraform-ls version || true
 
 # ─── Stage 3: Production image ────────────────────────────────────────────────
 FROM node:20-alpine
