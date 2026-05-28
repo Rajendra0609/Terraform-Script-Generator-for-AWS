@@ -534,6 +534,19 @@ tfgen_v14_fixed/
     ├── PRODUCT_ROADMAP.md
     └── screenshots/           ← UI screenshots used in this README
 ```
+What migrate.js Does
+This is a database migration runner for your TFGen project. It manages and applies SQL schema changes to your PostgreSQL database in a controlled, sequential way.
+
+Core Problem It Solves
+When your app evolves, your database schema changes — new tables, new columns, constraints, etc. Without a migration tool, you'd manually run SQL scripts and lose track of what's been applied where (local, staging, prod). This script automates that.
+
+How It Works — Step by Step
+1. Discovers migration files from the database/ folder
+Files must follow the naming pattern: 001_initial_schema.sql, 002_add_user_role.sql, etc.
+2. Tracks what's already applied via a schema_migrations table it creates automatically in Postgres — so re-running is always safe.
+3. Applies only pending migrations in order, each wrapped in a transaction — if a migration fails, it rolls back and exits, so your DB is never left half-migrated.
+
+npm install pg
 
 ---
 
