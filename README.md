@@ -547,7 +547,15 @@ Files must follow the naming pattern: 001_initial_schema.sql, 002_add_user_role.
 3. Applies only pending migrations in order, each wrapped in a transaction — if a migration fails, it rolls back and exits, so your DB is never left half-migrated.
 
 npm install pg
+npm install pg dotenv
+# Check status first
+node migrate.js --status
 
+# Dry run — see what SQL will execute
+node migrate.js --dry-run
+
+# Apply all pending migrations
+node migrate.js
 ---
 
 ## 📜 License
