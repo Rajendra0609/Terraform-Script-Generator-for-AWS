@@ -53,7 +53,16 @@ export function AuthProvider({ children }) {
   const login = useCallback(async (email, password) => {
     const res = await API.post('/api/auth/login', { email, password });
     const at = res.data.token || res.data.accessToken;
-    if (at) setToken(at);
+    if (at) {
+      // BUG-FIX: Set the axios header synchronously HERE, before calling
+      // setUser(). setUser() triggers a re-render of every component that
+      // consumes useAuth() (e.g. Navbar). Those components fire their own
+      // useEffect API calls immediately during that render cycle — before
+      // the useEffect([token]) below has a chance to run. Without setting
+      // the header here, those calls go out with no Bearer token → 401.
+      API.defaults.headers.common['Authorization'] = `Bearer ${at}`;
+      setToken(at);
+    }
     setUser(res.data.user);
     return res.data;
   }, []);
@@ -61,7 +70,11 @@ export function AuthProvider({ children }) {
   const register = useCallback(async (email, password) => {
     const res = await API.post('/api/auth/register', { email, password });
     const at = res.data.token || res.data.accessToken;
-    if (at) setToken(at);
+    if (at) {
+      // Same fix as login() above — set header synchronously before setUser()
+      API.defaults.headers.common['Authorization'] = `Bearer ${at}`;
+      setToken(at);
+    }
     setUser(res.data.user);
     return res.data;
   }, []);

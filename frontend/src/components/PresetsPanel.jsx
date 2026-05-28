@@ -315,11 +315,12 @@ export default function PresetsPanel({ onApply, onClose }) {
   return (
     <div className="flex flex-col h-full bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-        <div>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+        	<div>
           <h2 className="text-sm font-bold text-gray-900 dark:text-white">Architecture Presets</h2>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">One-click best-practice patterns</p>
+          <p className="text-xs text-gray-700 dark:text-gray-300 mt-0.5">One-click best-practice patterns</p>
         </div>
+
         <button onClick={onClose} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-lg leading-none">×</button>
       </div>
 
@@ -332,13 +333,14 @@ export default function PresetsPanel({ onApply, onClose }) {
             className={`text-xs px-2.5 py-1 rounded-full font-medium transition-colors ${
               activeCategory === cat
                 ? 'bg-blue-600 text-white'
-                : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'
+                : 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'
             }`}
           >
             {cat}
           </button>
         ))}
       </div>
+
 
       {/* Preset list */}
       <div className="flex-1 overflow-y-auto p-3 space-y-2">
@@ -355,13 +357,16 @@ export default function PresetsPanel({ onApply, onClose }) {
                   <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${COMPLEXITY_COLOR[preset.complexity]}`}>
                     {preset.complexity}
                   </span>
-                  <span className="text-[10px] text-gray-400 dark:text-gray-500">{preset.category}</span>
+                  <span className="text-[10px] text-gray-600 dark:text-gray-400">{preset.category}</span>
+
                 </div>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 leading-relaxed">{preset.description}</p>
+                <p className="text-xs text-gray-700 dark:text-gray-300 mt-0.5 leading-relaxed">{preset.description}</p>
+
 
                 {/* Resource count */}
                 <div className="flex items-center gap-2 mt-1.5">
-                  <span className="text-[10px] text-gray-400">{preset.resources.length} resources</span>
+                  <span className="text-[10px] text-gray-600">{preset.resources.length} resources</span>
+
                   <button
                     onClick={() => setExpanded(expanded === preset.id ? null : preset.id)}
                     className="text-[10px] text-blue-500 hover:text-blue-600 dark:text-blue-400"
@@ -373,7 +378,8 @@ export default function PresetsPanel({ onApply, onClose }) {
                 {/* Why tooltip */}
                 {expanded === preset.id && (
                   <div className="mt-2 p-2 rounded bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800">
-                    <p className="text-xs text-blue-800 dark:text-blue-200 leading-relaxed">{preset.why}</p>
+                    <p className="text-xs text-blue-900 dark:text-blue-100 leading-relaxed">{preset.why}</p>
+
                   </div>
                 )}
 

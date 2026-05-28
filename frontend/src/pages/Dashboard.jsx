@@ -1,13 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { useTheme } from '../contexts/ThemeContext';
 import { projectsAPI } from '../api/client';
 import { AWS_REGIONS } from '../utils/awsRegions';
 
 export default function Dashboard() {
   const { user } = useAuth();
-  const { c } = useTheme();
   const nav = useNavigate();
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);

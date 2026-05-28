@@ -457,7 +457,6 @@ function ValueChip({ val, fg2, fg3 }) {
   const isRef   = /^(aws_|data\.|module\.|var\.|local\.)/.test(val);
   const isBool  = val === 'true' || val === 'false';
   const isNum   = /^\d+$/.test(val);
-  const isStr   = !isRef && !isBool && !isNum;
 
   const color = isRef  ? '#60a5fa'
               : isBool ? (val === 'true' ? '#4ade80' : '#f87171')
@@ -564,7 +563,6 @@ function BlockCard({ block, index, c }) {
 
   const { type, labels, body } = block;
   const resourceType = type === 'resource' ? labels[0] : null;
-  const resourceName = type === 'resource' ? labels[1] : (labels[0] || null);
   const kb     = resourceType ? (RESOURCE_KB[resourceType] || null) : null;
   const color  = kb?.color || '#64748b';
   const icon   = kb?.icon  || (type === 'variable' ? '🔧' : type === 'output' ? '📤' : type === 'provider' ? '🔌' : '📦');

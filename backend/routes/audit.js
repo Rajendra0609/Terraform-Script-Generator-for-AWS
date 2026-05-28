@@ -11,6 +11,13 @@ router.use(authMiddleware, requireRole('admin'));
 
 router.get('/', async (req, res) => {
   const { action, user, from, to, limit = 50, offset = 0 } = req.query;
+
+  // BUG-003 fix: validate user as a UUID before it reaches the DB query.
+  // Without this, a non-UUID value causes PostgreSQL to throw
+  // "invalid input syntax for type uuid", leaking a raw 500 to the admin client.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (user && !UUID_RE.test(user)) return res.status(400).json({ error: 'Invalid user UUID' });
+
   const conditions = [];
   const params = [];
 

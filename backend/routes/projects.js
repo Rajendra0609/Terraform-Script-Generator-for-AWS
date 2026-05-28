@@ -8,6 +8,51 @@ const { audit, attachAuditResponseHook } = require('../middleware/audit');
 
 router.use(attachAuditResponseHook);
 
+// ─── BUG-019 fix: run ALTER TABLE migration once at module load time ──────────
+// Previously these ALTER TABLE statements ran inside every POST /:id/resources
+// transaction.  ALTER TABLE acquires an AccessExclusiveLock which blocks all
+// concurrent reads and writes, causing visible latency spikes on a busy server.
+// We now check information_schema once, run any missing-column migrations, and
+// set a flag so the per-request handler can skip the block entirely.
+const MIGRATE_COLS = [
+  { col: 'variables',         type: 'JSONB',        def: "'{}'::jsonb" },
+  { col: 'outputs',           type: 'JSONB',        def: "'{}'::jsonb" },
+  { col: 'is_module',         type: 'BOOLEAN',      def: 'false' },
+  { col: 'module_source',     type: 'VARCHAR(500)',  def: "''" },
+  { col: 'lifecycle_config',  type: 'JSONB',        def: "'{}'::jsonb" },
+  { col: 'position_x',        type: 'NUMERIC',      def: '0' },
+  { col: 'position_y',        type: 'NUMERIC',      def: '0' },
+  { col: 'annotations',       type: 'TEXT',         def: "''" },
+  { col: 'security_findings', type: 'JSONB',        def: "'[]'::jsonb" },
+];
+let _resourcesColumnsReady = false;
+
+async function ensureResourceColumns() {
+  if (_resourcesColumnsReady) return;
+  try {
+    const existing = await db.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'resources'`
+    );
+    const present = new Set(existing.rows.map(r => r.column_name));
+    for (const { col, type, def } of MIGRATE_COLS) {
+      if (!present.has(col)) {
+        await db.query(
+          `ALTER TABLE resources ADD COLUMN IF NOT EXISTS ${col} ${type} DEFAULT ${def}`
+        );
+      }
+    }
+    _resourcesColumnsReady = true;
+  } catch (err) {
+    // Non-fatal: log and allow the first request to attempt a fallback below.
+    console.error('[projects] ensureResourceColumns error:', err.message);
+  }
+}
+
+// Kick off the startup migration (fire-and-forget; errors are logged above).
+ensureResourceColumns();
+
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 /**
  * Check that the requesting user owns or is a member of the project.
@@ -172,30 +217,11 @@ router.post('/:id/resources', authMiddleware, audit('project.resources.save'), a
   try {
     await client.query('BEGIN');
 
-    // ── Auto-migrate: ensure all expected columns exist ──────────────────────
-    // This prevents save failures on DBs that haven't run the latest migration.
-    const migrateCols = [
-      { col: 'variables',         type: 'JSONB',        def: "'{}'" },
-      { col: 'outputs',           type: 'JSONB',        def: "'{}'" },
-      { col: 'is_module',         type: 'BOOLEAN',      def: 'false' },
-      { col: 'module_source',     type: 'VARCHAR(500)',  def: "''" },
-      { col: 'lifecycle_config',  type: 'JSONB',        def: "'{}'" },
-      { col: 'position_x',        type: 'NUMERIC',      def: '0' },
-      { col: 'position_y',        type: 'NUMERIC',      def: '0' },
-      { col: 'annotations',       type: 'TEXT',         def: "''" },
-      { col: 'security_findings', type: 'JSONB',        def: "'[]'" },
-    ];
-    for (const { col, type, def } of migrateCols) {
-      await client.query('SAVEPOINT sp_migrate');
-      try {
-        await client.query(
-          `ALTER TABLE resources ADD COLUMN IF NOT EXISTS ${col} ${type} DEFAULT ${def}`
-        );
-        await client.query('RELEASE SAVEPOINT sp_migrate');
-      } catch {
-        await client.query('ROLLBACK TO SAVEPOINT sp_migrate');
-      }
-    }
+    // BUG-019 fix: column migration moved to ensureResourceColumns() at module
+    // load time. ALTER TABLE acquires AccessExclusiveLock and must not run inside
+    // every per-request transaction. If startup migration hasn't completed yet,
+    // retry it here; the IF NOT EXISTS guards make it idempotent.
+    if (!_resourcesColumnsReady) await ensureResourceColumns();
 
     // Detect whether the `annotations` column is jsonb or text so we can
     // construct an INSERT that matches the DB schema (some deployments
@@ -475,6 +501,15 @@ router.post('/:id/versions', authMiddleware, audit('project.version.save'), asyn
     );
     res.status(201).json(result.rows[0]);
   } catch (e) {
+    // FIX: INSERT…SELECT MAX+1 is not atomic under concurrent load; two requests
+    // reading the same MAX both compute the same next version number and hit the
+    // UNIQUE(project_id, version_number) constraint.  Catch PG error 23505 and
+    // surface a 409 Conflict instead of an opaque 500, so callers can retry.
+    if (e.code === '23505') {
+      return res.status(409).json({
+        error: 'Version number conflict — another save is in progress. Please retry.',
+      });
+    }
     console.error('[projects] Save version error:', e.message);
     res.status(500).json({ error: 'Failed to save version: ' + e.message });
   }
@@ -544,6 +579,7 @@ router.post('/:id/members', authMiddleware, requireRole('user'), audit('project.
 });
 
 router.delete('/:id/members/:userId', authMiddleware, audit('project.member.remove'), async (req, res) => {
+  if (!UUID_RE.test(req.params.userId)) return res.status(400).json({ error: 'Invalid user ID' });
   const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
   if (!project) return;
   if (project.user_id !== req.user.id && req.user.role !== 'admin') {
@@ -561,6 +597,7 @@ router.delete('/:id/members/:userId', authMiddleware, audit('project.member.remo
 // out.  Only the invitee themselves may accept their own invitation.
 router.put('/:id/members/:userId/accept', authMiddleware, audit('project.member.accept'), async (req, res) => {
   // Only the invited user may accept their own invitation.
+  if (!UUID_RE.test(req.params.userId)) return res.status(400).json({ error: 'Invalid user ID' });
   if (req.user.id !== req.params.userId) {
     return res.status(403).json({ error: 'You can only accept your own invitation' });
   }

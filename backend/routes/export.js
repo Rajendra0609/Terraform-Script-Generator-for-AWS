@@ -106,6 +106,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
+          # TODO: Replace with your actual IAM Role ARN if shown as ACCOUNT_ID placeholder
           role-to-assume: "${safeRoleArn}"
           aws-region: \${{ env.AWS_REGION }}
 
@@ -182,7 +183,17 @@ ${enableApply ? `
       #   run: terraform apply -auto-approve -input=false
 `}`;
 
-  res.json({ filename: '.github/workflows/terraform.yml', content: yaml });
+  const warnings = [];
+  if (!roleArn) {
+    warnings.push(
+      'roleArn was not provided. The generated workflow YAML contains a literal ' +
+      '"arn:aws:iam::ACCOUNT_ID:role/TFGenGitHubActionsRole" placeholder. ' +
+      'Replace it with your actual IAM Role ARN before committing — GitHub Actions ' +
+      'will fail with a confusing AWS authentication error if the placeholder is ' +
+      'used as-is.'
+    );
+  }
+  res.json({ filename: '.github/workflows/terraform.yml', content: yaml, warnings });
 });
 
 // ─── GitLab CI ────────────────────────────────────────────────────────────────

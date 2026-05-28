@@ -133,7 +133,13 @@ JWT_REFRESH_EXPIRY=7d
 
 NODE_ENV=development
 CORS_ORIGIN=http://localhost:3000
+# Optional: override the Terraform Language Server executable path used by Studio
+# features. If `terraform-ls` is not on PATH, set the full path here.
+# TF_LSP_PATH=/usr/local/bin/terraform-ls
 ```
+
+`terraform-ls` must be installed on the backend system for Studio editor LSP features.
+Install it from HashiCorp releases or your operating system package manager.
 
 ### 4 — Configure Frontend
 

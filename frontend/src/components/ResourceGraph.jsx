@@ -382,7 +382,6 @@ function computeWarnings(resources, edges) {
   const push = (id, msg) => { if (!warnings[id]) warnings[id] = []; warnings[id].push(msg); };
 
   const hasNat = resources.some(r => r.service_type === 'nat_gateway');
-  const hasIgw = resources.some(r => r.service_type === 'internet_gateway' || r.service_type === 'igw');
   const hasRt  = resources.some(r => r.service_type === 'route_table');
 
   for (const r of resources) {
@@ -753,14 +752,18 @@ export default function ResourceGraph({ resources, onChange, onSelect, environme
   useEffect(() => {
     setPositions(prev => {
       const next = { ...prev };
-      resources.forEach((r, i) => {
-        if (!next[r._id]) {
-          next[r._id] = {
-            x: 80 + (i % 4) * (NODE_W + 48),
-            y: 60 + Math.floor(i / 4) * (NODE_H + 56),
-          };
-        }
-      });
+      // Use smartLayout for any newly-added resources that have no saved position.
+      // This prevents all new nodes from piling up at the same grid offset when
+      // many resources already exist (BUG-027 fix).
+      const hasNew = resources.some(r => !next[r._id]);
+      if (hasNew) {
+        const layoutPos = smartLayout(resources);
+        resources.forEach(r => {
+          if (!next[r._id]) {
+            next[r._id] = layoutPos[r._id] || { x: 80, y: 80 };
+          }
+        });
+      }
       return next;
     });
   }, [resources]);

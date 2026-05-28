@@ -73,6 +73,28 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+// BUG-006 fix: dedicated stricter rate limiter for auth endpoints to prevent
+// brute-force and credential-stuffing attacks. 10 req/15 min per IP is far
+// more appropriate than the global 100 req/15 min limit.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    const ip = req.ip || req.connection?.remoteAddress || '';
+    return TRUSTED_IPS.some(t => t && ip.includes(t));
+  },
+  handler: (req, res) => {
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    logger.warn(`[auth-rate-limit] 429 ${ip} ${req.method} ${req.originalUrl}`);
+    res.set('Retry-After', Math.ceil(15 * 60));
+    res.status(429).json({ error: 'Too many authentication attempts — try again later', retryAfter: 15 * 60 });
+  }
+});
+app.use('/api/auth/login',    authLimiter);
+app.use('/api/auth/register', authLimiter);
+
 // Dev-only request logger: log incoming requests to help trace whether
 // the browser's requests reach the backend. Enabled only in development.
 if (isDev) {
@@ -97,7 +119,20 @@ app.use('/api/auth',      require('./routes/auth'));
 app.use('/api/projects',  require('./routes/projects'));
 app.use('/api/templates', require('./routes/templates'));
 app.use('/api/terraform', require('./routes/terraform'));
-app.use('/api/aws',       require('./routes/aws'));
+
+// aws.js throws a synchronous Error at module load time if ENCRYPT_KEY is
+// absent or set to the insecure default.  Wrap in try/catch so the process
+// exits with a clear fatal message and code 1 rather than an unhandled
+// exception with a cryptic stack trace (which causes unhelpful crashloops
+// in Docker/Kubernetes).
+try {
+  app.use('/api/aws', require('./routes/aws'));
+} catch (err) {
+  console.error('\n[FATAL] Failed to load /routes/aws:', err.message);
+  console.error('[FATAL] Set a strong ENCRYPT_KEY in backend/.env and restart.\n');
+  process.exit(1);
+}
+
 app.use('/api/admin',     require('./routes/admin'));
 app.use('/api/audit',     require('./routes/audit'));    // audit log viewer (admin-only)
 app.use('/api/export',    require('./routes/export'));   // CI/CD pipeline + README generation
@@ -114,9 +149,15 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
 
 // Global error handler
+// BUG-021 fix: previously returned err.message directly, leaking DB table/column
+// names, SQL fragments, and file paths to callers. In production we return a
+// generic message; the full stack is logged server-side only.
 app.use((err, req, res, next) => {
   logger.error(err.stack);
-  res.status(500).json({ error: err.message || 'Internal server error' });
+  const message = process.env.NODE_ENV !== 'production'
+    ? (err.message || 'Internal server error')
+    : 'Internal server error';
+  res.status(500).json({ error: message });
 });
 
 // Troubleshooting note: "Cannot reach backend at http://10.244.24.67:4000"
@@ -199,6 +240,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { initQueue, enqueue, jobEvents } = require('./services/jobQueue');
+const { attachTerraformLspSession } = require('./services/terraformLsp');
 const { runPlan, runValidate, runFmt } = require('./terraform/runner');
 
 // BUG-004 fix: initQueue was never called, so the BullMQ worker was never
@@ -213,7 +255,35 @@ initQueue(async (data, logFn) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws/jobs' });
+
+// Handle WebSocket upgrades before Express middleware
+server.on('upgrade', (req, socket, head) => {
+  // Extract path for routing
+  const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
+  logger.info && logger.info(`[ws-upgrade] ${req.method} ${req.url} origin=${req.headers.origin || ''} host=${req.headers.host || ''}`);
+  try {
+    if (pathname === '/ws/jobs' || pathname.startsWith('/ws/jobs')) {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
+      return;
+    }
+    if (pathname === '/ws/terraform-lsp' || pathname.startsWith('/ws/terraform-lsp')) {
+      lspWss.handleUpgrade(req, socket, head, (ws) => {
+        lspWss.emit('connection', ws, req);
+      });
+      return;
+    }
+    logger.warn && logger.warn(`[ws-upgrade] Unknown websocket path: ${pathname}`);
+    socket.destroy();
+  } catch (err) {
+    logger.error && logger.error('[ws-upgrade] error handling upgrade: ' + (err && err.message));
+    try { socket.destroy(); } catch (_) {}
+  }
+});
+
+const wss = new WebSocketServer({ noServer: true });
+const lspWss = new WebSocketServer({ noServer: true });
 
 wss.on('connection', (ws, req) => {
   // Extract jobId from URL: /ws/jobs?id=<jobId>
@@ -241,11 +311,18 @@ wss.on('connection', (ws, req) => {
   ws.send(JSON.stringify({ type: 'connected', jobId }));
 });
 
+lspWss.on('connection', (ws) => {
+  attachTerraformLspSession(ws, logger);
+});
+
 server.listen(PORT, HOST, () => {
   logger.info(`✅ Backend running on http://${HOST}:${PORT}`);
-  // CORS is enabled with a strict whitelist in development
   logger.debug && logger.debug(`   CORS allowed origins: ${allowedOrigins.join(',')}`);
   logger.info(`   DB: ${process.env.DATABASE_URL ? '✓ configured' : '✗ DATABASE_URL missing!'}`);
+  logger.info(`   TF_LSP_PATH: ${process.env.TF_LSP_PATH || '(unset)'}`);
+  if (!process.env.TF_LSP_PATH) {
+    logger.warn('TF_LSP_PATH is not set in the loaded environment. Please ensure backend/.env is loaded by this process.');
+  }
 
   // ── Auto-migration: ensure all required tables and columns exist ───────────
   // This runs at startup and silently creates anything missing. Safe to run
@@ -346,6 +423,13 @@ server.listen(PORT, HOST, () => {
           diagnostics JSONB,
           ran_at     TIMESTAMP DEFAULT NOW()
         )
+      `).catch(() => {});
+
+      // BUG-022 fix: index on validation_logs to avoid full sequential scans
+      // when filtering by project for validation history features.
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_validation_logs_project
+          ON validation_logs(project_id, ran_at DESC)
       `).catch(() => {});
 
       await db.query(`
@@ -455,6 +539,10 @@ server.listen(PORT, HOST, () => {
         'ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS resource_count INT DEFAULT 0',
         'ALTER TABLE templates ADD COLUMN IF NOT EXISTS data_sources JSONB DEFAULT \'[]\'',
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT \'user\'',
+        // FIX: password-reset columns missing from auto-migration; without these
+        // the UPDATE in POST /api/auth/forgot-password silently touches 0 rows.
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMP',
       ];
       for (const sql of alterStatements) {
         await db.query(sql).catch(() => {});
@@ -476,6 +564,8 @@ server.listen(PORT, HOST, () => {
         // BUG-006 fix: indexes on most-queried tables missing from auto-migration
         'CREATE INDEX IF NOT EXISTS idx_resources_project        ON resources(project_id)',
         'CREATE INDEX IF NOT EXISTS idx_project_versions_project ON project_versions(project_id)',
+        // FIX: partial index for reset-token lookups (sparse column, WHERE avoids indexing NULLs)
+        'CREATE INDEX IF NOT EXISTS idx_users_reset_token ON users(reset_token) WHERE reset_token IS NOT NULL',
       ];
       for (const sql of indexes) {
         await db.query(sql).catch(() => {});

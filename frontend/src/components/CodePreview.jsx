@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useEffect } from 'react';
 import sanitizeHcl from '../utils/sanitizeHcl';
 
 /**
@@ -6,26 +6,15 @@ import sanitizeHcl from '../utils/sanitizeHcl';
  */
 
 export default function CodePreview({ hcl, onHclChange }) {
-  // Keep a ref to the last known-clean plain text to avoid HTML leaking into state
-  const plainRef = useRef(hcl);
-
-  // Always derive clean text from whatever is in hcl
-  function ensurePlainText(input) {
-    const cleaned = sanitizeHcl(input);
-    plainRef.current = cleaned;
-    return cleaned;
-  }
-
-  // FE-09 fix: dependency array must include hcl so the sanitization effect
-  // re-runs every time a new value arrives (e.g. after a project load where the
-  // initial prop was an empty string and the real HCL arrived asynchronously).
+  // FE-09 fix: dependency array must include hcl and onHclChange so the
+  // sanitization effect re-runs when the value or callback changes.
   useEffect(() => {
     if (!hcl) return;
     const clean = sanitizeHcl(hcl);
     if (clean !== hcl && onHclChange) {
       onHclChange(clean);
     }
-  }, [hcl]); // was [] — caused sanitization to be skipped on async prop updates
+  }, [hcl, onHclChange]); // was [] — caused sanitization to be skipped on async prop updates
 
   if (!hcl) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200, color: '#6B7280', fontSize: 13 }}>
