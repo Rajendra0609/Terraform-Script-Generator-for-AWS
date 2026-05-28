@@ -13,7 +13,7 @@ services:
       - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
       - ./database/fix_project_versions_owner.sql:/docker-entrypoint-initdb.d/03-fix_project_versions_owner.sql
-      - ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
+      #- ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
       - ./database/migrate_v5_columns.sql:/docker-entrypoint-initdb.d/05-migrate_v5_columns.sql
       - ./database/migrate_v6.sql:/docker-entrypoint-initdb.d/06-migrate_v6.sql
       - ./database/migrate_v7.sql:/docker-entrypoint-initdb.d/07-migrate_v7.sql
@@ -24,7 +24,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfgen} -d ${POSTGRES_DB:-terraform_generator}"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 60s
     restart: unless-stopped
 
   # ── Redis ────────────────────────────────────────────────────────────────────
@@ -45,12 +45,6 @@ services:
   # ── Backend (Node / Express) ─────────────────────────────────────────────────
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
-      args:
-        # Pin tool versions at build time; override here or in .env to upgrade
-        TERRAFORM_VERSION:    ${TERRAFORM_VERSION:-1.15.5}
-        TERRAFORM_LS_VERSION: ${TERRAFORM_LS_VERSION:-0.38.3}
     image: tfgen-backend:latest
     ports:
       - "${BACKEND_PORT:-4000}:4000"
@@ -87,18 +81,9 @@ services:
 
   # ── Frontend (React → nginx) ─────────────────────────────────────────────────
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        REACT_APP_API_URL:    ${REACT_APP_API_URL:-http://localhost:4000}
-        REACT_APP_API_URL_LS: ${REACT_APP_API_URL_LS:-http://localhost:4000}
     image: tfgen-frontend:latest
     ports:
       - "${FRONTEND_PORT:-3000}:8080"
-    depends_on:
-      backend:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:
