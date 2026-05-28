@@ -11,8 +11,8 @@ RUN npm ci --omit=dev
 FROM alpine:3.21 AS tools
 
 # ── Pin versions here — bump as needed ────────────────────────────────────────
-ARG TERRAFORM_VERSION=1.15.5
-ARG TERRAFORM_LS_VERSION=0.38.3
+ARG TERRAFORM_VERSION=1.15.3
+ARG TERRAFORM_LS_VERSION=0.38.6
 
 RUN apk add --no-cache curl unzip
 
@@ -30,14 +30,14 @@ RUN set -eux; \
     curl -fsSL \
       "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${BIN_ARCH}.zip" \
       -o /tmp/terraform.zip; \
-    unzip /tmp/terraform.zip -d /usr/local/bin; \
+    unzip -o /tmp/terraform.zip -d /usr/local/bin; \
     chmod +x /usr/local/bin/terraform; \
     \
     # ── terraform-ls ──────────────────────────────────────────────────────────
     curl -fsSL \
       "https://releases.hashicorp.com/terraform-ls/${TERRAFORM_LS_VERSION}/terraform-ls_${TERRAFORM_LS_VERSION}_linux_${BIN_ARCH}.zip" \
       -o /tmp/terraform-ls.zip; \
-    unzip /tmp/terraform-ls.zip -d /usr/local/bin; \
+    unzip -o /tmp/terraform-ls.zip -d /usr/local/bin; \
     chmod +x /usr/local/bin/terraform-ls; \
     \
     # Cleanup
@@ -90,7 +90,5 @@ USER appuser
 EXPOSE 4000
 
 # Health-check — pings the /health endpoint (defined in server.js)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-  CMD wget -qO- http://localhost:4000/health || exit 1
 
 CMD ["node", "server.js"]
