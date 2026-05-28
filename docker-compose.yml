@@ -1,72 +1,105 @@
 version: '3.9'
-
-# ─── Required secrets ─────────────────────────────────────────────────────────
-# Copy .env.example to .env and fill in strong secrets before running.
-# Generate values with: openssl rand -hex 32
-# NEVER commit .env to version control.
-# ──────────────────────────────────────────────────────────────────────────────
-
 services:
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
     environment:
-      POSTGRES_USER: tfgen
-      POSTGRES_PASSWORD: tfgen123
-      POSTGRES_DB: terraform_generator
+      POSTGRES_USER:     ${POSTGRES_USER:-tfgen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfgen123}
+      POSTGRES_DB:       ${POSTGRES_DB:-terraform_generator}
     ports:
-      - "5432:5432"
-    volumes:
+      - "${POSTGRES_PORT:-5432}:5432"
+      volumes:
       - pgdata:/var/lib/postgresql/data
       - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+      - ./database/fix_project_versions_owner.sql:/docker-entrypoint-initdb.d/03-fix_project_versions_owner.sql
+      - ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
+      - ./database/migrate_v5_columns.sql:/docker-entrypoint-initdb.d/05-migrate_v5_columns.sql
+      - ./database/migrate_v6.sql:/docker-entrypoint-initdb.d/06-migrate_v6.sql
+      - ./database/migrate_v7.sql:/docker-entrypoint-initdb.d/07-migrate_v7.sql
+      - ./database/migrate_v8_more_services.sql:/docker-entrypoint-initdb.d/08-migrate_v8_more_services.sql
+      - ./database/migrate_v9_missing_services.sql:/docker-entrypoint-initdb.d/09-migrate_v9_missing_services.sql
+      
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tfgen -d terraform_generator"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfgen} -d ${POSTGRES_DB:-terraform_generator}"]
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
+  # ── Redis ────────────────────────────────────────────────────────────────────
   redis:
-    image: redis:7
+    image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
+  # ── Backend (Node / Express) ─────────────────────────────────────────────────
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        # Pin tool versions at build time; override here or in .env to upgrade
+        TERRAFORM_VERSION:    ${TERRAFORM_VERSION:-1.15.5}
+        TERRAFORM_LS_VERSION: ${TERRAFORM_LS_VERSION:-0.38.3}
+    image: tfgen-backend:latest
     ports:
-      - "4000:4000"
+      - "${BACKEND_PORT:-4000}:4000"
+    env_file:
+      - ./backend/.env        # secret overrides go here
     environment:
-      PORT: 4000
-      HOST: 0.0.0.0
-      CORS_ORIGIN: http://localhost:3000
-      DATABASE_URL: postgresql://tfgen:tfgen123@postgres:5432/terraform_generator
-      REDIS_URL: redis://redis:6379
-      # BUG-009 fix: all three secrets are required.  Values come from the
-      # .env file (see .env.example).  Docker Compose will refuse to start if
-      # any of these variables is missing from the environment / .env file.
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — see .env.example}
+      NODE_ENV:     production
+      PORT:         4000
+      HOST:         0.0.0.0
+      CORS_ORIGIN:  ${CORS_ORIGIN:-http://localhost:3000}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
+      REDIS_URL:    redis://redis:6379
+      # Secrets — MUST be set in .env (see .env.example)
+      JWT_SECRET:         ${JWT_SECRET:?JWT_SECRET is required — see .env.example}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required — see .env.example}
-      ENCRYPT_KEY: ${ENCRYPT_KEY:?ENCRYPT_KEY is required — see .env.example}
+      ENCRYPT_KEY:        ${ENCRYPT_KEY:?ENCRYPT_KEY is required — see .env.example}
+      FRONTEND_URL:       ${FRONTEND_URL:-http://localhost:3000}
+      # Optional SMTP (for password-reset emails)
+      SMTP_HOST:   ${SMTP_HOST:-}
+      SMTP_PORT:   ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER:   ${SMTP_USER:-}
+      SMTP_PASS:   ${SMTP_PASS:-}
+      SMTP_FROM:   ${SMTP_FROM:-}
       TF_LSP_PATH: ${TF_LSP_PATH:-terraform-ls}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
-    restart: on-failure
+        condition: service_healthy
+    restart: on-failure:5
 
+  # ── Frontend (React → nginx) ─────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
+      dockerfile: Dockerfile
       args:
-        REACT_APP_API_URL: http://localhost:4000
+        REACT_APP_API_URL:    ${REACT_APP_API_URL:-http://localhost:4000}
+        REACT_APP_API_URL_LS: ${REACT_APP_API_URL_LS:-http://localhost:4000}
+    image: tfgen-frontend:latest
     ports:
-      - "3000:80"
+      - "${FRONTEND_PORT:-3000}:8080"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
