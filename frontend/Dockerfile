@@ -33,7 +33,7 @@ COPY --from=build /app/build /usr/share/nginx/html
 # nginx can bind to port 8080 as a non-root user
 # (we keep 80 in the compose and map host→container, but inside the
 #  container we run on 8080 with the nginx user, not root)
-RUN sed -i 's/listen 80;/listen 8080;/' /etc/nginx/conf.d/default.conf \
+RUN apk  add --no-cache curl\
  && chown -R nginx:nginx /usr/share/nginx/html \
  && chown -R nginx:nginx /var/cache/nginx \
  && touch /var/run/nginx.pid \
