@@ -49,27 +49,7 @@ services:
     ports:
       - "${BACKEND_PORT:-4000}:4000"
     env_file:
-      - ./backend/.env        # secret overrides go here
-    environment:
-      NODE_ENV:     production
-      PORT:         4000
-      HOST:         0.0.0.0
-      CORS_ORIGIN:  ${CORS_ORIGIN:-http://localhost:3000}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
-      REDIS_URL:    redis://redis:6379
-      # Secrets — MUST be set in .env (see .env.example)
-      JWT_SECRET:         ${JWT_SECRET:?JWT_SECRET is required — see .env.example}
-      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required — see .env.example}
-      ENCRYPT_KEY:        ${ENCRYPT_KEY:?ENCRYPT_KEY is required — see .env.example}
-      FRONTEND_URL:       ${FRONTEND_URL:-http://localhost:3000}
-      # Optional SMTP (for password-reset emails)
-      SMTP_HOST:   ${SMTP_HOST:-}
-      SMTP_PORT:   ${SMTP_PORT:-587}
-      SMTP_SECURE: ${SMTP_SECURE:-false}
-      SMTP_USER:   ${SMTP_USER:-}
-      SMTP_PASS:   ${SMTP_PASS:-}
-      SMTP_FROM:   ${SMTP_FROM:-}
-      TF_LSP_PATH: ${TF_LSP_PATH:-terraform-ls}
+      - .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -84,6 +64,8 @@ services:
     image: tfgen-frontend:latest
     ports:
       - "${FRONTEND_PORT:-3000}:8080"
+    env_file:
+      - .env        # secret overrides go here
     restart: unless-stopped
 
 volumes:
