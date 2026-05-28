@@ -1,5 +1,7 @@
 version: '3.9'
 services:
+
+  # ── Postgres ─────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
     environment:
@@ -13,18 +15,18 @@ services:
       - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
       - ./database/fix_project_versions_owner.sql:/docker-entrypoint-initdb.d/03-fix_project_versions_owner.sql
-      #- ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
+      # - ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
       - ./database/migrate_v5_columns.sql:/docker-entrypoint-initdb.d/05-migrate_v5_columns.sql
       - ./database/migrate_v6.sql:/docker-entrypoint-initdb.d/06-migrate_v6.sql
       - ./database/migrate_v7.sql:/docker-entrypoint-initdb.d/07-migrate_v7.sql
       - ./database/migrate_v8_more_services.sql:/docker-entrypoint-initdb.d/08-migrate_v8_more_services.sql
       - ./database/migrate_v9_missing_services.sql:/docker-entrypoint-initdb.d/09-migrate_v9_missing_services.sql
-      
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfgen} -d ${POSTGRES_DB:-terraform_generator}"]
       interval: 5s
       timeout: 5s
-      retries: 60s
+      retries: 10
+      start_period: 5m
     restart: unless-stopped
 
   # ── Redis ────────────────────────────────────────────────────────────────────
@@ -44,12 +46,38 @@ services:
 
   # ── Backend (Node / Express) ─────────────────────────────────────────────────
   backend:
-    build:
-    image: tfgen-backend:latest
+    image: daggu1997/tfgen_backend:v0.0.1
     ports:
       - "${BACKEND_PORT:-4000}:4000"
     env_file:
       - .env
+    environment:
+      NODE_ENV:     production
+      PORT:         4000
+      HOST:         0.0.0.0
+      CORS_ORIGIN:  http://localhost:3000, http://13.206.202.17:3000, http://0.0.0.0:3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
+      REDIS_URL:    redis://redis:6379
+      # Secrets — MUST be set in .env (see .env.example)
+      JWT_SECRET:         9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a          # FIX: must be a real secret, not a duration
+      JWT_ACCESS_EXPIRY:  1h                     # FIX: moved '1h' here where it belongs
+      JWT_REFRESH_EXPIRY: 7d
+      ENCRYPT_KEY:        2808289bdb3e4b8e6f29b5af99c91048d5e8da367573a82ef4bd2e49cee571ca  # FIX: removed duplicate; keeping second (final) value
+      FRONTEND_URL:       http://0.0.0.0:3000
+      JWT_REFRESH_SECRET: 9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a
+      RATE_LIMIT_WINDOW_MS: 900000
+      RATE_LIMIT_MAX:    1000
+      RATE_LIMIT_TRUSTED_IPS: 127.0.0.1,::1,0.0.0.0
+      TRUST_PROXY: 1
+      # Optional SMTP (for password-reset emails)
+      SMTP_HOST:   ${SMTP_HOST:-}
+      SMTP_PORT:   ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER:   ${SMTP_USER:-}
+      SMTP_PASS:   ${SMTP_PASS:-}
+      SMTP_FROM:   ${SMTP_FROM:-}
+      TF_LSP_PATH:     /usr/local/bin/terraform-ls
+      SKIP_STS_VERIFY: "true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -61,11 +89,11 @@ services:
 
   # ── Frontend (React → nginx) ─────────────────────────────────────────────────
   frontend:
-    image: tfgen-frontend:latest
+    image: daggu1997/tfgen_frontend:v0.0.1
     ports:
       - "${FRONTEND_PORT:-3000}:8080"
-    env_file:
-      - .env        # secret overrides go here
+    environment:
+      REACT_APP_API_URL: http://0.0.0.0:4000
     restart: unless-stopped
 
 volumes:
