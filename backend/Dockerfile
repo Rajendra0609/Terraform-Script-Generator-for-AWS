@@ -1,94 +1,101 @@
-# ─── Stage 1: Install npm dependencies ────────────────────────────────────────
-FROM node:20-alpine AS deps
+version: '3.9'
+services:
 
-WORKDIR /app
+  # ── Postgres ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-tfgen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfgen123}
+      POSTGRES_DB:       ${POSTGRES_DB:-terraform_generator}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+      - ./database/fix_project_versions_owner.sql:/docker-entrypoint-initdb.d/03-fix_project_versions_owner.sql
+      # - ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
+      - ./database/migrate_v5_columns.sql:/docker-entrypoint-initdb.d/05-migrate_v5_columns.sql
+      - ./database/migrate_v6.sql:/docker-entrypoint-initdb.d/06-migrate_v6.sql
+      - ./database/migrate_v7.sql:/docker-entrypoint-initdb.d/07-migrate_v7.sql
+      - ./database/migrate_v8_more_services.sql:/docker-entrypoint-initdb.d/08-migrate_v8_more_services.sql
+      - ./database/migrate_v9_missing_services.sql:/docker-entrypoint-initdb.d/09-migrate_v9_missing_services.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfgen} -d ${POSTGRES_DB:-terraform_generator}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5m
+    restart: unless-stopped
 
-# Copy only manifests first so Docker can cache the npm install layer
-COPY package*.json ./
-RUN npm ci --omit=dev
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
-# ─── Stage 2: Download Terraform & terraform-ls binaries ──────────────────────
-FROM alpine:3.21 AS tools
+  # ── Backend (Node / Express) ─────────────────────────────────────────────────
+  backend:
+    image: daggu1997/tfgen_backend:v0.0.1
+    ports:
+      - "${BACKEND_PORT:-4000}:4000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV:     production
+      PORT:         4000
+      HOST:         0.0.0.0
+      CORS_ORIGIN:  http://localhost:3000, http://13.206.202.17:3000, http://0.0.0.0:3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
+      REDIS_URL:    redis://redis:6379
+      # Secrets — MUST be set in .env (see .env.example)
+      JWT_SECRET:         9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a          # FIX: must be a real secret, not a duration
+      JWT_ACCESS_EXPIRY:  1h                     # FIX: moved '1h' here where it belongs
+      JWT_REFRESH_EXPIRY: 7d
+      ENCRYPT_KEY:        2808289bdb3e4b8e6f29b5af99c91048d5e8da367573a82ef4bd2e49cee571ca  # FIX: removed duplicate; keeping second (final) value
+      FRONTEND_URL:       http://0.0.0.0:3000
+      JWT_REFRESH_SECRET: 9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a
+      RATE_LIMIT_WINDOW_MS: 900000
+      RATE_LIMIT_MAX:    1000
+      RATE_LIMIT_TRUSTED_IPS: 127.0.0.1,::1,0.0.0.0
+      TRUST_PROXY: 1
+      # Optional SMTP (for password-reset emails)
+      SMTP_HOST:   ${SMTP_HOST:-}
+      SMTP_PORT:   ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER:   ${SMTP_USER:-}
+      SMTP_PASS:   ${SMTP_PASS:-}
+      SMTP_FROM:   ${SMTP_FROM:-}
+      TF_LSP_PATH:     /usr/local/bin/terraform-ls
+      SKIP_STS_VERIFY: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure:5
 
-# ── Pin versions here — bump as needed ────────────────────────────────────────
-ARG TERRAFORM_VERSION=1.15.3
-ARG TERRAFORM_LS_VERSION=0.38.6
+  # ── Frontend (React → nginx) ─────────────────────────────────────────────────
+  frontend:
+    image: daggu1997/tfgen_frontend:v0.0.1
+    ports:
+      - "${FRONTEND_PORT:-3000}:8080"
+    environment:
+      REACT_APP_API_URL: http://0.0.0.0:4000
+    restart: unless-stopped
 
-RUN apk add --no-cache curl unzip
-
-# Detect CPU architecture once and reuse for both downloads
-RUN set -eux; \
-    ARCH=$(uname -m); \
-    case "$ARCH" in \
-      x86_64)  BIN_ARCH="amd64" ;; \
-      aarch64) BIN_ARCH="arm64" ;; \
-      armv7l)  BIN_ARCH="arm"   ;; \
-      *) echo "Unsupported arch: $ARCH" && exit 1 ;; \
-    esac; \
-    \
-    # ── Terraform ─────────────────────────────────────────────────────────────
-    curl -fsSL \
-      "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${BIN_ARCH}.zip" \
-      -o /tmp/terraform.zip; \
-    unzip -o /tmp/terraform.zip -d /usr/local/bin; \
-    chmod +x /usr/local/bin/terraform; \
-    \
-    # ── terraform-ls ──────────────────────────────────────────────────────────
-    curl -fsSL \
-      "https://releases.hashicorp.com/terraform-ls/${TERRAFORM_LS_VERSION}/terraform-ls_${TERRAFORM_LS_VERSION}_linux_${BIN_ARCH}.zip" \
-      -o /tmp/terraform-ls.zip; \
-    unzip -o /tmp/terraform-ls.zip -d /usr/local/bin; \
-    chmod +x /usr/local/bin/terraform-ls; \
-    \
-    # Cleanup
-    rm /tmp/terraform.zip /tmp/terraform-ls.zip; \
-    \
-    # Smoke-test both binaries
-    terraform version || true; \
-    terraform-ls version || true
-
-# ─── Stage 3: Production image ────────────────────────────────────────────────
-FROM node:20-alpine
-
-ENV NODE_ENV=production
-
-WORKDIR /app
-
-# ── System tools ──────────────────────────────────────────────────────────────
-# docker-cli  → lets the backend run checkov/infracost via the host Docker daemon
-#               (daemon is NOT running inside the container; the socket is bind-mounted
-#                in docker-compose.yml using /var/run/docker.sock)
-# ca-certificates, wget → needed by the HEALTHCHECK and HTTPS calls
-RUN apk add --no-cache \
-      docker-cli \
-      ca-certificates \
-      wget
-
-# ── Copy Terraform binaries from the tools stage ──────────────────────────────
-COPY --from=tools /usr/local/bin/terraform      /usr/local/bin/terraform
-COPY --from=tools /usr/local/bin/terraform-ls   /usr/local/bin/terraform-ls
-
-# ── Non-root user ─────────────────────────────────────────────────────────────
-# appuser runs the Node process.
-# We also add appuser to the 'docker' group (created by the docker-cli package)
-# so it can talk to /var/run/docker.sock when the socket is bind-mounted.
-#
-# NOTE: on Linux hosts the Docker socket GID is typically 999 (same as the
-# Alpine docker group).  If your host uses a different GID, override at runtime:
-#   docker-compose run --group-add <HOST_DOCKER_GID> backend
-RUN addgroup -S appgroup \
- && adduser  -S appuser -G appgroup \
- && adduser  appuser docker
-
-# ── Application files ─────────────────────────────────────────────────────────
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN chown -R appuser:appgroup /app
-
-USER appuser
-
-EXPOSE 4000
-
-# Health-check — pings the /health endpoint (defined in server.js)
-
-CMD ["node", "server.js"]
+volumes:
+  pgdata:
+  redisdata:
