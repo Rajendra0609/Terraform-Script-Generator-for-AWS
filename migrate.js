@@ -21,20 +21,50 @@
  * Re-running the script is safe — already-applied versions are skipped.
  */
 
-const fs      = require('fs');
-const path    = require('path');
-const { Client } = require('pg');
+const fs   = require('fs');
+const path = require('path');
 
-// Load .env from backend directory if present (local dev convenience)
-try { require('dotenv').config({ path: path.join(__dirname, 'backend', '.env') }); } catch (_) {}
+// ── FIX 1: Explicit dotenv load with clear error if missing ──────────────────
+try {
+  require('dotenv').config({ path: path.join(__dirname, 'backend', '.env') });
+} catch (e) {
+  // dotenv is optional — warn instead of silently failing
+  if (e.code === 'MODULE_NOT_FOUND') {
+    console.warn('[migrate] Warning: dotenv not installed. Falling back to process.env only.');
+    console.warn('[migrate] Run: npm install dotenv  to enable .env file support.\n');
+  } else {
+    throw e;
+  }
+}
+
+// ── FIX 2: pg import with clear error if missing ─────────────────────────────
+let Client;
+try {
+  ({ Client } = require('pg'));
+} catch (e) {
+  if (e.code === 'MODULE_NOT_FOUND') {
+    console.error('[migrate] ERROR: "pg" package is not installed.');
+    console.error('[migrate] Run: npm install pg');
+    process.exit(1);
+  }
+  throw e;
+}
 
 const DB_URL = process.env.DATABASE_URL;
 if (!DB_URL) {
-  console.error('[migrate] DATABASE_URL environment variable is not set.');
+  console.error('[migrate] ERROR: DATABASE_URL environment variable is not set.');
+  console.error('[migrate] Either set it in your shell or add it to backend/.env');
   process.exit(1);
 }
 
 const MIGRATIONS_DIR = path.join(__dirname, 'database');
+
+// ── FIX 3: Guard if database/ folder doesn't exist ───────────────────────────
+if (!fs.existsSync(MIGRATIONS_DIR)) {
+  console.error(`[migrate] ERROR: Migrations directory not found: ${MIGRATIONS_DIR}`);
+  console.error('[migrate] Create a "database/" folder and add your .sql migration files.');
+  process.exit(1);
+}
 
 // ── Discover migration files ──────────────────────────────────────────────────
 // Accept files matching NNN_*.sql  (3+ leading digits, underscore, description)
@@ -46,6 +76,7 @@ function discoverMigrations() {
     .sort()   // lexicographic sort is correct for zero-padded numeric prefixes
     .map(filename => ({
       version:  filename.match(MIGRATION_RE)[1],
+      version: filename.match(MIGRATION_RE)[1],
       filename,
       filepath: path.join(MIGRATIONS_DIR, filename),
     }));
@@ -70,10 +101,11 @@ async function appliedVersions(client) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+// ── FIX 4: Wrap top-level async in .catch() to handle connection errors cleanly
 (async () => {
-  const args    = process.argv.slice(2);
-  const dryRun  = args.includes('--dry-run');
-  const status  = args.includes('--status');
+  const args   = process.argv.slice(2);
+  const dryRun = args.includes('--dry-run');
+  const status = args.includes('--status');
 
   const migrations = discoverMigrations();
   if (migrations.length === 0) {
@@ -82,7 +114,15 @@ async function appliedVersions(client) {
   }
 
   const client = new Client({ connectionString: DB_URL });
-  await client.connect();
+
+  // FIX 4: Catch connection errors with a clean message
+  try {
+    await client.connect();
+  } catch (err) {
+    console.error('[migrate] ERROR: Could not connect to the database.');
+    console.error(`[migrate] Check your DATABASE_URL. Details: ${err.message}`);
+    process.exit(1);
+  }
 
   try {
     await ensureMigrationsTable(client);
