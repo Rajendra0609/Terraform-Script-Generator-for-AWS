@@ -1,101 +1,47 @@
-version: '3.9'
-services:
+# ─── Stage 1: Build React app ─────────────────────────────────────────────────
+FROM node:20-alpine AS build
 
-  # ── Postgres ─────────────────────────────────────────────────────────────────
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER:     ${POSTGRES_USER:-tfgen}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfgen123}
-      POSTGRES_DB:       ${POSTGRES_DB:-terraform_generator}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-      - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
-      - ./database/fix_project_versions_owner.sql:/docker-entrypoint-initdb.d/03-fix_project_versions_owner.sql
-      # - ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
-      - ./database/migrate_v5_columns.sql:/docker-entrypoint-initdb.d/05-migrate_v5_columns.sql
-      - ./database/migrate_v6.sql:/docker-entrypoint-initdb.d/06-migrate_v6.sql
-      - ./database/migrate_v7.sql:/docker-entrypoint-initdb.d/07-migrate_v7.sql
-      - ./database/migrate_v8_more_services.sql:/docker-entrypoint-initdb.d/08-migrate_v8_more_services.sql
-      - ./database/migrate_v9_missing_services.sql:/docker-entrypoint-initdb.d/09-migrate_v9_missing_services.sql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfgen} -d ${POSTGRES_DB:-terraform_generator}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5m
-    restart: unless-stopped
+WORKDIR /app
 
-  # ── Redis ────────────────────────────────────────────────────────────────────
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redisdata:/data
-    command: ["redis-server", "--appendonly", "yes"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
+# Receive the build-time API URL (REACT_APP_* are baked in at build time by CRA)
+ARG REACT_APP_API_URL=http://13.206.202.17:4000
+ARG REACT_APP_API_URL_LS=http://13.206.202.17:4000
 
-  # ── Backend (Node / Express) ─────────────────────────────────────────────────
-  backend:
-    image: daggu1997/tfgen_backend:v0.0.1
-    ports:
-      - "${BACKEND_PORT:-4000}:4000"
-    env_file:
-      - .env
-    environment:
-      NODE_ENV:     production
-      PORT:         4000
-      HOST:         0.0.0.0
-      CORS_ORIGIN:  http://localhost:3000, http://13.206.202.17:3000, http://0.0.0.0:3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
-      REDIS_URL:    redis://redis:6379
-      # Secrets — MUST be set in .env (see .env.example)
-      JWT_SECRET:         9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a          # FIX: must be a real secret, not a duration
-      JWT_ACCESS_EXPIRY:  1h                     # FIX: moved '1h' here where it belongs
-      JWT_REFRESH_EXPIRY: 7d
-      ENCRYPT_KEY:        2808289bdb3e4b8e6f29b5af99c91048d5e8da367573a82ef4bd2e49cee571ca  # FIX: removed duplicate; keeping second (final) value
-      FRONTEND_URL:       http://0.0.0.0:3000
-      JWT_REFRESH_SECRET: 9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a
-      RATE_LIMIT_WINDOW_MS: 900000
-      RATE_LIMIT_MAX:    1000
-      RATE_LIMIT_TRUSTED_IPS: 127.0.0.1,::1,0.0.0.0
-      TRUST_PROXY: 1
-      # Optional SMTP (for password-reset emails)
-      SMTP_HOST:   ${SMTP_HOST:-}
-      SMTP_PORT:   ${SMTP_PORT:-587}
-      SMTP_SECURE: ${SMTP_SECURE:-false}
-      SMTP_USER:   ${SMTP_USER:-}
-      SMTP_PASS:   ${SMTP_PASS:-}
-      SMTP_FROM:   ${SMTP_FROM:-}
-      TF_LSP_PATH:     /usr/local/bin/terraform-ls
-      SKIP_STS_VERIFY: "true"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: on-failure:5
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
+ENV REACT_APP_API_URL_LS=$REACT_APP_API_URL_LS
 
-  # ── Frontend (React → nginx) ─────────────────────────────────────────────────
-  frontend:
-    image: daggu1997/tfgen_frontend:v0.0.1
-    ports:
-      - "${FRONTEND_PORT:-3000}:8080"
-    environment:
-      REACT_APP_API_URL: http://0.0.0.0:4000
-    restart: unless-stopped
+# Install dependencies first (cached layer)
+COPY package*.json ./
+RUN npm install
 
-volumes:
-  pgdata:
-  redisdata:
+# Copy source and build
+COPY . .
+RUN npm run build
+
+# ─── Stage 2: Serve with nginx (non-root) ─────────────────────────────────────
+FROM nginx:1.27-alpine
+
+# Remove the default config
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy our custom nginx config
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy the built React app
+COPY --from=build /app/build /usr/share/nginx/html
+
+# nginx can bind to port 8080 as a non-root user
+# (we keep 80 in the compose and map host→container, but inside the
+#  container we run on 8080 with the nginx user, not root)
+RUN apk add --no-cache curl \
+ && chown -R nginx:nginx /usr/share/nginx/html \
+ && chown -R nginx:nginx /var/cache/nginx \
+ && touch /var/run/nginx.pid \
+ && chown nginx:nginx /var/run/nginx.pid
+
+USER nginx
+
+EXPOSE 8080
+
+
+CMD ["nginx", "-g", "daemon off;"]
