@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Copy only manifests first so Docker can cache the npm install layer
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --verbose
 
 # ─── Stage 2: Download Terraform & terraform-ls binaries ──────────────────────
 FROM alpine:3.21 AS tools
