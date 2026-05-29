@@ -61,6 +61,7 @@ services:
       SMTP_USER:  srirajendraprasaddaggubati@gmail.com
       SMTP_PASS:  ohul sitk qapy hmzl       # Gmail app password (16 chars)
       SMTP_FROM:  TFGen tfgenadmin@gmail.com
+      FRONTEND_URL:  http://13.232.187.242:3000
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
