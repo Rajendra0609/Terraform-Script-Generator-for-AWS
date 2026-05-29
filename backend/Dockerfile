@@ -77,6 +77,7 @@ COPY --from=tools /usr/local/bin/terraform-ls   /usr/local/bin/terraform-ls
 # Alpine docker group).  If your host uses a different GID, override at runtime:
 #   docker-compose run --group-add <HOST_DOCKER_GID> backend
 RUN addgroup -S appgroup \
+ && addgroup -S docker \
  && adduser  -S appuser -G appgroup \
  && adduser  appuser docker
 
