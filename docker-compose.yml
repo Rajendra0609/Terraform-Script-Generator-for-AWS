@@ -54,31 +54,10 @@ services:
     environment:
       NODE_ENV:     production
       PORT:         4000
-      HOST:         0.0.0.0
-      CORS_ORIGIN:  http://localhost:3000, http://13.206.202.17:3000, http://0.0.0.0:3000
+      HOST:         0.0.0.0.
+      CORS_ORIGIN:  http://localhost:3000
       DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
       REDIS_URL:    redis://redis:6379
-      # Secrets — MUST be set in .env (see .env.example)
-      JWT_SECRET:         9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a          # FIX: must be a real secret, not a duration
-      JWT_REFRESH_SECRET:  9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a
-      JWT_ACCESS_EXPIRY:  1h                     # FIX: moved '1h' here where it belongs
-      JWT_REFRESH_EXPIRY: 7d
-      ENCRYPT_KEY:        2808289bdb3e4b8e6f29b5af99c91048d5e8da367573a82ef4bd2e49cee571ca  # FIX: removed duplicate; keeping second (final) value
-      FRONTEND_URL:       http://0.0.0.0:3000
-      JWT_REFRESH_SECRET: 9a02ab8c4842c46138a3a479eab7786150aa3f0a304c8f09fe461d9b7871a54a
-      RATE_LIMIT_WINDOW_MS: 900000
-      RATE_LIMIT_MAX:    1000
-      RATE_LIMIT_TRUSTED_IPS: 127.0.0.1,::1,0.0.0.0
-      TRUST_PROXY: 1
-      # Optional SMTP (for password-reset emails)
-      SMTP_HOST:   ${SMTP_HOST:-}
-      SMTP_PORT:   ${SMTP_PORT:-587}
-      SMTP_SECURE: ${SMTP_SECURE:-false}
-      SMTP_USER:   ${SMTP_USER:-}
-      SMTP_PASS:   ${SMTP_PASS:-}
-      SMTP_FROM:   ${SMTP_FROM:-}
-      TF_LSP_PATH:     /usr/local/bin/terraform-ls
-      SKIP_STS_VERIFY: "true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -87,16 +66,13 @@ services:
       redis:
         condition: service_healthy
     restart: on-failure:5
-
-  # ── Frontend (React → nginx) ─────────────────────────────────────────────────
   frontend:
     image: daggu1997/tfgen_frontend:v0.0.1
     ports:
       - "${FRONTEND_PORT:-3000}:8080"
-    environment:
-      REACT_APP_API_URL: http://0.0.0.0:4000
     restart: unless-stopped
-
+    depends_on:
+      - backend
 volumes:
   pgdata:
   redisdata:
