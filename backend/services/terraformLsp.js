@@ -43,11 +43,12 @@ function serverUriToClient(serverUri, workspaceDir) {
  */
 function translateAllUrisToClient(payloadStr, workspaceDir) {
   const serverBase = pathToFileURL(workspaceDir).href;
-  // The base may or may not have a trailing slash depending on OS
-  const escaped = serverBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Normalise: strip trailing slash so the regex works with or without it
+  const base = serverBase.replace(/\/$/, '');
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return payloadStr.replace(
-    new RegExp(escaped + '/?([\\w.-]+)', 'g'),
-    (_, filename) => CLIENT_BASE + filename,
+    new RegExp(escaped + '/?([\\w.%-]+)', 'g'),
+    (_, filename) => CLIENT_BASE + decodeURIComponent(filename),
   );
 }
 
@@ -205,10 +206,24 @@ class TerraformLspSession {
 
     // ── Intercept: initialize — inject real workspace paths ────────────────
     if (payload.method === 'initialize') {
+      // Ensure rootUri has a trailing slash — terraform-ls uses it as the
+      // workspace root prefix when resolving relative file URIs.
+      const rootUri = this.rootUri.endsWith('/')
+        ? this.rootUri
+        : this.rootUri + '/';
+
       payload.params = {
         ...payload.params,
-        rootUri:          this.rootUri,
-        workspaceFolders: [{ uri: this.rootUri, name: 'workspace' }],
+        rootUri,
+        rootPath:         this.workspaceDir,
+        workspaceFolders: [{ uri: rootUri, name: 'workspace' }],
+        // initializationOptions tells terraform-ls to pre-load the AWS
+        // provider schema so completions are available immediately.
+        initializationOptions: {
+          ...(payload.params?.initializationOptions || {}),
+          experimentalFeatures: { prefillRequiredFields: true },
+          terraform: { path: process.env.TERRAFORM_PATH || 'terraform' },
+        },
       };
       this._writeToProcess(payload);
       return;
