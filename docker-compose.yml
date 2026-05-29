@@ -54,10 +54,14 @@ services:
     environment:
       NODE_ENV:     production
       PORT:         4000
-      HOST:         0.0.0.0.
+      HOST:         0.0.0.0
       CORS_ORIGIN:  http://localhost:3000,http://127.0.0.1:3000,http://13.232.187.242:3000
       DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
       REDIS_URL:    redis://redis:6379
+      SMTP_USER:  srirajendraprasaddaggubati@gmail.com
+      SMTP_PASS:  ohul sitk qapy hmzl       # Gmail app password (16 chars)
+      SMTP_FROM:  TFGen tfgenadmin@gmail.com
+
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
