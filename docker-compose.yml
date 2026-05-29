@@ -3,7 +3,7 @@ services:
 
   # ── Postgres ─────────────────────────────────────────────────────────────────
   postgres:
-    image: postgres:15-alpine
+    image: daggu1997/tfgen_postgres:v0.0.1
     environment:
       POSTGRES_USER:     ${POSTGRES_USER:-tfgen}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfgen123}
@@ -12,21 +12,12 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-      - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
-      - ./database/fix_project_versions_owner.sql:/docker-entrypoint-initdb.d/03-fix_project_versions_owner.sql
-      # - ./database/migrate.sql:/docker-entrypoint-initdb.d/04-migrate.sql
-      - ./database/migrate_v5_columns.sql:/docker-entrypoint-initdb.d/05-migrate_v5_columns.sql
-      - ./database/migrate_v6.sql:/docker-entrypoint-initdb.d/06-migrate_v6.sql
-      - ./database/migrate_v7.sql:/docker-entrypoint-initdb.d/07-migrate_v7.sql
-      - ./database/migrate_v8_more_services.sql:/docker-entrypoint-initdb.d/08-migrate_v8_more_services.sql
-      - ./database/migrate_v9_missing_services.sql:/docker-entrypoint-initdb.d/09-migrate_v9_missing_services.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfgen} -d ${POSTGRES_DB:-terraform_generator}"]
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 5m
+      start_period: 120s
     restart: unless-stopped
 
   # ── Redis ────────────────────────────────────────────────────────────────────
