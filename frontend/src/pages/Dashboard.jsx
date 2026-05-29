@@ -16,6 +16,9 @@ export default function Dashboard() {
   const [newEnv, setNewEnv] = useState('dev');
   const [search, setSearch] = useState('');
   const [deleting, setDeleting] = useState(null);
+  // FIX: add error state so create/delete failures surface to the user instead
+  // of being silently swallowed by empty catch blocks.
+  const [formError, setFormError] = useState('');
 
   useEffect(() => {
     projectsAPI.list().then(r => setProjects(r.data)).catch(() => {}).finally(() => setLoading(false));
@@ -25,26 +28,38 @@ export default function Dashboard() {
     e.preventDefault();
     if (!newName.trim()) return;
     setCreating(true);
+    setFormError('');
     try {
       const r = await projectsAPI.create({ name: newName.trim(), aws_region: newRegion, environment: newEnv });
       const newId = r.data?.id;
       if (!newId) {
         console.error('[Dashboard] Project created but response contained no id:', r.data);
+        setFormError('Project was created but the server returned no ID. Please refresh the page.');
         setCreating(false);
         return;
       }
       nav(`/builder/${newId}`);
-    } catch { setCreating(false); }
+    } catch (err) {
+      // FIX: was `catch {}` — error was silently dropped and the spinner froze.
+      const msg = err.response?.data?.error || err.message || 'Failed to create project. Please try again.';
+      setFormError(msg);
+      setCreating(false);
+    }
   };
 
   const deleteProject = async (id, e) => {
     e.stopPropagation();
     if (!window.confirm('Delete this project? This cannot be undone.')) return;
     setDeleting(id);
+    setFormError('');
     try {
       await projectsAPI.delete(id);
       setProjects(prev => prev.filter(p => p.id !== id));
-    } catch { } finally { setDeleting(null); }
+    } catch (err) {
+      // FIX: was `catch {}` — user had no idea deletion failed.
+      const msg = err.response?.data?.error || err.message || 'Failed to delete project.';
+      setFormError(msg);
+    } finally { setDeleting(null); }
   };
 
   const filtered = projects.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
@@ -186,7 +201,7 @@ export default function Dashboard() {
             <form onSubmit={createProject} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr auto auto', gap: 12, alignItems: 'end' }}>
               <div>
                 <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 6 }}>Project Name *</label>
-                <input autoFocus value={newName} onChange={e => setNewName(e.target.value)} placeholder="my-aws-infra" required
+                <input autoFocus value={newName} onChange={e => { setNewName(e.target.value); setFormError(''); }} placeholder="my-aws-infra" required
                   style={formInput}
                   onFocus={e => { e.target.style.borderColor = '#00A87C'; e.target.style.boxShadow = '0 0 0 3px rgba(0,168,124,0.10)'; }}
                   onBlur={e => { e.target.style.borderColor = '#D1D5DB'; e.target.style.boxShadow = 'none'; }}
@@ -217,13 +232,27 @@ export default function Dashboard() {
                 }}>
                 {creating ? '⏳' : '→ Create'}
               </button>
-              <button type="button" onClick={() => setShowForm(false)}
+              <button type="button" onClick={() => { setShowForm(false); setFormError(''); }}
                 style={{ padding: '9px 14px', borderRadius: 8, border: '1px solid #D1D5DB', background: '#FFFFFF', color: '#6B7280', fontSize: 13, cursor: 'pointer', transition: 'background 0.15s' }}
                 onMouseEnter={e => e.currentTarget.style.background = '#F3F4F6'}
                 onMouseLeave={e => e.currentTarget.style.background = '#FFFFFF'}>
                 ✕
               </button>
             </form>
+            {/* FIX: show create/delete errors to the user — previously swallowed silently */}
+            {formError && (
+              <div style={{ marginTop: 12, padding: '10px 14px', background: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 8, color: '#DC2626', fontSize: 13 }}>
+                ❌ {formError}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Delete error banner — shown when form is not open */}
+        {formError && !showForm && (
+          <div style={{ marginBottom: 16, padding: '10px 14px', background: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 8, color: '#DC2626', fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span>❌ {formError}</span>
+            <button onClick={() => setFormError('')} style={{ background: 'none', border: 'none', color: '#DC2626', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}>✕</button>
           </div>
         )}
 
