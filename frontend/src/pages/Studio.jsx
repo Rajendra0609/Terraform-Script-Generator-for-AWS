@@ -355,6 +355,7 @@ export default function Studio() {
 
   // ── File state ─────────────────────────────────────────────────────────
   const [files, setFiles] = useState(DEFAULT_FILES);
+  const filesRef = useRef(DEFAULT_FILES); // always-current mirror used inside async callbacks
   const [activeFile, setActiveFile] = useState('main.tf');
 
   // ── Editor refs ────────────────────────────────────────────────────────
@@ -404,6 +405,9 @@ export default function Studio() {
   const [busy, setBusy]     = useState({ validate: false, fmt: false, cmd: false });
   const [status, setStatus] = useState({ type: 'ready', message: 'Ready' });
   const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
+
+  // Keep filesRef in sync so LSP callbacks always see the latest files
+  useEffect(() => { filesRef.current = files; }, [files]);
 
   // ── Active file content ────────────────────────────────────────────────
   const activeContent = files[activeFile] || '';
@@ -458,6 +462,19 @@ export default function Studio() {
     });
   }, []);
 
+  // updateLspDocument must be declared BEFORE openLspDocument to avoid the
+  // temporal dead zone (TDZ) ReferenceError that occurs when a const useCallback
+  // references another const that hasn't been initialised yet.
+  const updateLspDocument = useCallback((filename, content) => {
+    if (!lspRef.current.open) return;
+    const uri = fileUri(filename);
+    lspRef.current.version[filename] = (lspRef.current.version[filename] || 0) + 1;
+    sendLspNotification('textDocument/didChange', {
+      textDocument: { uri, version: lspRef.current.version[filename] },
+      contentChanges: [{ text: content }],
+    });
+  }, [fileUri, sendLspNotification]);
+
   const openLspDocument = useCallback((filename, content) => {
     if (!lspRef.current.open) return;
     const uri = fileUri(filename);
@@ -474,16 +491,6 @@ export default function Studio() {
       textDocument: { uri, languageId: 'terraform', version, text: content },
     });
   }, [fileUri, sendLspNotification, updateLspDocument]);
-
-  const updateLspDocument = useCallback((filename, content) => {
-    if (!lspRef.current.open) return;
-    const uri = fileUri(filename);
-    lspRef.current.version[filename] = (lspRef.current.version[filename] || 0) + 1;
-    sendLspNotification('textDocument/didChange', {
-      textDocument: { uri, version: lspRef.current.version[filename] },
-      contentChanges: [{ text: content }],
-    });
-  }, [fileUri, sendLspNotification]);
 
   // ════════════════════════════════════════════════════════════════════════
   // LSP connection
@@ -547,9 +554,9 @@ export default function Studio() {
         lspRef.current.openedDocs = new Set(); // fresh tracker for this session
         setLspStatus('ready');
 
-        // Open all files on connect
-        const currentFiles = files;
-        for (const [fn, content] of Object.entries(currentFiles)) {
+        // Open all files on connect — use ref so we always see the latest file
+        // content even if connectLsp was memoised before the last edit.
+        for (const [fn, content] of Object.entries(filesRef.current)) {
           openLspDocument(fn, content);
         }
       } catch (err) {
@@ -637,7 +644,7 @@ export default function Studio() {
         setLspStatus('offline (connection error)');
       }
     };
-  }, [files, sendLspRequest, sendLspNotification, openLspDocument, addTermLine]);
+  }, [sendLspRequest, sendLspNotification, openLspDocument, addTermLine]);
 
   // ════════════════════════════════════════════════════════════════════════
   // Monaco: language & providers setup
@@ -1246,6 +1253,9 @@ export default function Studio() {
       // clearing busy.cmd before handleValidate/handleFmt resolved, briefly re-enabling buttons.
       if (cmd === 'validate') { await handleValidate(); return; }
       if (cmd === 'fmt')      { await handleFmt();      return; }
+      // NOTE: early returns above skip the finally block, which is intentional —
+      // handleValidate/handleFmt manage busy.validate / busy.fmt independently.
+      // busy.cmd is still cleared by finally for plan/init/other commands below.
       if (cmd === 'plan') {
         res = await terraformAPI.plan(sanitizeHcl(activeContent), runnerMode);
         const data = res?.data || {};
@@ -1279,7 +1289,7 @@ export default function Studio() {
       // outline click handler can skip navigation (BUG-7 fix: all _local symbols
       // had range.start.line = 0, causing every click to jump to line 1 regardless
       // of where the resource actually is).
-      setSymbols(parsed.resources.map((r, i) => ({
+      setSymbols(parsed.resources.map((r) => ({
         name: `${r.type}.${r.name}`, detail: 'resource', kind: 22, _local: true,
         range: { start: { line: null }, end: { line: null } },
       })));
