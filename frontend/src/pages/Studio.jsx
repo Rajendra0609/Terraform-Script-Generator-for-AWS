@@ -368,7 +368,8 @@ export default function Studio() {
     open: false,
     requestId: 1,
     pending: new Map(),
-    version: {},    // { filename: number }
+    version: {},       // { filename: number }
+    openedDocs: new Set(), // URIs sent via textDocument/didOpen (prevents double-open)
     retryCount: 0,
     retryDelay: 2000,
     retryTimer: null,
@@ -438,10 +439,12 @@ export default function Studio() {
         return reject(new Error('LSP not connected'));
       }
       const id = lspRef.current.requestId++;
+      // 15 s — terraform-ls indexes the workspace after `initialized` which can
+      // take 10-30 s; 8 s was too short and silently dropped first completions.
       const timer = setTimeout(() => {
         lspRef.current.pending.delete(id);
         reject(new Error('LSP request timed out'));
-      }, 8000);
+      }, 15000);
       lspRef.current.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject:  (e) => { clearTimeout(timer); reject(e); },
@@ -458,12 +461,19 @@ export default function Studio() {
   const openLspDocument = useCallback((filename, content) => {
     if (!lspRef.current.open) return;
     const uri = fileUri(filename);
-    const version = (lspRef.current.version[filename] || 0);
-    lspRef.current.version[filename] = version + 1;
+    if (lspRef.current.openedDocs.has(uri)) {
+      // Document already open in this LSP session — sending didOpen again is a
+      // protocol violation (terraform-ls returns an error).  Use didChange instead.
+      updateLspDocument(filename, content);
+      return;
+    }
+    lspRef.current.openedDocs.add(uri);
+    const version = (lspRef.current.version[filename] || 0) + 1;
+    lspRef.current.version[filename] = version;
     sendLspNotification('textDocument/didOpen', {
-      textDocument: { uri, languageId: 'terraform', version: version + 1, text: content },
+      textDocument: { uri, languageId: 'terraform', version, text: content },
     });
-  }, [fileUri, sendLspNotification]);
+  }, [fileUri, sendLspNotification, updateLspDocument]);
 
   const updateLspDocument = useCallback((filename, content) => {
     if (!lspRef.current.open) return;
@@ -493,7 +503,10 @@ export default function Studio() {
     lspRef.current.ws = ws;
 
     ws.onopen = async () => {
-      lspRef.current.open = true;
+      // NOTE: lspRef.current.open is intentionally NOT set here.
+      // We must complete initialize → initialized before allowing any document
+      // notifications; setting open=true early lets keystrokes send didChange
+      // before the handshake finishes, which violates LSP and corrupts the session.
       lspRef.current.retryCount = 0;
       lspRef.current.retryDelay = 2000;
       setLspStatus('initialising…');
@@ -503,6 +516,12 @@ export default function Studio() {
           clientInfo: { name: 'TFGen Studio', version: '1.0.0' },
           capabilities: {
             textDocument: {
+              synchronization: {
+                dynamicRegistration: false,
+                willSave: false,
+                willSaveWaitUntil: false,
+                didSave: false,
+              },
               completion: {
                 completionItem: { snippetSupport: true, documentationFormat: ['markdown', 'plaintext'] },
               },
@@ -523,6 +542,9 @@ export default function Studio() {
           },
         });
         sendLspNotification('initialized', {});
+        // Only mark open AFTER the full handshake — prevents premature didChange
+        lspRef.current.open = true;
+        lspRef.current.openedDocs = new Set(); // fresh tracker for this session
         setLspStatus('ready');
 
         // Open all files on connect
@@ -700,9 +722,15 @@ export default function Studio() {
 
     // Create models for all files
     for (const [fn, content] of Object.entries(files)) {
-      const uri   = monaco.Uri.parse(fileUri(fn));
-      const model = monaco.editor.getModel(uri) ||
-                    monaco.editor.createModel(content, 'terraform', uri);
+      const uri = monaco.Uri.parse(fileUri(fn));
+      let model = monaco.editor.getModel(uri);
+      if (!model) {
+        model = monaco.editor.createModel(content, 'terraform', uri);
+      } else if (model.getLanguageId() !== 'terraform') {
+        // Stale model from a previous render cycle with the wrong language —
+        // the 'terraform' completion provider won't fire for it without this fix.
+        monaco.editor.setModelLanguage(model, 'terraform');
+      }
       modelsRef.current[fn] = model;
     }
     // Set active model
@@ -768,8 +796,44 @@ export default function Studio() {
             }
           } catch (_) {}
         }
-        // Fallback: local heuristics
-        return { suggestions: [] };
+        // Fallback: keyword + block snippets so the editor is never completely silent
+        const word = model.getWordUntilPosition(position);
+        const fallbackRange = new monaco.Range(
+          position.lineNumber, word.startColumn,
+          position.lineNumber, word.endColumn,
+        );
+        return {
+          suggestions: [
+            { label: 'resource',  detail: 'resource block',  kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'resource "${1:type}" "${2:name}" {\n  $0\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            { label: 'variable',  detail: 'variable block',  kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'variable "${1:name}" {\n  description = "${2}"\n  type        = ${3:string}\n  default     = ${4:null}\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            { label: 'output',    detail: 'output block',    kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'output "${1:name}" {\n  description = "${2}"\n  value       = ${3}\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            { label: 'module',    detail: 'module block',    kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'module "${1:name}" {\n  source = "${2}"\n  $0\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            { label: 'locals',    detail: 'locals block',    kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'locals {\n  $0\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            { label: 'provider',  detail: 'provider block',  kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'provider "${1:name}" {\n  $0\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            { label: 'data',      detail: 'data source',     kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'data "${1:type}" "${2:name}" {\n  $0\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            { label: 'terraform', detail: 'terraform block', kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: 'terraform {\n  required_version = ">= ${1:1.5.0}"\n\n  required_providers {\n    aws = {\n      source  = "hashicorp/aws"\n      version = "~> ${2:5.0}"\n    }\n  }\n}',
+              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet, range: fallbackRange },
+            ...['for_each', 'count', 'depends_on', 'lifecycle', 'tags', 'dynamic', 'true', 'false', 'null'].map(kw => ({
+              label: kw, detail: 'Terraform keyword', kind: monaco.languages.CompletionItemKind.Keyword,
+              insertText: kw, range: fallbackRange,
+            })),
+          ],
+        };
       },
     });
 
@@ -1717,7 +1781,10 @@ export default function Studio() {
               onChange={(value) => {
                 const val = value || '';
                 setFiles(prev => ({ ...prev, [activeFile]: val }));
-                if (lspRef.current.open) updateLspDocument(activeFile, val);
+                // LSP sync is handled exclusively by onDidChangeModelContent
+                // (registered in onEditorMount). Calling updateLspDocument here
+                // too would send two textDocument/didChange per keystroke and
+                // double-increment the version counter, desynchronising terraform-ls.
               }}
             />
           </div>
