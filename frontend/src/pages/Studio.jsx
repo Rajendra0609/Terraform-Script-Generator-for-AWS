@@ -530,7 +530,16 @@ export default function Studio() {
                 didSave: false,
               },
               completion: {
-                completionItem: { snippetSupport: true, documentationFormat: ['markdown', 'plaintext'] },
+                dynamicRegistration: false,
+                completionItem: {
+                  snippetSupport: true,
+                  commitCharactersSupport: true,
+                  documentationFormat: ['markdown', 'plaintext'],
+                  deprecatedSupport: true,
+                  preselectSupport: true,
+                  resolveSupport: { properties: ['documentation', 'detail', 'additionalTextEdits'] },
+                },
+                contextSupport: true,
               },
               hover: { contentFormat: ['markdown', 'plaintext'] },
               definition: { linkSupport: false },
@@ -764,15 +773,21 @@ export default function Studio() {
 
     // 1. Completion
     monaco.languages.registerCompletionItemProvider(LANG, {
-      triggerCharacters: ['.', '"', '_', '{', ' ', '='],
+      // Include letters/digits so the provider fires while typing a word,
+      // not just after a punctuation trigger character.
+      triggerCharacters: ['.', '"', '_', '{', ' ', '=', ':', '\n', 'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z'],
       provideCompletionItems: async (model, position) => {
         if (lspRef.current.open) {
           // LSP connected — always return its answer, even if empty.
           // Never fall through to the keyword fallback when LSP is live;
           // mixing both lists produces confusing duplicate / irrelevant items.
           try {
+            // model.uri.toString() is already "file:///terraform/<filename>"
+            // — use it directly; do NOT pass through fileUri() which would
+            // double-wrap it into "file:///terraform/file:///terraform/main.tf"
+            const docUri = model.uri.toString();
             const raw = await sendLspRequest('textDocument/completion', {
-              textDocument: { uri: fileUri(model.uri.toString().replace('file:///terraform/', '')) },
+              textDocument: { uri: docUri },
               position: { line: position.lineNumber - 1, character: position.column - 1 },
             });
             const items = Array.isArray(raw) ? raw : (raw?.items || []);
@@ -801,9 +816,10 @@ export default function Studio() {
                   };
                 }),
             };
-          } catch (_) {
-            // LSP request failed — return empty rather than keyword fallback
-            // so misleading suggestions don't appear while LSP is connected.
+          } catch (err) {
+            // Log to the LSP output panel so the user can see what failed,
+            // then return empty so Monaco doesn't crash.
+            console.warn('[LSP completion error]', err?.message || err);
             return { suggestions: [] };
           }
         }
@@ -854,9 +870,9 @@ export default function Studio() {
       provideHover: async (model, position) => {
         if (!lspRef.current.open) return null;
         try {
-          const fn = model.uri.toString().replace('file:///terraform/', '');
+          const docUri = model.uri.toString();
           const result = await sendLspRequest('textDocument/hover', {
-            textDocument: { uri: fileUri(fn) },
+            textDocument: { uri: docUri },
             position: { line: position.lineNumber - 1, character: position.column - 1 },
           });
           if (!result?.contents) return null;
@@ -877,9 +893,9 @@ export default function Studio() {
       provideDefinition: async (model, position) => {
         if (!lspRef.current.open) return null;
         try {
-          const fn = model.uri.toString().replace('file:///terraform/', '');
+          const docUri = model.uri.toString();
           const result = await sendLspRequest('textDocument/definition', {
-            textDocument: { uri: fileUri(fn) },
+            textDocument: { uri: docUri },
             position: { line: position.lineNumber - 1, character: position.column - 1 },
           });
           if (!result) return null;
@@ -904,9 +920,9 @@ export default function Studio() {
       provideReferences: async (model, position) => {
         if (!lspRef.current.open) return null;
         try {
-          const fn = model.uri.toString().replace('file:///terraform/', '');
+          const docUri = model.uri.toString();
           const result = await sendLspRequest('textDocument/references', {
-            textDocument: { uri: fileUri(fn) },
+            textDocument: { uri: docUri },
             position: { line: position.lineNumber - 1, character: position.column - 1 },
             context: { includeDeclaration: true },
           });
@@ -931,9 +947,9 @@ export default function Studio() {
       provideDocumentSymbols: async (model) => {
         if (!lspRef.current.open) return null;
         try {
-          const fn = model.uri.toString().replace('file:///terraform/', '');
+          const docUri = model.uri.toString();
           const result = await sendLspRequest('textDocument/documentSymbol', {
-            textDocument: { uri: fileUri(fn) },
+            textDocument: { uri: docUri },
           });
           if (!Array.isArray(result)) return null;
           setSymbols(result);
