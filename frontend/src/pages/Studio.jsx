@@ -894,6 +894,7 @@ export default function Studio() {
         if (!lspRef.current.open) return null;
         try {
           const docUri = model.uri.toString();
+          const currentFn = docUri.replace('file:///terraform/', '');
           const result = await sendLspRequest('textDocument/definition', {
             textDocument: { uri: docUri },
             position: { line: position.lineNumber - 1, character: position.column - 1 },
@@ -901,7 +902,7 @@ export default function Studio() {
           if (!result) return null;
           const locs = Array.isArray(result) ? result : [result];
           return locs.map(loc => {
-            const locFn = loc.uri?.replace('file:///terraform/', '') || fn;
+            const locFn = loc.uri?.replace('file:///terraform/', '') || currentFn;
             const targetModel = modelsRef.current[locFn] || model;
             return {
               uri: targetModel.uri,
@@ -921,6 +922,7 @@ export default function Studio() {
         if (!lspRef.current.open) return null;
         try {
           const docUri = model.uri.toString();
+          const currentFn = docUri.replace('file:///terraform/', '');
           const result = await sendLspRequest('textDocument/references', {
             textDocument: { uri: docUri },
             position: { line: position.lineNumber - 1, character: position.column - 1 },
@@ -928,7 +930,7 @@ export default function Studio() {
           });
           if (!Array.isArray(result)) return null;
           return result.map(loc => {
-            const locFn = loc.uri?.replace('file:///terraform/', '') || fn;
+            const locFn = loc.uri?.replace('file:///terraform/', '') || currentFn;
             const m2 = modelsRef.current[locFn] || model;
             return {
               uri: m2.uri,
