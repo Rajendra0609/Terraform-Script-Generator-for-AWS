@@ -1,27 +1,23 @@
 import axios from 'axios';
 
-// REACT_APP_API_URL must be set in .env (or .env.local).
-// For local dev: http://localhost:4000
-// Never leave this undefined — it defaults to the same origin which won't
-// reach a backend running on a different port.
-const BASE_URL = process.env.REACT_APP_API_URL;
-
-if (!BASE_URL) {
-  console.error(
-    '[client.js] REACT_APP_API_URL is not set!\n' +
-    'Create frontend/.env with: REACT_APP_API_URL=http://localhost:4000\n' +
-    'Then restart the dev server.'
-  );
-}
+// ── Base URL ──────────────────────────────────────────────────────────────────
+// When running behind the nginx proxy (docker-compose), REACT_APP_API_URL is
+// intentionally empty. All /api/... calls are made relative to the same origin
+// (e.g. http://localhost:3000/api/...) and nginx proxies them to the backend
+// container via Docker internal DNS.
+//
+// Only non-empty when running the frontend directly against a remote backend
+// (e.g. REACT_APP_API_URL=http://localhost:4000 for bare `npm start` dev).
+const BASE_URL = process.env.REACT_APP_API_URL || '';
 
 // Debug: print which API base URL the client was built with (development only)
 if (process.env.NODE_ENV === 'development') {
-  console.debug(`[API] BASE_URL = ${BASE_URL || 'null (will default to http://localhost:4000)'}`);
+  console.debug(`[API] BASE_URL = "${BASE_URL || '(empty — using relative paths via nginx proxy)'}" `);
 }
 
 const API = axios.create({
-  baseURL: BASE_URL || 'http://localhost:4000',
-  timeout: 120000, // 120s for long terraform operations
+  baseURL: BASE_URL,   // '' = relative URLs, nginx handles the proxy
+  timeout: 120000,     // 120s for long terraform operations
   headers: { 'Content-Type': 'application/json' },
   // BUG-008 fix: send cookies (including the HttpOnly refreshToken) cross-origin
   withCredentials: true,
@@ -135,8 +131,8 @@ API.interceptors.response.use(
 
     if (err.code === 'ERR_NETWORK' || err.code === 'ECONNREFUSED') {
       console.error(
-        `[API] Cannot reach backend at ${BASE_URL}.\n` +
-        `Make sure the backend is running: cd backend && npm start`
+        `[API] Cannot reach backend.\n` +
+        `Make sure docker-compose is running: docker compose up -d`
       );
     } else if (err.response) {
       console.error(`[API] ${err.response.status} - ${JSON.stringify(err.response.data)}`);
@@ -158,7 +154,7 @@ if (window[_HEALTH_INTERVAL_KEY]) {
 }
 window[_HEALTH_INTERVAL_KEY] = setInterval(async () => {
   try {
-    await API.get('/api/health', { timeout: 5000, _skipRetry: true }); // skip retry for health — BUG-018 fix: explicit flag, not fragile _retryCount seed
+    await API.get('/api/health', { timeout: 5000, _skipRetry: true }); // BUG-018 fix: explicit flag
     _healthOk = true;
   } catch {
     _healthOk = false;
@@ -176,6 +172,16 @@ function assertProjectId(id) {
     return Promise.reject(new Error(msg));
   }
   return null;
+}
+
+// ── WebSocket base URL ────────────────────────────────────────────────────────
+// Derive the WebSocket base from window.location so it always matches the page
+// origin — this works correctly whether accessed via localhost, an IP, or a
+// domain, without any hardcoded addresses.
+// nginx proxies /ws/... to the backend container (see nginx.conf).
+function getWsBase() {
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${window.location.host}`;
 }
 
 export const projectsAPI = {
@@ -210,21 +216,19 @@ export const terraformAPI = {
   scan:     (hcl)                  => API.post('/api/terraform/scan',     { hcl }),
 };
 
-
 /** WebSocket job stream — returns a WebSocket instance. */
 export const jobsAPI = {
   connectWs(jobId) {
-    const wsBase = (process.env.REACT_APP_API_URL || 'http://localhost:4000')
-      .replace(/^http/, 'ws');
-    return new WebSocket(`${wsBase}/ws/jobs?id=${encodeURIComponent(jobId)}`);
+    // Use window.location so the WS goes through nginx (/ws/ proxy block)
+    // regardless of what host/IP the app is accessed from.
+    return new WebSocket(`${getWsBase()}/ws/jobs?id=${encodeURIComponent(jobId)}`);
   },
 };
 
 export const terraformLspAPI = {
   connect() {
-    const wsBase = (process.env.REACT_APP_API_URL_LS || 'http://localhost:4000')
-      .replace(/^http/, 'ws');
-    return new WebSocket(`${wsBase}/ws/terraform-lsp`);
+    // Use window.location so the WS goes through nginx (/ws/ proxy block).
+    return new WebSocket(`${getWsBase()}/ws/terraform-lsp`);
   },
 };
 
