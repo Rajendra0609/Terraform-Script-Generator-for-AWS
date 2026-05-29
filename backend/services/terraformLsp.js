@@ -222,7 +222,12 @@ class TerraformLspSession {
         initializationOptions: {
           ...(payload.params?.initializationOptions || {}),
           experimentalFeatures: { prefillRequiredFields: true },
-          terraform: { path: process.env.TERRAFORM_PATH || 'terraform' },
+          // Only pass terraform.path if it's an absolute path —
+          // terraform-ls rejects relative names like "terraform" with -32098.
+          // If unset, terraform-ls auto-discovers the binary from PATH.
+          ...(process.env.TERRAFORM_PATH?.startsWith('/')
+            ? { terraform: { path: process.env.TERRAFORM_PATH } }
+            : {}),
         },
       };
       this._writeToProcess(payload);
