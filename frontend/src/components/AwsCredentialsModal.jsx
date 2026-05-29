@@ -57,8 +57,16 @@ export default function AwsCredentialsModal({ onClose }) {
         aws_region:        form.aws_region,
         label:             form.label.trim() || 'My AWS Account',
       });
-      const info = res.data.accountInfo;
-      setSuccess(`Credentials verified and saved! AWS Account: ${info?.account || 'N/A'}`);
+      const info    = res.data.accountInfo;
+      const warning = res.data.warning; // set by backend when SKIP_STS_VERIFY=true or STS was unreachable
+      // FIX: when the backend saved credentials without live STS verification it
+      // returns a `warning` field. Show that instead of the misleading
+      // "Credentials verified" message so the user knows verification was skipped.
+      if (warning) {
+        setSuccess(`⚠️ Credentials saved (unverified): ${warning}`);
+      } else {
+        setSuccess(`Credentials verified and saved! AWS Account: ${info?.account || 'N/A'}`);
+      }
       // Refresh displayed metadata
       const r = await awsAPI.getCredentials();
       setExisting(r.data.credentials);
