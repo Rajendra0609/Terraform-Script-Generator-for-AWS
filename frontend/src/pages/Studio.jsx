@@ -759,17 +759,18 @@ export default function Studio() {
     monaco.languages.registerCompletionItemProvider(LANG, {
       triggerCharacters: ['.', '"', '_', '{', ' ', '='],
       provideCompletionItems: async (model, position) => {
-        // LSP completions first
         if (lspRef.current.open) {
+          // LSP connected — always return its answer, even if empty.
+          // Never fall through to the keyword fallback when LSP is live;
+          // mixing both lists produces confusing duplicate / irrelevant items.
           try {
             const raw = await sendLspRequest('textDocument/completion', {
               textDocument: { uri: fileUri(model.uri.toString().replace('file:///terraform/', '')) },
               position: { line: position.lineNumber - 1, character: position.column - 1 },
             });
             const items = Array.isArray(raw) ? raw : (raw?.items || []);
-            if (items.length) {
-              return {
-                suggestions: items.slice(0, 30).map(item => {
+            return {
+              suggestions: items.slice(0, 50).map(item => {
                   const ins = item.textEdit ? item.textEdit.newText : (item.insertText || item.label || '');
                   const rng = item.textEdit
                     ? new monaco.Range(
@@ -792,11 +793,15 @@ export default function Studio() {
                     sortText: String(item.sortText || item.label || ''),
                   };
                 }),
-              };
-            }
-          } catch (_) {}
+            };
+          } catch (_) {
+            // LSP request failed — return empty rather than keyword fallback
+            // so misleading suggestions don't appear while LSP is connected.
+            return { suggestions: [] };
+          }
         }
-        // Fallback: keyword + block snippets so the editor is never completely silent
+        // ── Offline fallback ─────────────────────────────────────────────
+        // Only reached when terraform-ls is NOT connected.
         const word = model.getWordUntilPosition(position);
         const fallbackRange = new monaco.Range(
           position.lineNumber, word.startColumn,
@@ -1108,9 +1113,14 @@ export default function Studio() {
     // Ensure model exists
     if (!modelsRef.current[filename]) {
       const uri = monaco.Uri.parse(fileUri(filename));
-      modelsRef.current[filename] = monaco.editor.createModel(
-        files[filename] || '', 'terraform', uri,
-      );
+      // getModel first — createModel throws "Another model is already set at that URI"
+      // if Monaco has a cached model we don't know about yet.
+      const existing = monaco.editor.getModel(uri);
+      const model = existing || monaco.editor.createModel(files[filename] || '', 'terraform', uri);
+      if (existing && existing.getLanguageId() !== 'terraform') {
+        monaco.editor.setModelLanguage(existing, 'terraform');
+      }
+      modelsRef.current[filename] = model;
     }
     editor.setModel(modelsRef.current[filename]);
     setActiveFile(filename);
