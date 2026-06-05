@@ -28,7 +28,7 @@ pipeline {
         DOCKER_HUB_CREDENTIALS_ID = 'docker'
         GIT_BRANCH                = "${params.GIT_BRANCH}"
         GITHUB_CREDENTIALS_ID     = 'github'
-        GITHUB_REPO               = 'Rajendra0609/masala-and-mug'
+        GITHUB_REPO               = 'Rajendra0609/Terraform-Script-Generator-for-AWS'
         GITHUB_API_URL            = 'https://api.github.com'
         EMAIL_RECIPIENTS          = 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com'
         TERM                      = 'xterm-256color'
@@ -38,25 +38,61 @@ pipeline {
         SCANNER_HOME              = tool 'sonar'
         // Composed image tag used across Docker stages
         IMAGE_TAG                 = "${params.DOCKERHUBREPO}:${params.VERSION}"
+        BACKEND_TEST_PORT = '4099'
+        FRONTEND_URL      = 'http://localhost:3000'
+
+        // ── Test credentials (override from Jenkins credentials store) ─────────
+        TEST_DATABASE_URL = credentials('TEST_DATABASE_URL')
+        TEST_REDIS_URL    = credentials('TEST_REDIS_URL')
+        JWT_SECRET        = credentials('TFGEN_TEST_JWT_SECRET')
+        ENCRYPT_KEY       = credentials('TFGEN_TEST_ENCRYPT_KEY')
+
+        // ── Node / npm ─────────────────────────────────────────────────────────
+        NODE_ENV          = 'test'
+        CI                = 'true'
+        NPM_CONFIG_CACHE  = "${WORKSPACE}/.npm-cache"
+
+        // ── Reports ────────────────────────────────────────────────────────────
+        REPORT_DIR        = "${WORKSPACE}/tests/reports"
+
+        // ── Playwright ────────────────────────────────────────────────────────
+        PLAYWRIGHT_BROWSERS_PATH = "${WORKSPACE}/.playwright-browsers"
     }
     parameters {
-        string(name: 'GIT_BRANCH',               defaultValue: 'Basics',                         description: 'Branch to build')
-        string(name: 'DOCKERHUBREPO',            defaultValue: 'daggu1997/masalamugstaticweb',    description: 'Docker Hub repository to push the image')
+        string(name: 'GIT_BRANCH',               defaultValue: 'docker_test',                         description: 'Branch to build')
+        string(name: 'DOCKERHUBREPO',            defaultValue: 'daggu1997/terraform-script-generator',    description: 'Docker Hub repository to push the image')
         string(name: 'VERSION',                  defaultValue: 'v0.0.1',                          description: 'Version of the Docker image')
         string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                        description: 'Credentials ID for Docker Hub')
         string(name: 'GITHUB_CREDENTIALS_ID',   defaultValue: 'github',                          description: 'Credentials ID for GitHub access')
-        string(name: 'GITHUB_REPO',             defaultValue: 'Rajendra0609/masala-and-mug',     description: 'GitHub repository in owner/repo format')
+        string(name: 'GITHUB_REPO',             defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',     description: 'GitHub repository in owner/repo format')
         string(name: 'TAG',                     defaultValue: 'v0.0.1',                           description: 'Version of the Kubernetes deployment')
         string(name: 'EMAIL_RECIPIENTS',        defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated list of email recipients')
         string(name: 'K8S_NAMESPACE',           defaultValue: 'default',                          description: 'Kubernetes namespace for deployment')
-        string(name: 'K8S_DEPLOYMENT_NAME',     defaultValue: 'masala-and-mug',                  description: 'Kubernetes deployment name')
+        string(name: 'K8S_DEPLOYMENT_NAME',     defaultValue: 'terraform-script-generator',                  description: 'Kubernetes deployment name')
     }
 
     stages {
 
-        // ─────────────────────────────────────────────────────────────────
-        // 1. Node health-check
-        // ─────────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo '🔄 Cloning the code into source/'
+                checkout scm: [
+                    $class: 'GitSCM',
+                    branches: [[name: "${params.GIT_BRANCH}"]],
+                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'source']],
+                    userRemoteConfigs: [[
+                        url          : 'https://github.com/Rajendra0609/Terraform-Script-Generator-for-AWS.git',
+                        credentialsId: 'github',
+                        name         : 'origin'
+                    ]]
+                ]
+                // Stash checked-out source so later stages can restore it if needed
+                dir('source') {
+                    stash name: 'source-code', includes: '**/*'
+                }
+            }
+        }
+
         stage('Check Node Status') {
             steps {
                 withCredentials([
@@ -76,32 +112,6 @@ pipeline {
             }
         }
 
-        // ─────────────────────────────────────────────────────────────────
-        // 2. Checkout
-        // ─────────────────────────────────────────────────────────────────
-        stage('Checkout') {
-            steps {
-                echo '🔄 Cloning the code into source/'
-                checkout scm: [
-                    $class: 'GitSCM',
-                    branches: [[name: "${params.GIT_BRANCH}"]],
-                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'source']],
-                    userRemoteConfigs: [[
-                        url          : 'https://github.com/Rajendra0609/masala-and-mug.git',
-                        credentialsId: 'github',
-                        name         : 'origin'
-                    ]]
-                ]
-                // Stash checked-out source so later stages can restore it if needed
-                dir('source') {
-                    stash name: 'source-code', includes: '**/*'
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 3. Secret scanning
-        // ─────────────────────────────────────────────────────────────────
         stage('Gitleaks Scan') {
             steps {
                 dir('source') {
@@ -116,206 +126,28 @@ pipeline {
             }
         }
 
-        // ─────────────────────────────────────────────────────────────────
-        // 4. HTML validation
-        // ─────────────────────────────────────────────────────────────────
-        stage('HTML Test') {
-            steps {
-                dir('source') {
-                    echo '🧪 Running HTML validation...'
-                    sh 'npm install -g html-validator-cli'
-                    sh 'html-validator --file=./index.html --verbose > ../validation-report.txt || true'
-                    echo '✅ HTML validation completed.'
-                }
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'validation-report.txt', allowEmptyArchive: true
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 5. Install dependencies
-        // ─────────────────────────────────────────────────────────────────
         stage('Install Dependencies') {
-            steps {
-                dir('source') {
-                    echo '📦 Installing npm dependencies...'
-                    sh 'npm install'
-                    echo '✅ Dependencies installed.'
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 6. Unit tests (JUnit)
-        // ─────────────────────────────────────────────────────────────────
-        stage('JUnit Test') {
-            steps {
-                dir('source') {
-                    echo '🧪 Running JUnit tests...'
-                    script {
-                        def testResult = sh(script: 'npm test', returnStatus: true)
-                        if (testResult != 0) {
-                            echo '⚠️ Some tests failed — continuing (allowFailure=true).'
+            parallel {
+                stage('Backend') {
+                    steps {
+                        dir('backend') {
+                            echo '📦 Installing backend npm dependencies...'
+                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
                         }
                     }
-                    echo '✅ JUnit tests completed.'
                 }
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'source/test-results/**/*.xml', fingerprint: true, allowEmptyArchive: true
-                    junit testResults: 'source/test-results/**/*.xml', allowEmptyResults: true
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 7. OWASP Dependency-Check  ← NEW
-        // ─────────────────────────────────────────────────────────────────
-        stage('OWASP Dependency Check') {
-            steps {
-                dir('source') {
-                    echo '🛡️ Running OWASP Dependency-Check...'
-                    dependencyCheck(
-                        additionalArguments: '''
-                            --scan .
-                            --format HTML
-                            --format XML
-                            --out ../owasp-reports
-                            --prettyPrint
-                        ''',
-                        odcInstallation: 'OWASP-DC'
-                    )
-                }
-            }
-            post {
-                always {
-                    dependencyCheckPublisher pattern: 'owasp-reports/dependency-check-report.xml'
-                    archiveArtifacts artifacts: 'owasp-reports/**', allowEmptyArchive: true
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 8. SonarQube analysis  ← NEW
-        // ─────────────────────────────────────────────────────────────────
-        stage('SonarQube Analysis') {
-            steps {
-                dir('source') {
-                    echo '🔎 Running SonarQube analysis...'
-                    withSonarQubeEnv('sonar') {
-                        sh """
-                            ${SCANNER_HOME}/bin/sonar-scanner \
-                                -Dsonar.projectKey=masala-and-mug \
-                                -Dsonar.projectName='Masala and Mug' \
-                                -Dsonar.projectVersion=${params.VERSION} \
-                                -Dsonar.sources=. \
-                                -Dsonar.branch.name=${params.GIT_BRANCH}
-                        """
+                stage('Frontend') {
+                    steps {
+                        dir('frontend') {
+                            echo '📦 Installing frontend npm dependencies...'
+                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
+                        }
                     }
                 }
             }
-        }
+        }    
 
-        // ─────────────────────────────────────────────────────────────────
-        // 9. SonarQube Quality Gate  ← NEW
-        // ─────────────────────────────────────────────────────────────────
-        stage('Quality Gate') {
-            steps {
-                echo '⏳ Waiting for SonarQube Quality Gate...'
-                timeout(time: 5, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
-                }
-                echo '✅ Quality Gate passed.'
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 10. Docker Build  ← NEW
-        // ─────────────────────────────────────────────────────────────────
-        stage('Docker Build') {
-            steps {
-                dir('source') {
-                    echo "🐳 Building Docker image: ${IMAGE_TAG}"
-                    sh "docker build -t ${IMAGE_TAG} ."
-                    echo '✅ Docker image built.'
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 11. Trivy Image Scan  ← NEW
-        // ─────────────────────────────────────────────────────────────────
-        stage('Trivy Image Scan') {
-            steps {
-                echo "🔍 Scanning Docker image with Trivy: ${IMAGE_TAG}"
-                sh """
-                    trivy image \
-                        --exit-code 0 \
-                        --severity HIGH,CRITICAL \
-                        --format table \
-                        --output trivy-report.txt \
-                        ${IMAGE_TAG}
-                """
-                echo '✅ Trivy scan completed.'
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'trivy-report.txt', allowEmptyArchive: true
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 12. Docker Push  ← NEW
-        // ─────────────────────────────────────────────────────────────────
-        stage('Docker Push') {
-            steps {
-                echo "📤 Pushing Docker image to Docker Hub: ${IMAGE_TAG}"
-                withCredentials([
-                    usernamePassword(credentialsId: "${params.DOCKER_HUB_CREDENTIALS_ID}",
-                                     usernameVariable: 'DOCKER_USER',
-                                     passwordVariable: 'DOCKER_PASS')
-                ]) {
-                    sh '''
-                        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
-                        docker push ''' + "${IMAGE_TAG}" + '''
-                        docker logout
-                    '''
-                }
-                echo '✅ Docker image pushed.'
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // 13. Kubernetes Deploy  ← NEW
-        // ─────────────────────────────────────────────────────────────────
-        stage('Deploy to Kubernetes') {
-            steps {
-                echo "🚀 Deploying ${IMAGE_TAG} to Kubernetes namespace '${params.K8S_NAMESPACE}'..."
-                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
-                    sh """
-                        kubectl set image deployment/${params.K8S_DEPLOYMENT_NAME} \
-                            ${params.K8S_DEPLOYMENT_NAME}=${IMAGE_TAG} \
-                            --namespace=${params.K8S_NAMESPACE}
-
-                        kubectl rollout status deployment/${params.K8S_DEPLOYMENT_NAME} \
-                            --namespace=${params.K8S_NAMESPACE} \
-                            --timeout=120s
-                    """
-                }
-                echo '✅ Kubernetes deployment successful.'
-            }
-        }
-
-    } // end stages
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Post actions
-    // ─────────────────────────────────────────────────────────────────────
+    } 
     post {
         success {
             echo '✅ Build & Deploy completed successfully!'
