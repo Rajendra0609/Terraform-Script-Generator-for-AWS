@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Terraform AWS Generator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Color+Emoji&display=swap" rel="stylesheet"/>
+  <!-- FEATURE: Twemoji for consistent cross-platform emoji rendering in SVG.
+       Provides Twitter's open-source color emoji set, ensuring emojis in the
+       Resource Graph nodes look identical on all browsers/OS combinations. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js" crossorigin="anonymous"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Outfit', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            tf: {
+              purple: '#7B42BC',
+              light:  '#9F6FD0',
+              dark:   '#5325A0',
+              orange: '#F0883E',
+              bg:     '#0D1117',
+              surface:'#161B22',
+              card:   '#21262D',
+              border: '#30363D',
+              text:   '#E6EDF3',
+              muted:  '#8B949E',
+              green:  '#3FB950',
+              red:    '#F85149',
+              yellow: '#D29922',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0D1117; color: #E6EDF3; font-family: 'Outfit', sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #161B22; }
+    ::-webkit-scrollbar-thumb { background: #30363D; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #7B42BC; }
+    .code-area { font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.6; }
+    .line-numbers { counter-reset: line; }
+    .line-numbers .line::before { counter-increment: line; content: counter(line); display: inline-block; width: 36px; color: #8B949E; text-align: right; margin-right: 16px; user-select: none; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .fade-in { animation: fadeIn 0.25s ease forwards; }
+    @keyframes pulse-border { 0%,100% { border-color: #7B42BC; } 50% { border-color: #9F6FD0; } }
+    .active-service { animation: pulse-border 2s infinite; }
+    .toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; }
+    .split-panel { display: flex; height: calc(100vh - 56px); overflow: hidden; }
+    .panel-left   { width: 260px; min-width: 260px; overflow-y: auto; border-right: 1px solid #30363D; background: #161B22; }
+    .panel-center { flex: 1; overflow-y: auto; background: #0D1117; }
+    .panel-right  { width: 480px; min-width: 480px; overflow-y: auto; border-left: 1px solid #30363D; background: #161B22; }
+
+    /* ── FEATURE: Global emoji styling ── */
+    /* Ensure emoji render with color on all platforms */
+    .emoji { font-family: "Noto Color Emoji", "Segoe UI Emoji", "Apple Color Emoji", "Twemoji Mozilla", sans-serif; }
+    /* Twemoji img elements: sized to match surrounding text */
+    img.emoji { height: 1em; width: 1em; margin: 0 0.05em 0 0.1em; vertical-align: -0.1em; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- FEATURE: Initialize Twemoji on page load for SVG emoji fallback -->
+  <script>
+    // Parse emoji in the document after React mounts
+    // Uses MutationObserver to handle dynamically added content
+    if (window.twemoji) {
+      const twemojiOpts = { folder: 'svg', ext: '.svg', base: 'https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/' };
+      document.addEventListener('DOMContentLoaded', () => {
+        // Re-parse on DOM mutations for React-rendered content
+        const observer = new MutationObserver(() => {
+          // Only parse non-SVG DOM nodes (SVG text handles its own font-family)
+          const htmlNodes = document.querySelectorAll('.navbar-emoji, .legend-emoji, .toolbar-emoji');
+          htmlNodes.forEach(node => twemoji.parse(node, twemojiOpts));
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+      });
+    }
+  </script>
+</body>
+</html>
