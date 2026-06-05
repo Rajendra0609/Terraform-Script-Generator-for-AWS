@@ -1,0 +1,449 @@
+pipeline {
+    agent {
+        kubernetes {
+            label 'kube_m'
+            defaultContainer 'jnlp'
+        }
+    }
+    tools {
+        nodejs 'nodejs'
+    }
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '1'))
+        disableConcurrentBuilds()
+        timeout(time: 1, unit: 'HOURS')
+        skipDefaultCheckout()
+        timestamps()
+        disableResume()
+        retry(1)
+        preserveStashes(buildCount: 10)
+        quietPeriod(5)
+        lock(resource: 'prod-deploy')
+        checkoutToSubdirectory('source')
+    }
+    environment {
+        DOCKER_HUB_CREDENTIALS_ID = 'docker'
+        GIT_BRANCH                = "${params.GIT_BRANCH}"
+        GITHUB_CREDENTIALS_ID     = 'github'
+        GITHUB_REPO               = 'Rajendra0609/masala-and-mug'
+        GITHUB_API_URL            = 'https://api.github.com'
+        EMAIL_RECIPIENTS          = 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com'
+        TERM                      = 'xterm-256color'
+        GITHUB_TOKEN              = 'git_token'
+        DOCKER_USER               = 'docker_user'
+        DOCKER_PASS               = 'docker_token'
+        SCANNER_HOME              = tool 'sonar'
+        // Composed image tag used across Docker stages
+        IMAGE_TAG                 = "${params.DOCKERHUBREPO}:${params.VERSION}"
+    }
+    parameters {
+        string(name: 'GIT_BRANCH',               defaultValue: 'Basics',                         description: 'Branch to build')
+        string(name: 'DOCKERHUBREPO',            defaultValue: 'daggu1997/masalamugstaticweb',    description: 'Docker Hub repository to push the image')
+        string(name: 'VERSION',                  defaultValue: 'v0.0.1',                          description: 'Version of the Docker image')
+        string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                        description: 'Credentials ID for Docker Hub')
+        string(name: 'GITHUB_CREDENTIALS_ID',   defaultValue: 'github',                          description: 'Credentials ID for GitHub access')
+        string(name: 'GITHUB_REPO',             defaultValue: 'Rajendra0609/masala-and-mug',     description: 'GitHub repository in owner/repo format')
+        string(name: 'TAG',                     defaultValue: 'v0.0.1',                           description: 'Version of the Kubernetes deployment')
+        string(name: 'EMAIL_RECIPIENTS',        defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated list of email recipients')
+        string(name: 'K8S_NAMESPACE',           defaultValue: 'default',                          description: 'Kubernetes namespace for deployment')
+        string(name: 'K8S_DEPLOYMENT_NAME',     defaultValue: 'masala-and-mug',                  description: 'Kubernetes deployment name')
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────────────────────────
+        // 1. Node health-check
+        // ─────────────────────────────────────────────────────────────────
+        stage('Check Node Status') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'github_token',  variable: 'GITHUB_TOKEN'),
+                    usernamePassword(credentialsId: 'docker',
+                                     usernameVariable: 'DOCKER_USER',
+                                     passwordVariable: 'DOCKER_PASS')
+                ]) {
+                    script {
+                        def status = sh(script: 'bash /usr/local/bin/node_status.sh', returnStdout: true).trim()
+                        echo "Node Status Output:\n${status}"
+                        if (status.contains("ERROR") || status.contains("DOWN")) {
+                            error("Node status check failed: ${status}")
+                        }
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 2. Checkout
+        // ─────────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo '🔄 Cloning the code into source/'
+                checkout scm: [
+                    $class: 'GitSCM',
+                    branches: [[name: "${params.GIT_BRANCH}"]],
+                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'source']],
+                    userRemoteConfigs: [[
+                        url          : 'https://github.com/Rajendra0609/masala-and-mug.git',
+                        credentialsId: 'github',
+                        name         : 'origin'
+                    ]]
+                ]
+                // Stash checked-out source so later stages can restore it if needed
+                dir('source') {
+                    stash name: 'source-code', includes: '**/*'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 3. Secret scanning
+        // ─────────────────────────────────────────────────────────────────
+        stage('Gitleaks Scan') {
+            steps {
+                dir('source') {
+                    echo '🔍 Running Gitleaks...'
+                    sh '''
+                        gitleaks detect --source . --redact \
+                            --report-format=json \
+                            --report-path=../gitleaks-report.json
+                    '''
+                }
+                archiveArtifacts artifacts: 'gitleaks-report.json', onlyIfSuccessful: false
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 4. HTML validation
+        // ─────────────────────────────────────────────────────────────────
+        stage('HTML Test') {
+            steps {
+                dir('source') {
+                    echo '🧪 Running HTML validation...'
+                    sh 'npm install -g html-validator-cli'
+                    sh 'html-validator --file=./index.html --verbose > ../validation-report.txt || true'
+                    echo '✅ HTML validation completed.'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'validation-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 5. Install dependencies
+        // ─────────────────────────────────────────────────────────────────
+        stage('Install Dependencies') {
+            steps {
+                dir('source') {
+                    echo '📦 Installing npm dependencies...'
+                    sh 'npm install'
+                    echo '✅ Dependencies installed.'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 6. Unit tests (JUnit)
+        // ─────────────────────────────────────────────────────────────────
+        stage('JUnit Test') {
+            steps {
+                dir('source') {
+                    echo '🧪 Running JUnit tests...'
+                    script {
+                        def testResult = sh(script: 'npm test', returnStatus: true)
+                        if (testResult != 0) {
+                            echo '⚠️ Some tests failed — continuing (allowFailure=true).'
+                        }
+                    }
+                    echo '✅ JUnit tests completed.'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'source/test-results/**/*.xml', fingerprint: true, allowEmptyArchive: true
+                    junit testResults: 'source/test-results/**/*.xml', allowEmptyResults: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 7. OWASP Dependency-Check  ← NEW
+        // ─────────────────────────────────────────────────────────────────
+        stage('OWASP Dependency Check') {
+            steps {
+                dir('source') {
+                    echo '🛡️ Running OWASP Dependency-Check...'
+                    dependencyCheck(
+                        additionalArguments: '''
+                            --scan .
+                            --format HTML
+                            --format XML
+                            --out ../owasp-reports
+                            --prettyPrint
+                        ''',
+                        odcInstallation: 'OWASP-DC'
+                    )
+                }
+            }
+            post {
+                always {
+                    dependencyCheckPublisher pattern: 'owasp-reports/dependency-check-report.xml'
+                    archiveArtifacts artifacts: 'owasp-reports/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 8. SonarQube analysis  ← NEW
+        // ─────────────────────────────────────────────────────────────────
+        stage('SonarQube Analysis') {
+            steps {
+                dir('source') {
+                    echo '🔎 Running SonarQube analysis...'
+                    withSonarQubeEnv('sonar') {
+                        sh """
+                            ${SCANNER_HOME}/bin/sonar-scanner \
+                                -Dsonar.projectKey=masala-and-mug \
+                                -Dsonar.projectName='Masala and Mug' \
+                                -Dsonar.projectVersion=${params.VERSION} \
+                                -Dsonar.sources=. \
+                                -Dsonar.branch.name=${params.GIT_BRANCH}
+                        """
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 9. SonarQube Quality Gate  ← NEW
+        // ─────────────────────────────────────────────────────────────────
+        stage('Quality Gate') {
+            steps {
+                echo '⏳ Waiting for SonarQube Quality Gate...'
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+                echo '✅ Quality Gate passed.'
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 10. Docker Build  ← NEW
+        // ─────────────────────────────────────────────────────────────────
+        stage('Docker Build') {
+            steps {
+                dir('source') {
+                    echo "🐳 Building Docker image: ${IMAGE_TAG}"
+                    sh "docker build -t ${IMAGE_TAG} ."
+                    echo '✅ Docker image built.'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 11. Trivy Image Scan  ← NEW
+        // ─────────────────────────────────────────────────────────────────
+        stage('Trivy Image Scan') {
+            steps {
+                echo "🔍 Scanning Docker image with Trivy: ${IMAGE_TAG}"
+                sh """
+                    trivy image \
+                        --exit-code 0 \
+                        --severity HIGH,CRITICAL \
+                        --format table \
+                        --output trivy-report.txt \
+                        ${IMAGE_TAG}
+                """
+                echo '✅ Trivy scan completed.'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 12. Docker Push  ← NEW
+        // ─────────────────────────────────────────────────────────────────
+        stage('Docker Push') {
+            steps {
+                echo "📤 Pushing Docker image to Docker Hub: ${IMAGE_TAG}"
+                withCredentials([
+                    usernamePassword(credentialsId: "${params.DOCKER_HUB_CREDENTIALS_ID}",
+                                     usernameVariable: 'DOCKER_USER',
+                                     passwordVariable: 'DOCKER_PASS')
+                ]) {
+                    sh '''
+                        echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                        docker push ''' + "${IMAGE_TAG}" + '''
+                        docker logout
+                    '''
+                }
+                echo '✅ Docker image pushed.'
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // 13. Kubernetes Deploy  ← NEW
+        // ─────────────────────────────────────────────────────────────────
+        stage('Deploy to Kubernetes') {
+            steps {
+                echo "🚀 Deploying ${IMAGE_TAG} to Kubernetes namespace '${params.K8S_NAMESPACE}'..."
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh """
+                        kubectl set image deployment/${params.K8S_DEPLOYMENT_NAME} \
+                            ${params.K8S_DEPLOYMENT_NAME}=${IMAGE_TAG} \
+                            --namespace=${params.K8S_NAMESPACE}
+
+                        kubectl rollout status deployment/${params.K8S_DEPLOYMENT_NAME} \
+                            --namespace=${params.K8S_NAMESPACE} \
+                            --timeout=120s
+                    """
+                }
+                echo '✅ Kubernetes deployment successful.'
+            }
+        }
+
+    } // end stages
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Post actions
+    // ─────────────────────────────────────────────────────────────────────
+    post {
+        success {
+            echo '✅ Build & Deploy completed successfully!'
+            slackSend(
+                channel: '#doc_jen_task_tracker',
+                message: """
+                    ✅ *Pipeline Success*
+                    *Job:* `${env.JOB_NAME}`
+                    *Build #:* `${env.BUILD_NUMBER}`
+                    *Image:* `${IMAGE_TAG}`
+                    *Status:* Passed ✅
+                    <${env.BUILD_URL}|View Build Logs>
+                """
+            )
+            mail(
+                to: "${EMAIL_RECIPIENTS}",
+                subject: "SUCCESS: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
+                body: """\
+                    The Jenkins Pipeline completed successfully.
+
+                    🐳 Docker Image : ${IMAGE_TAG}
+                    🔗 Pipeline URL : ${env.BUILD_URL}
+                    👷 Triggered by : ${currentBuild.getBuildCauses()[0].userName}
+
+                    View the full job here: ${env.BUILD_URL}
+                """
+            )
+        }
+
+        failure {
+            script {
+                def log         = currentBuild.rawBuild.getLog(1000)
+                def lastLines   = log.takeRight(50).join('\n')
+                def culprit     = "Unknown"
+                def changeAuthor = "Unknown"
+
+                try {
+                    changeAuthor = currentBuild.changeSets.collect { cs ->
+                        cs.items.collect { it.author.fullName }
+                    }.flatten().unique().join(', ')
+                    culprit = currentBuild.getBuildCauses()[0].userName
+                } catch (e) {
+                    echo "Failed to determine author or trigger: ${e.message}"
+                }
+
+                slackSend(
+                    channel: '#doc_jen_task_tracker',
+                    message: """
+                        ❌ *Pipeline Failure*
+                        *Job:* `${env.JOB_NAME}`
+                        *Build #:* `${env.BUILD_NUMBER}`
+                        *Status:* FAILED ❌
+                        <${env.BUILD_URL}|View Build Logs>
+                    """
+                )
+                mail(
+                    to: "${EMAIL_RECIPIENTS}",
+                    subject: "FAILURE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
+                    body: """\
+                        The Jenkins Pipeline has FAILED ❌
+
+                        👤 Git Committer(s): ${changeAuthor}
+                        🚀 Triggered by    : ${culprit}
+                        🔗 Pipeline URL    : ${env.BUILD_URL}
+
+                        📄 Last 50 lines of console output:
+                        --------------------------------------------------
+                        ${lastLines}
+                        --------------------------------------------------
+
+                        Please investigate the issue.
+                    """
+                )
+            }
+        }
+
+        unstable {
+            script {
+                def log          = currentBuild.rawBuild.getLog(1000)
+                def lastLines    = log.takeRight(50).join('\n')
+                def culprit      = "Unknown"
+                def changeAuthor = "Unknown"
+
+                try {
+                    changeAuthor = currentBuild.changeSets.collect { cs ->
+                        cs.items.collect { it.author.fullName }
+                    }.flatten().unique().join(', ')
+                    culprit = currentBuild.getBuildCauses()[0].userName
+                } catch (e) {
+                    echo "Failed to determine author or trigger: ${e.message}"
+                }
+
+                slackSend(
+                    channel: '#doc_jen_task_tracker',
+                    message: """
+                        ⚠️ *Pipeline Unstable*
+                        *Job:* `${env.JOB_NAME}`
+                        *Build #:* `${env.BUILD_NUMBER}`
+                        *Status:* UNSTABLE ⚠️
+                        <${env.BUILD_URL}|View Build Logs>
+                    """
+                )
+                mail(
+                    to: "${EMAIL_RECIPIENTS}",
+                    subject: "UNSTABLE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
+                    body: """\
+                        The Jenkins Pipeline is UNSTABLE ⚠️
+
+                        👤 Git Committer(s): ${changeAuthor}
+                        🚀 Triggered by    : ${culprit}
+                        🔗 Pipeline URL    : ${env.BUILD_URL}
+
+                        📄 Last 50 lines of console output:
+                        --------------------------------------------------
+                        ${lastLines}
+                        --------------------------------------------------
+
+                        Please investigate the warning.
+                    """
+                )
+            }
+        }
+
+        always {
+            // Clean up locally built Docker image to free disk space
+            sh "docker rmi ${IMAGE_TAG} || true"
+            cleanWs()
+            echo '🧹 Workspace cleaned'
+        }
+    }
+}
