@@ -22,60 +22,81 @@ pipeline {
         preserveStashes(buildCount: 10)
         quietPeriod(5)
         lock(resource: 'prod-deploy')
-        checkoutToSubdirectory('source')
+        checkoutToSubdirectory('source')   // ← entire repo lands at WORKSPACE/source/
     }
     environment {
+        // ── Source folder roots (all relative to WORKSPACE) ───────────────────
+        // Repo layout:
+        //   source/
+        //     backend/
+        //     database/
+        //     docs/
+        //     frontend/
+        SRC_ROOT      = "${WORKSPACE}/source"
+        BACKEND_DIR   = "${WORKSPACE}/source/backend"
+        FRONTEND_DIR  = "${WORKSPACE}/source/frontend"
+        DATABASE_DIR  = "${WORKSPACE}/source/database"
+        DOCS_DIR      = "${WORKSPACE}/source/docs"
+
+        // ── Docker / registry ────────────────────────────────────────────────
         DOCKER_HUB_CREDENTIALS_ID = 'docker'
-        GIT_BRANCH                = "${params.GIT_BRANCH}"
-        GITHUB_CREDENTIALS_ID     = 'github'
-        GITHUB_REPO               = 'Rajendra0609/Terraform-Script-Generator-for-AWS'
-        GITHUB_API_URL            = 'https://api.github.com'
-        EMAIL_RECIPIENTS          = 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com'
-        TERM                      = 'xterm-256color'
-        GITHUB_TOKEN              = 'git_token'
-        DOCKER_USER               = 'docker_user'
-        DOCKER_PASS               = 'docker_token'
-        SCANNER_HOME              = tool 'sonar'
-        // Composed image tag used across Docker stages
         IMAGE_TAG                 = "${params.DOCKERHUBREPO}:${params.VERSION}"
+
+        // ── GitHub ────────────────────────────────────────────────────────────
+        GITHUB_CREDENTIALS_ID = 'github'
+        GITHUB_REPO           = 'Rajendra0609/Terraform-Script-Generator-for-AWS'
+        GITHUB_API_URL        = 'https://api.github.com'
+
+        // ── Notifications ─────────────────────────────────────────────────────
+        EMAIL_RECIPIENTS = 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com'
+
+        // ── Misc ──────────────────────────────────────────────────────────────
+        TERM             = 'xterm-256color'
+        SCANNER_HOME     = tool 'sonar'
         BACKEND_TEST_PORT = '4099'
         FRONTEND_URL      = 'http://localhost:3000'
 
-        // ── Test credentials (override from Jenkins credentials store) ─────────
-        TEST_DATABASE_URL = credentials('TEST_DATABASE_URL')
-        TEST_REDIS_URL    = credentials('TEST_REDIS_URL')
-        JWT_SECRET        = credentials('TFGEN_TEST_JWT_SECRET')
-        ENCRYPT_KEY       = credentials('TFGEN_TEST_ENCRYPT_KEY')
+        // ── Node / npm ────────────────────────────────────────────────────────
+        NODE_ENV         = 'test'
+        CI               = 'true'
+        NPM_CONFIG_CACHE = "${WORKSPACE}/.npm-cache"
 
-        // ── Node / npm ─────────────────────────────────────────────────────────
-        NODE_ENV          = 'test'
-        CI                = 'true'
-        NPM_CONFIG_CACHE  = "${WORKSPACE}/.npm-cache"
-
-        // ── Reports ────────────────────────────────────────────────────────────
-        REPORT_DIR        = "${WORKSPACE}/tests/reports"
-
-        // ── Playwright ────────────────────────────────────────────────────────
+        // ── Reports / Playwright ──────────────────────────────────────────────
+        REPORT_DIR               = "${WORKSPACE}/tests/reports"
         PLAYWRIGHT_BROWSERS_PATH = "${WORKSPACE}/.playwright-browsers"
+
+        // ── Test credentials: bound with withCredentials() inside the test   ──
+        // ── stage only, NOT here — a missing credential here kills ALL stages ──
+        // ACTION REQUIRED: add these four Secret Text entries in Jenkins before
+        // the Run Tests stage will pass:
+        //   TEST_DATABASE_URL | TEST_REDIS_URL | TFGEN_TEST_JWT_SECRET | TFGEN_TEST_ENCRYPT_KEY
     }
     parameters {
-        string(name: 'GIT_BRANCH',               defaultValue: 'docker_test',                         description: 'Branch to build')
-        string(name: 'DOCKERHUBREPO',            defaultValue: 'daggu1997/terraform-script-generator',    description: 'Docker Hub repository to push the image')
-        string(name: 'VERSION',                  defaultValue: 'v0.0.1',                          description: 'Version of the Docker image')
-        string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                        description: 'Credentials ID for Docker Hub')
-        string(name: 'GITHUB_CREDENTIALS_ID',   defaultValue: 'github',                          description: 'Credentials ID for GitHub access')
-        string(name: 'GITHUB_REPO',             defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',     description: 'GitHub repository in owner/repo format')
-        string(name: 'TAG',                     defaultValue: 'v0.0.1',                           description: 'Version of the Kubernetes deployment')
-        string(name: 'EMAIL_RECIPIENTS',        defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated list of email recipients')
-        string(name: 'K8S_NAMESPACE',           defaultValue: 'default',                          description: 'Kubernetes namespace for deployment')
-        string(name: 'K8S_DEPLOYMENT_NAME',     defaultValue: 'terraform-script-generator',                  description: 'Kubernetes deployment name')
+        string(name: 'GIT_BRANCH',                defaultValue: 'docker_test',                                                       description: 'Branch to build')
+        string(name: 'DOCKERHUBREPO',             defaultValue: 'daggu1997/terraform-script-generator',                               description: 'Docker Hub repository')
+        string(name: 'VERSION',                   defaultValue: 'v0.0.1',                                                             description: 'Docker image version tag')
+        string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                                                             description: 'Credentials ID for Docker Hub')
+        string(name: 'GITHUB_CREDENTIALS_ID',    defaultValue: 'GITHUB_TOKEN',                                                              description: 'Credentials ID for GitHub')
+        string(name: 'GITHUB_REPO',              defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',                     description: 'GitHub repository (owner/repo)')
+        string(name: 'TAG',                      defaultValue: 'v0.0.1',                                                              description: 'Kubernetes deployment version')
+        string(name: 'EMAIL_RECIPIENTS',         defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated email recipients')
+        string(name: 'K8S_NAMESPACE',            defaultValue: 'default',                                                             description: 'Kubernetes namespace')
+        string(name: 'K8S_DEPLOYMENT_NAME',      defaultValue: 'terraform-script-generator',                                         description: 'Kubernetes deployment name')
     }
 
     stages {
 
+        // ── 1. Checkout ───────────────────────────────────────────────────────
+        // After this stage the workspace looks like:
+        //   WORKSPACE/
+        //     source/
+        //       backend/
+        //       database/
+        //       docs/
+        //       frontend/
         stage('Checkout') {
             steps {
-                echo '🔄 Cloning the code into source/'
+                echo '🔄 Cloning repo into source/'
                 checkout scm: [
                     $class: 'GitSCM',
                     branches: [[name: "${params.GIT_BRANCH}"]],
@@ -86,24 +107,24 @@ pipeline {
                         name         : 'origin'
                     ]]
                 ]
-                // Stash checked-out source so later stages can restore it if needed
                 dir('source') {
                     stash name: 'source-code', includes: '**/*'
                 }
             }
         }
 
+        // ── 2. Check Node Status ──────────────────────────────────────────────
         stage('Check Node Status') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'github_token',  variable: 'GITHUB_TOKEN'),
+                    string(credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN'),
                     usernamePassword(credentialsId: 'docker',
                                      usernameVariable: 'DOCKER_USER',
                                      passwordVariable: 'DOCKER_PASS')
                 ]) {
                     script {
                         def status = sh(script: 'bash /usr/local/bin/node_status.sh', returnStdout: true).trim()
-                        echo "Node Status Output:\n${status}"
+                        echo "Node Status:\n${status}"
                         if (status.contains("ERROR") || status.contains("DOWN")) {
                             error("Node status check failed: ${status}")
                         }
@@ -112,87 +133,235 @@ pipeline {
             }
         }
 
+        // ── 3. Gitleaks Scan ──────────────────────────────────────────────────
         stage('Gitleaks Scan') {
-            steps {
-                dir('source') {
-                    echo '🔍 Running Gitleaks...'
-                    sh '''
-                        gitleaks detect --source . --redact \
+    steps {
+        dir('source') {
+            echo '🔍 Running Gitleaks secret scan...'
+            script {
+                // Run gitleaks; capture exit code instead of letting Jenkins abort
+                def exitCode = sh(
+                    script: '''
+                        gitleaks detect \
+                            --source . \
+                            --redact \
                             --report-format=json \
-                            --report-path=../gitleaks-report.json
-                    '''
+                            --report-path=../gitleaks-report.json \
+                            --exit-code 1
+                    ''',
+                    returnStatus: true   // ← prevents Jenkins from failing on non-zero
+                )
+ 
+                // Print a readable summary from the JSON report
+                def reportFile = new File("${WORKSPACE}/gitleaks-report.json")
+                if (reportFile.exists() && reportFile.text.trim() != 'null') {
+                    def leaks = readJSON file: "${WORKSPACE}/gitleaks-report.json"
+                    if (leaks && leaks.size() > 0) {
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "🚨 Gitleaks found ${leaks.size()} potential secret(s):"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        leaks.eachWithIndex { leak, i ->
+                            echo """
+[${i + 1}] Rule      : ${leak.RuleID}
+    File      : ${leak.File}
+    Line      : ${leak.StartLine}
+    Commit    : ${leak.Commit}
+    Author    : ${leak.Author}
+    Secret    : ${leak.Secret}   ← REDACTED in report (--redact flag is on)
+"""
+                        }
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "ℹ️  False positives? Add them to source/.gitleaksignore"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    }
                 }
-                archiveArtifacts artifacts: 'gitleaks-report.json', onlyIfSuccessful: false
+ 
+                // ── CHOOSE ONE behaviour below ────────────────────────────────
+ 
+                // OPTION A (recommended for CI enforcement):
+                // Fail the build — no secrets allowed to merge.
+                if (exitCode != 0) {
+                    error("🚨 Gitleaks found secrets in the repo. Fix or allowlist them before merging.")
+                }
+ 
+                // OPTION B (soft warning — build continues, team is alerted):
+                // Uncomment this block and comment out OPTION A above if you
+                // want the pipeline to keep running while you clean up the leaks.
+                // if (exitCode != 0) {
+                //     unstable("⚠️ Gitleaks found ${leaks?.size() ?: 'some'} secret(s). Review gitleaks-report.json.")
+                // }
+            }
+        }
+    }
+    post {
+        always {
+            // Archive report regardless of pass/fail so it's visible in Jenkins UI
+            archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+        }
+    }
+}
+
+        // ── 4. Install Dependencies ───────────────────────────────────────────
+        // backend and frontend each have their own package.json.
+        // database and docs are included here as examples — remove or adapt
+        // if they don't have a package.json of their own.
+        stage('Install Dependencies') {
+            parallel {
+
+                stage('Backend — npm install') {
+                    steps {
+                        dir('source/backend') {         // → WORKSPACE/source/backend
+                            echo '📦 Installing backend dependencies...'
+                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
+                        }
+                    }
+                }
+
+                stage('Frontend — npm install') {
+                    steps {
+                        dir('source/frontend') {        // → WORKSPACE/source/frontend
+                            echo '📦 Installing frontend dependencies...'
+                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
+                        }
+                    }
+                }
+
+                // Uncomment if database/ has its own package.json or migration runner:
+                // stage('Database — install') {
+                //     steps {
+                //         dir('source/database') {     // → WORKSPACE/source/database
+                //             echo '📦 Installing database tooling...'
+                //             sh 'npm install --cache ${NPM_CONFIG_CACHE}'
+                //         }
+                //     }
+                // }
+
             }
         }
 
-        stage('Install Dependencies') {
+        // ── 5. Run Tests ──────────────────────────────────────────────────────
+        // Test credentials are scoped HERE with withCredentials() so that a
+        // missing credential only fails this stage — not the whole pipeline.
+        stage('Run Tests') {
             parallel {
-                stage('Backend') {
+
+                stage('Backend — tests') {
                     steps {
-                        dir('backend') {
-                            echo '📦 Installing backend npm dependencies...'
-                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
+                        withCredentials([
+                            string(credentialsId: 'TEST_DATABASE_URL',     variable: 'TEST_DATABASE_URL'),
+                            string(credentialsId: 'TEST_REDIS_URL',        variable: 'TEST_REDIS_URL'),
+                            string(credentialsId: 'TFGEN_TEST_JWT_SECRET', variable: 'JWT_SECRET'),
+                            string(credentialsId: 'TFGEN_TEST_ENCRYPT_KEY', variable: 'ENCRYPT_KEY'),
+                        ]) {
+                            dir('source/backend') {     // → WORKSPACE/source/backend
+                                echo '🧪 Running backend tests...'
+                                sh 'npm test'
+                            }
                         }
                     }
                 }
-                stage('Frontend') {
+
+                stage('Frontend — tests') {
                     steps {
-                        dir('frontend') {
-                            echo '📦 Installing frontend npm dependencies...'
-                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
+                        dir('source/frontend') {        // → WORKSPACE/source/frontend
+                            echo '🧪 Running frontend tests...'
+                            sh 'npm test -- --watchAll=false'
                         }
+                    }
+                }
+
+            }
+        }
+
+        // ── 6. Database Migrations ────────────────────────────────────────────
+        // Example stage showing how to enter source/database independently.
+        stage('Database Migrations') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'TEST_DATABASE_URL', variable: 'DATABASE_URL'),
+                ]) {
+                    dir('source/database') {            // → WORKSPACE/source/database
+                        echo '🗄️ Running database migrations...'
+                        sh 'npm run migrate'            // adapt to your migration tool
                     }
                 }
             }
-        }    
+        }
 
-    } 
+        // ── 7. Build Docs ─────────────────────────────────────────────────────
+        stage('Build Docs') {
+            steps {
+                dir('source/docs') {                    // → WORKSPACE/source/docs
+                    echo '📄 Building documentation...'
+                    sh 'npm run build'                  // adapt to your docs tool
+                }
+            }
+        }
+
+        // ── 8. Docker Build & Push ────────────────────────────────────────────
+        stage('Docker Build & Push') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
+                                     usernameVariable: 'DOCKER_USER',
+                                     passwordVariable: 'DOCKER_PASS')
+                ]) {
+                    dir('source/backend') {             // Dockerfile lives in backend/
+                        echo "🐳 Building image ${env.IMAGE_TAG}..."
+                        sh '''
+                            echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                            docker build -t ${IMAGE_TAG} .
+                            docker push ${IMAGE_TAG}
+                        '''
+                    }
+                }
+            }
+        }
+
+    }
+
+    // ── Post Actions ──────────────────────────────────────────────────────────
     post {
         success {
-            echo '✅ Build & Deploy completed successfully!'
+            echo '✅ Pipeline completed successfully!'
             slackSend(
                 channel: '#doc_jen_task_tracker',
                 message: """
                     ✅ *Pipeline Success*
                     *Job:* `${env.JOB_NAME}`
                     *Build #:* `${env.BUILD_NUMBER}`
-                    *Image:* `${IMAGE_TAG}`
+                    *Image:* `${env.IMAGE_TAG}`
                     *Status:* Passed ✅
                     <${env.BUILD_URL}|View Build Logs>
                 """
             )
             mail(
-                to: "${EMAIL_RECIPIENTS}",
+                to: "${env.EMAIL_RECIPIENTS}",
                 subject: "SUCCESS: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
                 body: """\
                     The Jenkins Pipeline completed successfully.
 
-                    🐳 Docker Image : ${IMAGE_TAG}
+                    🐳 Docker Image : ${env.IMAGE_TAG}
                     🔗 Pipeline URL : ${env.BUILD_URL}
                     👷 Triggered by : ${currentBuild.getBuildCauses()[0].userName}
-
-                    View the full job here: ${env.BUILD_URL}
                 """
             )
         }
 
         failure {
             script {
-                def log         = currentBuild.rawBuild.getLog(1000)
-                def lastLines   = log.takeRight(50).join('\n')
-                def culprit     = "Unknown"
+                def log          = currentBuild.rawBuild.getLog(1000)
+                def lastLines    = log.takeRight(50).join('\n')
+                def culprit      = "Unknown"
                 def changeAuthor = "Unknown"
-
                 try {
                     changeAuthor = currentBuild.changeSets.collect { cs ->
                         cs.items.collect { it.author.fullName }
                     }.flatten().unique().join(', ')
                     culprit = currentBuild.getBuildCauses()[0].userName
                 } catch (e) {
-                    echo "Failed to determine author or trigger: ${e.message}"
+                    echo "Could not determine author/trigger: ${e.message}"
                 }
-
                 slackSend(
                     channel: '#doc_jen_task_tracker',
                     message: """
@@ -204,7 +373,7 @@ pipeline {
                     """
                 )
                 mail(
-                    to: "${EMAIL_RECIPIENTS}",
+                    to: "${env.EMAIL_RECIPIENTS}",
                     subject: "FAILURE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
                     body: """\
                         The Jenkins Pipeline has FAILED ❌
@@ -217,8 +386,6 @@ pipeline {
                         --------------------------------------------------
                         ${lastLines}
                         --------------------------------------------------
-
-                        Please investigate the issue.
                     """
                 )
             }
@@ -230,16 +397,14 @@ pipeline {
                 def lastLines    = log.takeRight(50).join('\n')
                 def culprit      = "Unknown"
                 def changeAuthor = "Unknown"
-
                 try {
                     changeAuthor = currentBuild.changeSets.collect { cs ->
                         cs.items.collect { it.author.fullName }
                     }.flatten().unique().join(', ')
                     culprit = currentBuild.getBuildCauses()[0].userName
                 } catch (e) {
-                    echo "Failed to determine author or trigger: ${e.message}"
+                    echo "Could not determine author/trigger: ${e.message}"
                 }
-
                 slackSend(
                     channel: '#doc_jen_task_tracker',
                     message: """
@@ -251,7 +416,7 @@ pipeline {
                     """
                 )
                 mail(
-                    to: "${EMAIL_RECIPIENTS}",
+                    to: "${env.EMAIL_RECIPIENTS}",
                     subject: "UNSTABLE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
                     body: """\
                         The Jenkins Pipeline is UNSTABLE ⚠️
@@ -264,18 +429,25 @@ pipeline {
                         --------------------------------------------------
                         ${lastLines}
                         --------------------------------------------------
-
-                        Please investigate the warning.
                     """
                 )
             }
         }
 
         always {
-            // Clean up locally built Docker image to free disk space
-            sh "docker rmi ${IMAGE_TAG} || true"
-            cleanWs()
-            echo '🧹 Workspace cleaned'
+            script {
+                try {
+                    sh "docker rmi ${env.IMAGE_TAG} || true"
+                } catch (Exception e) {
+                    echo "ℹ️ Docker image cleanup skipped — no agent context: ${e.message}"
+                }
+                try {
+                    cleanWs()
+                    echo '🧹 Workspace cleaned'
+                } catch (Exception e) {
+                    echo "ℹ️ Workspace cleanup skipped — no agent context: ${e.message}"
+                }
+            }
         }
     }
 }
