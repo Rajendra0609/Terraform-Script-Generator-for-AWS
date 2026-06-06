@@ -1,0 +1,22 @@
+# .gitleaksignore
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:backend/.env:generic-api-key:12
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:.env:generic-api-key:11
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:.env:generic-api-key:18
+3c06c71adb2edfa5708b9e1e58a1d22e1ecc700d:.env:generic-api-key:11
+3c06c71adb2edfa5708b9e1e58a1d22e1ecc700d:.env:generic-api-key:12
+1c75e856cefd0cf794bf00b87c35c77927de781b:docker-compose.yml:generic-api-key:63
+6c37dd34c537fdbabed4d91c44f0a7307ac58399:backend/.env:generic-api-key:11
+6c37dd34c537fdbabed4d91c44f0a7307ac58399:backend/.env:generic-api-key:12
+6c37dd34c537fdbabed4d91c44f0a7307ac58399:backend/.env:generic-api-key:18
+bae60c673c6f7194be4f92eb1925d3e4b47e877a:backend/Dockerfile:generic-api-key:67
+# .gitleaksignore
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:backend/.env:generic-api-key:12
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:.env:generic-api-key:11
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:.env:generic-api-key:12
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:.env:generic-api-key:18
+3c06c71adb2edfa5708b9e1e58a1d22e1ecc700d:.env:generic-api-key:12
+1c75e856cefd0cf794bf00b87c35c77927de781b:docker-compose.yml:generic-api-key:63
+51967ac3bc9e6544885e101bda2e20ec1f2b5c2a:docker-compose.yml:generic-api-key:67
+6c37dd34c537fdbabed4d91c44f0a7307ac58399:backend/.env:generic-api-key:12
+87ea78c43dcab03fc9aa0bcecf73a2556fdaa7d9:backend/.env:generic-api-key:12
+9b05bf985b41d8f271fb92a31993a45ab8f1a64d:tests/unit/backend/auth-middleware.test.js:generic-api-key:18
