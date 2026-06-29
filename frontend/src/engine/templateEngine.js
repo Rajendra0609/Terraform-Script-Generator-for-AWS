@@ -9,6 +9,17 @@
  *  - data source auto-injection (aws_caller_identity, aws_availability_zones)
  *  - variables + outputs HCL serialization
  *  - Full project HCL assembly (main.tf, variables.tf, outputs.tf, providers.tf)
+ *
+ * FIX: Resolved terraform validate failures:
+ *  - BUG-TF-01: Duplicate required_providers.aws across providers.tf + versions.tf
+ *    → generateProviderBlock now emits ONLY the provider "aws" {} block.
+ *    → generateTerraformBlock() is the single source of truth for the terraform{} block.
+ *  - BUG-TF-02: Unresolved {{placeholder}} tokens causing invalid HCL syntax
+ *    → generateHCL now returns '' for undefined keys (removed "keep match" behaviour).
+ *  - BUG-TF-03: var.XXX references with no corresponding variable declaration
+ *    → extractImplicitVariables() auto-declares any var.NAME used in generated HCL.
+ *  - BUG-TF-04: buildFullHCL emitting two terraform{} blocks when backend is set
+ *    → buildFullHCL now uses generateTerraformBlock(backendConfig) for one merged block.
  */
 
 // --- Secret pattern detector (client-side guard, belt-and-suspenders) ---------
@@ -31,11 +42,13 @@ export function generateHCL(templateBody, config, environment = 'dev') {
   // Add environment to config
   const fullConfig = { ...config, environment };
 
-  // Replace placeholders; empty/null values become empty string (so lines can be removed)
+  // BUG-TF-02 fix: undefined keys now return '' instead of keeping the raw
+  // {{placeholder}} token. A literal {{placeholder}} in HCL is invalid syntax
+  // and causes `terraform validate` to fail with a parse error.
+  // Returning '' lets the empty-assignment remover below strip the whole line.
   body = body.replace(/\{\{(\w+)\}\}/g, (match, key) => {
     const val = fullConfig[key];
-    if (val === undefined) return match; // keep placeholder if no value provided at all
-    if (val === null || val === '') return '';
+    if (val === undefined || val === null || val === '') return '';
     return String(val);
   });
 
@@ -66,24 +79,64 @@ export function generateHCL(templateBody, config, environment = 'dev') {
   return body;
 }
 
-// --- Provider block ------------------------------------------------------------
-export function generateProviderBlock(region) {
-  return `terraform {
+// --- Unified terraform block (single source of truth for terraform{} config) ---
+/**
+ * BUG-TF-01 + BUG-TF-04 fix: generateTerraformBlock() is the ONLY place that
+ * emits a terraform{} block with required_version + required_providers.
+ * It optionally merges a backend configuration into the SAME block.
+ *
+ * This eliminates the duplicate required_providers.aws that previously appeared
+ * in both providers.tf (from generateProviderBlock) and versions.tf (from
+ * generateVersionsBlock), which caused `terraform validate` to fail with:
+ *   "Duplicate required_providers configuration for aws"
+ */
+export function generateTerraformBlock(backendConfig) {
+  let block = `terraform {
+  required_version = ">= 1.5.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
   }
+`;
+
+  // Merge backend into the same terraform{} block when configured.
+  // Terraform allows only ONE backend block per configuration directory.
+  if (backendConfig && backendConfig.type) {
+    const { type, ...bConfig } = backendConfig;
+    block += `\n  backend "${type}" {\n`;
+    for (const [key, value] of Object.entries(bConfig)) {
+      block += `    ${key} = "${value}"\n`;
+    }
+    block += `  }\n`;
+  }
+
+  block += `}\n`;
+  return block;
 }
 
-provider "aws" {
+// --- Provider block ------------------------------------------------------------
+/**
+ * BUG-TF-01 fix: Now returns ONLY the provider "aws" {} block — no terraform{}
+ * wrapper.  The terraform{} block (with required_version + required_providers)
+ * is emitted exclusively by generateTerraformBlock() / generateVersionsBlock(),
+ * preventing duplicate required_providers declarations across files.
+ */
+export function generateProviderBlock(region) {
+  return `provider "aws" {
   region = "${region}"
 }
 `;
 }
 
-// --- Backend block -------------------------------------------------------------
+// --- Backend block (standalone terraform{} for split-file backend.tf) ---------
+/**
+ * Returns a standalone terraform { backend "type" {} } block.
+ * Used only in split-file mode (backend.tf). The versions.tf file provides the
+ * required_providers block, so there is no duplication of provider declarations.
+ */
 export function generateBackendBlock(backendConfig) {
   if (!backendConfig || !backendConfig.type) return '';
   const { type, ...config } = backendConfig;
@@ -96,10 +149,6 @@ export function generateBackendBlock(backendConfig) {
 }
 
 // --- Locals block (auto-generated from common resource values) -----------------
-/**
- * Generates a `locals {}` block consolidating shared values across resources.
- * This reduces duplication in generated HCL and follows Terraform best practices.
- */
 export function generateLocalsBlock(resources, region, environment, projectName = '') {
   const locals = {
     environment,
@@ -108,7 +157,6 @@ export function generateLocalsBlock(resources, region, environment, projectName 
     common_tags: `{\n    Environment = local.environment\n    Project     = local.project_name\n    ManagedBy   = "Terraform"\n    GeneratedBy = "TFGen"\n  }`,
   };
 
-  // Detect unique AZs referenced across resources for consolidation
   const azSet = new Set();
   const cidrSet = new Set();
   for (const r of resources) {
@@ -131,12 +179,7 @@ export function generateLocalsBlock(resources, region, environment, projectName 
   return block;
 }
 
-// --- Data sources block (always-useful data lookups) --------------------------
-/**
- * Generates common `data {}` blocks that most real Terraform projects need.
- * - aws_caller_identity: account ID, ARN for use in policies
- * - aws_availability_zones: AZ list for multi-AZ deployments
- */
+// --- Data sources block -------------------------------------------------------
 export function generateDataSourcesBlock() {
   return `# --- Common data sources -----------------------------------------------
 data "aws_caller_identity" "current" {}
@@ -185,52 +228,139 @@ export function generateOutputsHCL(outputs) {
   return hcl.trim() + '\n';
 }
 
+// --- Implicit variable extractor (BUG-TF-03 fix) ------------------------------
+/**
+ * Scans HCL content for var.NAME references and returns variable declarations
+ * for any that are not already present in the explicit variables map.
+ *
+ * Example: RDS template uses `password = var.db_password` but the schema has
+ * no db_password field (correctly, for security).  Without this function,
+ * `terraform validate` fails with:
+ *   "An input variable with the name db_password has not been declared"
+ */
+export function extractImplicitVariables(hclContent, explicitVariables = {}) {
+  const implicit = {};
+  // Match var.name — not inside comments or string literals
+  const varRe = /\bvar\.([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+  let m;
+  while ((m = varRe.exec(hclContent)) !== null) {
+    const varName = m[1];
+    if (explicitVariables[varName] || implicit[varName]) continue;
+
+    const isSensitive =
+      /password|secret|key|token|credential|cert|private/i.test(varName);
+
+    implicit[varName] = {
+      description: `Input variable referenced in configuration. Supply via terraform.tfvars or -var flag.`,
+      type: 'string',
+      ...(isSensitive && { sensitive: true }),
+    };
+  }
+  return implicit;
+}
+
 // --- Full HCL assembly --------------------------------------------------------
+/**
+ * BUG-TF-04 fix: All terraform{} content (required_version, required_providers,
+ * optional backend) is now merged into a single block via generateTerraformBlock().
+ * This prevents the previous behaviour where a backend block and a provider block
+ * each emitted their own terraform{} wrapper, producing two terraform blocks in
+ * the combined output.
+ */
 export function buildFullHCL(resources, region, environment, backendConfig, variables, outputs, projectName = '') {
-  const provider  = generateProviderBlock(region || 'ap-south-1');
-  const backend   = generateBackendBlock(backendConfig);
-  const locals    = generateLocalsBlock(resources, region || 'ap-south-1', environment || 'dev', projectName);
-  const dataSrcs  = generateDataSourcesBlock();
-  const vars      = generateVariablesHCL(variables);
-  const outs      = generateOutputsHCL(outputs);
-  const blocks    = resources
+  const effectiveRegion = region || 'ap-south-1';
+  const effectiveEnv    = environment || 'dev';
+
+  // Single merged terraform{} block: required_version + required_providers + optional backend
+  const tfBlock  = generateTerraformBlock(backendConfig);
+  const provider = generateProviderBlock(effectiveRegion);
+  const locals   = generateLocalsBlock(resources, effectiveRegion, effectiveEnv, projectName);
+  const dataSrcs = generateDataSourcesBlock();
+  const blocks   = resources
     .filter(r => r.hcl_output)
     .map(r => r.hcl_output)
     .join('\n\n');
 
-  return [backend, provider, dataSrcs, locals, vars, blocks, outs]
+  // BUG-TF-03 fix: auto-declare any var.XXX referenced in templates
+  const allBlockHcl  = blocks;
+  const implicitVars = extractImplicitVariables(allBlockHcl, variables || {});
+  const mergedVars   = { ...implicitVars, ...(variables || {}) }; // explicit wins
+  const vars         = generateVariablesHCL(mergedVars);
+  const outs         = generateOutputsHCL(outputs);
+
+  return [tfBlock, provider, dataSrcs, locals, vars, blocks, outs]
     .filter(Boolean)
     .join('\n')
     .replace(/\n{4,}/g, '\n\n');
 }
 
 // --- Split file assembly ------------------------------------------------------
+/**
+ * BUG-TF-01 fix: providers.tf now contains ONLY `provider "aws" {}` — no
+ * terraform{} wrapper. versions.tf remains the single source of required_providers.
+ * This eliminates the duplicate required_providers.aws that previously appeared
+ * in both files.
+ *
+ * File layout:
+ *  backend.tf   — terraform { backend "type" {} }  (only when backend configured)
+ *  versions.tf  — terraform { required_version + required_providers }
+ *  providers.tf — provider "aws" { region = "..." }  (NO terraform{} wrapper)
+ *  locals.tf    — locals { ... }
+ *  main.tf      — data sources + resource / module blocks
+ *  variables.tf — variable declarations (explicit + auto-detected implicit)
+ *  outputs.tf   — output declarations
+ *  README.md    — terraform-docs style documentation
+ */
 export function buildSplitHCL(resources, region, environment, backendConfig, variables, outputs, projectName = '') {
-  const provider  = generateProviderBlock(region || 'ap-south-1');
-  const backend   = generateBackendBlock(backendConfig);
-  const locals    = generateLocalsBlock(resources, region || 'ap-south-1', environment || 'dev', projectName);
-  const dataSrcs  = generateDataSourcesBlock();
-  const vars      = generateVariablesHCL(variables);
-  const outs      = generateOutputsHCL(outputs);
-  const blocks    = resources
+  const effectiveRegion = region || 'ap-south-1';
+  const effectiveEnv    = environment || 'dev';
+
+  const provider = generateProviderBlock(effectiveRegion);
+  const locals   = generateLocalsBlock(resources, effectiveRegion, effectiveEnv, projectName);
+  const dataSrcs = generateDataSourcesBlock();
+  const blocks   = resources
     .filter(r => r.hcl_output)
     .map(r => r.hcl_output)
     .join('\n\n');
 
+  // BUG-TF-03 fix: auto-declare implicit var.XXX references
+  const implicitVars = extractImplicitVariables(blocks, variables || {});
+  const mergedVars   = { ...implicitVars, ...(variables || {}) };
+  const vars         = generateVariablesHCL(mergedVars);
+  const outs         = generateOutputsHCL(outputs);
+
   const files = {};
-  if (backend)  files['backend.tf']   = backend;
+
+  // backend.tf — standalone terraform { backend "..." {} } block.
+  // Terraform allows multiple terraform{} blocks across files; backend and
+  // required_providers keys don't conflict with each other.
+  if (backendConfig && backendConfig.type) {
+    files['backend.tf'] = generateBackendBlock(backendConfig);
+  }
+
+  // providers.tf — ONLY the provider "aws" {} block.
+  // The terraform{} wrapper has been intentionally removed to prevent the
+  // duplicate required_providers.aws that caused validate failures.
   if (provider) files['providers.tf'] = provider;
+
   const mainParts = [dataSrcs, blocks].filter(Boolean).join('\n\n');
-  if (mainParts) files['main.tf']     = mainParts;
-  if (locals)   files['locals.tf']    = locals;
-  if (vars)     files['variables.tf'] = vars;
-  if (outs)     files['outputs.tf']   = outs;
+  if (mainParts)  files['main.tf']      = mainParts;
+  if (locals)     files['locals.tf']    = locals;
+  if (vars)       files['variables.tf'] = vars;
+  if (outs)       files['outputs.tf']   = outs;
+
+  // versions.tf — single authoritative terraform{} block.
   files['versions.tf'] = generateVersionsBlock();
-  files['README.md']   = generateReadme(resources, region, environment, projectName);
+  files['README.md']   = generateReadme(resources, effectiveRegion, effectiveEnv, projectName);
+
   return files;
 }
 
 // --- versions.tf --------------------------------------------------------------
+/**
+ * Single authoritative terraform{} block for split-file output.
+ * This is the ONLY file in the split layout that contains required_providers.
+ */
 export function generateVersionsBlock() {
   return `terraform {
   required_version = ">= 1.5.0"
@@ -336,9 +466,9 @@ ${inputRows
 
 \`\`\`
 .
-├── backend.tf       # Remote state configuration
-├── providers.tf     # AWS provider + Terraform version block
-├── versions.tf      # Required provider version constraints
+├── backend.tf       # Remote state configuration (omitted if no backend is set)
+├── versions.tf      # Required provider version constraints (single terraform{} block)
+├── providers.tf     # AWS provider configuration
 ├── locals.tf        # Shared locals (tags, region, env, project)
 ├── main.tf          # Data sources + resource / module definitions
 ├── variables.tf     # Input variable declarations

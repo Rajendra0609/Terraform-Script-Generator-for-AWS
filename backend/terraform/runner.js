@@ -47,6 +47,16 @@ function cleanup(dir) {
  * Detect provider prefixes in HCL (e.g. "aws_instance" → "aws") and write
  * a _providers_override.tf file so `terraform init` knows what to download
  * and can skip credential validation.
+ *
+ * FIX: The override file now also emits a `terraform { required_providers {} }`
+ * block when the HCL doesn't already contain one.  Without this, pasting bare
+ * resource blocks (no provider config) caused `terraform init` to fail because
+ * Terraform couldn't locate the aws provider registry entry.
+ *
+ * Naming: _providers_override.tf ends with _override.tf, so Terraform treats
+ * it as an override file — provider args are MERGED with (not duplicated from)
+ * any existing provider "aws" {} block in the user's HCL.  This is the
+ * intentional Terraform override mechanism and does NOT create duplicate blocks.
  */
 function writeProviderOverride(workDir, hcl) {
   const prefixes = new Set();
@@ -56,10 +66,25 @@ function writeProviderOverride(workDir, hcl) {
 
   if (/skip_credentials_validation/.test(hcl)) return;
 
-  const blocks = [];
+  const overrideParts = [];
+
+  // Emit required_providers when missing so `terraform init` can locate the
+  // provider binary even for HCL that has no explicit terraform{} block.
+  const hasRequiredProviders = /required_providers\s*\{/.test(hcl);
+  if (!hasRequiredProviders && prefixes.has('aws')) {
+    overrideParts.push(`terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}`);
+  }
+
   for (const p of prefixes) {
     if (p === 'aws') {
-      blocks.push(`provider "aws" {
+      overrideParts.push(`provider "aws" {
   skip_credentials_validation = true
   skip_metadata_api_check     = true
   skip_requesting_account_id  = true
@@ -70,10 +95,10 @@ function writeProviderOverride(workDir, hcl) {
     }
   }
 
-  if (blocks.length > 0) {
+  if (overrideParts.length > 0) {
     fs.writeFileSync(
       path.join(workDir, '_providers_override.tf'),
-      blocks.join('\n\n') + '\n',
+      overrideParts.join('\n\n') + '\n',
       'utf8'
     );
   }
