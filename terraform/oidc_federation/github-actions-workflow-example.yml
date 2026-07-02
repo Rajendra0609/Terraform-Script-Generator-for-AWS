@@ -1,0 +1,88 @@
+# .github/workflows/deploy.yml
+# =============================================================================
+# TFGen CI/CD workflow — uses OIDC federation instead of static AWS keys
+# =============================================================================
+# Prerequisites:
+#   1. Apply terraform/oidc_federation/ to create the IAM role
+#   2. Add GITHUB_ACTIONS_ROLE_ARN as a GitHub Actions secret (or variable)
+#      Value: the output of `terraform output github_actions_role_arn`
+#   3. Remove AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from GitHub secrets
+# =============================================================================
+
+name: Deploy TFGen
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # REQUIRED — allows OIDC token request
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── OIDC: assume IAM role (no static keys!) ───────────────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GITHUB_ACTIONS_ROLE_ARN }}
+          role-session-name: tfgen-ci-${{ github.run_id }}
+          aws-region: ap-south-1   # change to your region
+
+      # Verify we have credentials (no secrets visible in logs)
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      # ── Build & push Docker images ────────────────────────────────────────
+      - name: Log in to ECR
+        run: |
+          aws ecr get-login-password --region ap-south-1 \
+            | docker login --username AWS \
+              --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com
+
+      - name: Build and push backend
+        run: |
+          IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/tfgen-backend"
+          docker build -t $IMAGE:${{ github.sha }} ./backend
+          docker tag  $IMAGE:${{ github.sha }} $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+      - name: Build and push frontend
+        run: |
+          IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/tfgen-frontend"
+          docker build -t $IMAGE:${{ github.sha }} ./frontend
+          docker tag  $IMAGE:${{ github.sha }} $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+      # ── Rolling deploy to EKS ─────────────────────────────────────────────
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name tfgen-prod --region ap-south-1
+
+      - name: Deploy to EKS
+        run: |
+          kubectl set image deployment/tfgen-backend \
+            backend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/tfgen-backend:${{ github.sha }} \
+            -n tfgen
+          kubectl set image deployment/tfgen-frontend \
+            frontend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/tfgen-frontend:${{ github.sha }} \
+            -n tfgen
+          kubectl rollout status deployment/tfgen-backend  -n tfgen --timeout=120s
+          kubectl rollout status deployment/tfgen-frontend -n tfgen --timeout=120s
+
+      # ── Run database migrations ───────────────────────────────────────────
+      - name: Run migrations
+        run: |
+          kubectl exec -n tfgen \
+            $(kubectl get pod -n tfgen -l app=tfgen-backend -o jsonpath='{.items[0].metadata.name}') \
+            -- node migrate.js

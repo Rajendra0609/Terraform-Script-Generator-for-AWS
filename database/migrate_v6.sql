@@ -1,0 +1,17 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- migrate_v6.sql  — INTENTIONALLY EMPTY / DEPRECATED
+--
+-- FIX: this file was a byte-for-byte duplicate of fix_project_versions_owner.sql
+-- and caused the entire migration run to abort with ON_ERROR_STOP=on whenever
+-- the 'tfgen' PostgreSQL role did not exist in the target environment.
+--
+-- The ownership transfer is a one-time, superuser-only admin operation.
+-- Run it manually ONLY after confirming the 'tfgen' role exists:
+--
+--   sudo -u postgres psql -d terraform_generator \
+--        -f database/fix_project_versions_owner.sql
+--
+-- This file is kept as an empty placeholder so migration runners that iterate
+-- over migrate_v*.sql files by glob do not error on a missing file.
+-- ─────────────────────────────────────────────────────────────────────────────
+SELECT 1; -- no-op
