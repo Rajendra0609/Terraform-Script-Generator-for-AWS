@@ -13,10 +13,17 @@ const path = require('path');
 const os   = require('os');
 const { v4: uuidv4 } = require('uuid');
 const { isDockerAvailable } = require('../utils/dockerAvailable');
+const { SCRATCH_MOUNT, SCRATCH_VOLUME_ARGS_RO, ensureScratchDir } = require('../utils/dockerScratch');
 
 const CHECKOV_IMAGE = process.env.CHECKOV_IMAGE || 'bridgecrew/checkov:latest';
-const WORKSPACE     = path.join(os.tmpdir(), 'tfgen-checkov');
-if (!fs.existsSync(WORKSPACE)) fs.mkdirSync(WORKSPACE, { recursive: true });
+// SECURITY FIX (critical — see utils/dockerScratch.js): this used to live
+// under os.tmpdir(), which only exists inside THIS container. Bind-mounting
+// that path into a sibling `docker run` container silently produced an
+// EMPTY /workspace there — meaning Checkov always scanned nothing and
+// always returned 0 findings, so the "block plan on CRITICAL findings" gate
+// could never actually fire, no matter how insecure the real HCL was.
+const WORKSPACE = path.join(SCRATCH_MOUNT, 'checkov-workspaces');
+ensureScratchDir(WORKSPACE);
 
 function cleanup(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
@@ -197,16 +204,19 @@ async function runCheckov(hcl) {
 
   const sessionId = uuidv4();
   const workDir   = path.join(WORKSPACE, sessionId);
-  fs.mkdirSync(workDir, { recursive: true });
+  ensureScratchDir(workDir);
   fs.writeFileSync(path.join(workDir, 'main.tf'), hcl, 'utf8');
 
   const dockerCmd = [
     'docker run --rm',
     '--network=none --memory=256m --cpus=0.5 --pids-limit=20',
     '--user=1000:1000',
-    `-v "${workDir}":/workspace:ro`,
+    // SECURITY FIX: shared named volume, not a broken host-path bind mount
+    // (see utils/dockerScratch.js) — `workDir` is a real absolute path
+    // under SCRATCH_MOUNT, valid unchanged inside the sibling container.
+    ...SCRATCH_VOLUME_ARGS_RO,
     CHECKOV_IMAGE,
-    'checkov', '--directory', '/workspace', '--output', 'json', '--quiet',
+    'checkov', '--directory', workDir, '--output', 'json', '--quiet',
     '--framework', 'terraform',
     // Do not fail on findings — we parse the JSON ourselves
     '--soft-fail',

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { generateHCL } from '../engine/templateEngine';
+import { generateHCL, escapeHclString, sanitizeHclIdentifier } from '../engine/templateEngine';
 import { awsAPI } from '../api/client';
 import { DEFAULT_AWS_REGION } from '../utils/awsRegions';
 import { useTheme } from '../contexts/ThemeContext';
@@ -219,18 +219,31 @@ function getFieldWarning(fieldId, value) {
 }
 
 // --- SG Rules → HCL serializer -----------------------------------------------
+// SECURITY FIX (critical — HCL/Terraform template injection): every field
+// below (rule description, CIDR blocks, protocol, direction) used to be
+// interpolated straight into the generated HCL string with NO escaping,
+// including `r.description` — a free-text field a project collaborator
+// types directly. A literal `"` in any of these could close the string and
+// inject arbitrary new resource blocks. See templateEngine.js's module-level
+// comment for the full writeup; escapeHclString/sanitizeHclIdentifier are
+// the same helpers used there, applied here for consistency.
 function generateSgRulesHCL(rules, sgName) {
   if (!Array.isArray(rules) || !rules.length) return '';
+  const safeSgName = sanitizeHclIdentifier(sgName, 'sg');
   return rules.map((r, i) => {
-    const cidrs = r.cidr_blocks ? `cidr_blocks = [${r.cidr_blocks.split(',').map(s => `"${s.trim()}"`).join(', ')}]` : '';
-    const ipv6  = r.ipv6_cidr  ? `ipv6_cidr_blocks = ["${r.ipv6_cidr.trim()}"]` : '';
-    const srcSg = r.source_sg  ? `source_security_group_id = ${r.source_sg}` : '';
-    const ports = r.protocol === '-1' ? '' : `  from_port   = ${r.from_port || 0}\n  to_port     = ${r.to_port || 0}`;
-    const desc  = r.description ? `  description = "${r.description}"` : '';
-    return `resource "aws_security_group_rule" "${sgName}_${r.direction}_${i + 1}" {
-  type              = "${r.direction}"
-  security_group_id = aws_security_group.${sgName}.id
-  protocol          = "${r.protocol}"
+    const direction = r.direction === 'egress' ? 'egress' : 'ingress';
+    const protocol  = escapeHclString(r.protocol ?? 'tcp');
+    const cidrs = r.cidr_blocks
+      ? `cidr_blocks = [${r.cidr_blocks.split(',').map(s => `"${escapeHclString(s.trim())}"`).join(', ')}]`
+      : '';
+    const ipv6  = r.ipv6_cidr  ? `ipv6_cidr_blocks = ["${escapeHclString(r.ipv6_cidr.trim())}"]` : '';
+    const srcSg = r.source_sg  ? `source_security_group_id = ${sanitizeHclIdentifier(r.source_sg)}` : '';
+    const ports = r.protocol === '-1' ? '' : `  from_port   = ${Number(r.from_port) || 0}\n  to_port     = ${Number(r.to_port) || 0}`;
+    const desc  = r.description ? `  description = "${escapeHclString(r.description)}"` : '';
+    return `resource "aws_security_group_rule" "${safeSgName}_${direction}_${i + 1}" {
+  type              = "${direction}"
+  security_group_id = aws_security_group.${safeSgName}.id
+  protocol          = "${protocol}"
 ${ports}
 ${[cidrs, ipv6, srcSg, desc].filter(Boolean).map(l => '  ' + l).join('\n')}
 }`;
@@ -238,47 +251,60 @@ ${[cidrs, ipv6, srcSg, desc].filter(Boolean).map(l => '  ' + l).join('\n')}
 }
 
 // --- Subnets → HCL serializer ------------------------------------------------
+// SECURITY FIX — same class of bug as above: cidr/az/name/type were
+// interpolated unescaped. `resName` was already sanitized; cidr/az/type/tag
+// values were not.
 function generateSubnetsHCL(subnets, vpcName) {
   if (!Array.isArray(subnets) || !subnets.length) return '';
+  const safeVpcName = sanitizeHclIdentifier(vpcName, 'vpc');
   return subnets.map((s, i) => {
-    const resName = s.name ? s.name.replace(/[^a-z0-9_]/gi, '_') : `${s.type}_subnet_${i}`;
+    const resName = s.name ? sanitizeHclIdentifier(s.name, `${s.type || 'subnet'}_${i}`) : `${sanitizeHclIdentifier(s.type, 'subnet')}_${i}`;
+    const cidr = escapeHclString(s.cidr || `10.0.${i}.0/24`);
+    const az   = s.az ? `\n  availability_zone       = "${escapeHclString(s.az)}"` : '';
+    const name = escapeHclString(s.name || resName);
+    const type = escapeHclString(s.type || '');
     return `resource "aws_subnet" "${resName}" {
-  vpc_id                  = aws_vpc.${vpcName}.id
-  cidr_block              = "${s.cidr || `10.0.${i}.0/24`}"${s.az ? `\n  availability_zone       = "${s.az}"` : ''}
+  vpc_id                  = aws_vpc.${safeVpcName}.id
+  cidr_block              = "${cidr}"${az}
   map_public_ip_on_launch = ${s.map_public_ip !== false ? 'true' : 'false'}
 
   tags = {
-    Name = "${s.name || resName}"
-    Type = "${s.type}"
+    Name = "${name}"
+    Type = "${type}"
   }
 }`;
   }).join('\n\n');
 }
 
 // --- EC2 instances → HCL serializer -----------------------------------------
+// SECURITY FIX — same class of bug: ami_id/instance_type/key_name/
+// root_volume_type/name/user_data were all interpolated unescaped.
+// `inst.subnet_ref`'s existing isRef check is kept (it decides quoted vs.
+// bare rendering) but the value itself is now also sanitized either way.
 function generateEc2HCL(instances) {
   if (!Array.isArray(instances) || !instances.length) return '';
   return instances.map((inst, i) => {
-    const resName = inst.name ? inst.name.replace(/[^a-z0-9_]/gi, '_') : `instance_${i + 1}`;
+    const resName = inst.name ? sanitizeHclIdentifier(inst.name, `instance_${i + 1}`) : `instance_${i + 1}`;
     // Normalize subnet reference: if it's a terraform resource reference (e.g. aws_subnet.name.id
     // or module.xxx), emit unquoted; otherwise quote it so HCL remains valid.
     let subnetLine = '';
     if (inst.subnet_ref) {
       const sr = String(inst.subnet_ref).trim();
       const isRef = /^(aws_[a-z0-9_]+\.[A-Za-z0-9_]+\.id|module\.[A-Za-z0-9_]+)/.test(sr);
-      subnetLine = isRef ? `  subnet_id     = ${sr}` : `  subnet_id     = "${sr}"`;
+      subnetLine = isRef ? `  subnet_id     = ${sanitizeHclIdentifier(sr) === sr ? sr : escapeHclString(sr)}`
+                          : `  subnet_id     = "${escapeHclString(sr)}"`;
     }
 
     const lines = [
-      `  ami           = "${inst.ami_id || 'data.aws_ami.latest.id'}"`,
-      `  instance_type = "${inst.instance_type || 't3.micro'}"`,
+      `  ami           = "${escapeHclString(inst.ami_id || 'data.aws_ami.latest.id')}"`,
+      `  instance_type = "${escapeHclString(inst.instance_type || 't3.micro')}"`,
       subnetLine,
-      inst.key_name    && `  key_name      = "${inst.key_name}"`,
+      inst.key_name    && `  key_name      = "${escapeHclString(inst.key_name)}"`,
       `  associate_public_ip_address = ${inst.associate_public_ip ? 'true' : 'false'}`,
       `  monitoring    = ${inst.monitoring ? 'true' : 'false'}`,
-      inst.user_data   && `  user_data     = base64encode(<<-EOF\n    ${inst.user_data.trim()}\n  EOF\n  )`,
-      `\n  root_block_device {\n    volume_size = ${inst.root_volume_size || 20}\n    volume_type = "${inst.root_volume_type || 'gp3'}"\n    encrypted   = true\n  }`,
-      `\n  tags = { Name = "${inst.name || resName}" }`,
+      inst.user_data   && `  user_data     = base64encode(<<-EOF\n    ${String(inst.user_data).trim()}\n  EOF\n  )`,
+      `\n  root_block_device {\n    volume_size = ${Number(inst.root_volume_size) || 20}\n    volume_type = "${escapeHclString(inst.root_volume_type || 'gp3')}"\n    encrypted   = true\n  }`,
+      `\n  tags = { Name = "${escapeHclString(inst.name || resName)}" }`,
     ].filter(Boolean).join('\n');
     return `resource "aws_instance" "${resName}" {\n${lines}\n}`;
   }).join('\n\n');

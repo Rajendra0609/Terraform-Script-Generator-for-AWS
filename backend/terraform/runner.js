@@ -20,11 +20,18 @@ const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 const { v4: uuidv4 } = require('uuid');
+const { SCRATCH_MOUNT, SCRATCH_VOLUME_ARGS, ensureScratchDir } = require('../utils/dockerScratch');
 
 // ─── Workspace directories ────────────────────────────────────────────────────
-const WORKSPACE    = path.join(os.tmpdir(), 'tfgen-workspaces');
-const PLUGIN_CACHE = path.join(os.tmpdir(), 'tfgen-plugin-cache');
-[WORKSPACE, PLUGIN_CACHE].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+// SECURITY FIX: these used to live under os.tmpdir() (e.g. /tmp/tfgen-...),
+// a path that only exists inside THIS container. Docker-mode operations
+// bind-mounted that path straight into a sibling `docker run` container,
+// which — because bind-mount sources are resolved by the HOST daemon, not
+// this container — silently got an empty directory instead of the real HCL.
+// See utils/dockerScratch.js for the full writeup and the named-volume fix.
+const WORKSPACE    = path.join(SCRATCH_MOUNT, 'terraform-workspaces');
+const PLUGIN_CACHE = path.join(SCRATCH_MOUNT, 'terraform-plugin-cache');
+[WORKSPACE, PLUGIN_CACHE].forEach(ensureScratchDir);
 
 // BUG-011 fix: pin the Terraform image by immutable digest so that the binary
 // cannot change silently between server restarts.
@@ -220,16 +227,22 @@ function runInDocker(workDir, tfArgs, opts = {}) {
     `--network=${network}`,
     '--memory=512m', '--cpus=1.0', '--pids-limit=50',
     '--user=1000:1000',
-    '-v', `${workDir}:/workspace:rw`,
-    '-v', `${PLUGIN_CACHE}:/tmp/plugin-cache:rw`,
-    '-e', 'TF_PLUGIN_CACHE_DIR=/tmp/plugin-cache',
+    // SECURITY FIX: mount the shared named volume (SCRATCH_MOUNT is
+    // identical inside this container and the sibling container — see
+    // utils/dockerScratch.js) instead of bind-mounting `workDir` as a raw
+    // host path, which silently produced an empty directory in the sibling
+    // container (see that module's comment for the full writeup). Because
+    // `workDir` is already an absolute path under SCRATCH_MOUNT, it's valid
+    // unchanged as the sibling container's working directory below.
+    ...SCRATCH_VOLUME_ARGS,
+    '-e', `TF_PLUGIN_CACHE_DIR=${PLUGIN_CACHE}`,
     '-e', 'TF_INPUT=false',
     '-e', 'TF_CLI_ARGS_init=-backend=false',
   ];
   for (const [k, v] of Object.entries(extraEnv)) {
     args.push('-e', `${k}=${v}`);
   }
-  args.push('-w', '/workspace', TF_DOCKER_IMAGE, ...tfArgs);
+  args.push('-w', workDir, TF_DOCKER_IMAGE, ...tfArgs);
 
   return new Promise(resolve => {
     let stdout = '', stderr = '';
@@ -271,7 +284,7 @@ async function runFmt(hcl, logFn, mode = 'auto') {
   const resolvedMode = resolveMode(mode);
   const sessionId = uuidv4();
   const workDir   = path.join(WORKSPACE, sessionId);
-  fs.mkdirSync(workDir);
+  ensureScratchDir(workDir);
   const tfFile = path.join(workDir, 'main.tf');
 
   try {
@@ -329,7 +342,7 @@ async function runValidate(hcl, logFn, mode = 'auto') {
   const resolvedMode = resolveMode(mode);
   const sessionId = uuidv4();
   const workDir   = path.join(WORKSPACE, sessionId);
-  fs.mkdirSync(workDir);
+  ensureScratchDir(workDir);
   fs.writeFileSync(path.join(workDir, 'main.tf'), hcl, 'utf8');
   writeProviderOverride(workDir, hcl);
 
@@ -409,7 +422,7 @@ async function runPlan(hcl, logFn, awsCredentials = null, mode = 'auto') {
   const resolvedMode = resolveMode(mode);
   const sessionId = uuidv4();
   const workDir   = path.join(WORKSPACE, sessionId);
-  fs.mkdirSync(workDir);
+  ensureScratchDir(workDir);
   fs.writeFileSync(path.join(workDir, 'main.tf'), hcl, 'utf8');
   if (!awsCredentials) writeProviderOverride(workDir, hcl);
 
@@ -488,7 +501,7 @@ async function runInit(hcl, logFn, mode = 'auto') {
   const resolvedMode = resolveMode(mode);
   const sessionId = uuidv4();
   const workDir   = path.join(WORKSPACE, sessionId);
-  fs.mkdirSync(workDir);
+  ensureScratchDir(workDir);
   fs.writeFileSync(path.join(workDir, 'main.tf'), hcl, 'utf8');
   writeProviderOverride(workDir, hcl);
 
@@ -612,7 +625,7 @@ async function runApply(hcl, logFn, awsCredentials, mode = 'auto') {
   const resolvedMode = resolveMode(mode);
   const sessionId = uuidv4();
   const workDir   = path.join(WORKSPACE, sessionId);
-  fs.mkdirSync(workDir);
+  ensureScratchDir(workDir);
   fs.writeFileSync(path.join(workDir, 'main.tf'), hcl, 'utf8');
 
   const credEnv = {

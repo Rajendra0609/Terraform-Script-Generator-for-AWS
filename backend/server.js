@@ -252,6 +252,8 @@ const { WebSocketServer } = require('ws');
 const { initQueue, enqueue, jobEvents } = require('./services/jobQueue');
 const { attachTerraformLspSession } = require('./services/terraformLsp');
 const { dispatchAndPersist } = require('./services/terraformJobs');
+const { verifyAccessToken } = require('./middleware/auth');
+const { hasJobAccess, UUID_RE } = require('./utils/projectAccess');
 
 // BUG-004 fix: initQueue was never called, so the BullMQ worker was never
 // started and all jobs ran synchronously, blocking the event loop.
@@ -268,26 +270,87 @@ initQueue(dispatchAndPersist);
 
 const server = http.createServer(app);
 
-// Handle WebSocket upgrades before Express middleware
-server.on('upgrade', (req, socket, head) => {
-  // Extract path for routing
-  const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
-  logger.info && logger.info(`[ws-upgrade] ${req.method} ${req.url} origin=${req.headers.origin || ''} host=${req.headers.host || ''}`);
+/**
+ * Write a minimal HTTP response and close the socket, so a rejected upgrade
+ * gets a real status code/reason instead of a bare connection reset.
+ */
+function rejectUpgrade(socket, statusCode, reason) {
   try {
-    if (pathname === '/ws/jobs' || pathname.startsWith('/ws/jobs')) {
+    socket.write(
+      `HTTP/1.1 ${statusCode} ${reason}\r\n` +
+      'Connection: close\r\n' +
+      'Content-Length: 0\r\n\r\n'
+    );
+  } catch (_) { /* socket may already be gone */ }
+  try { socket.destroy(); } catch (_) {}
+}
+
+// SECURITY FIX (critical): /ws/jobs and /ws/terraform-lsp previously had NO
+// authentication at all.
+//  - /ws/jobs?id=<jobId>: any client that supplied a jobId immediately
+//    received that job's live terraform plan/apply output — no check that
+//    the caller owned or was a member of the associated project. jobId is a
+//    UUID, but it's returned in plain JSON from POST /plan|/apply, logged,
+//    etc., so anything that leaked a jobId handed a stranger a live read of
+//    that job's terraform output (resource ARNs, IPs, infra details).
+//  - /ws/terraform-lsp: every connection unconditionally spawned a new
+//    terraform-ls process + temp workspace with no auth and no concurrency
+//    limit — an unauthenticated, unbounded resource-exhaustion vector.
+//
+// Fix, applied at the upgrade itself (before either WebSocketServer ever
+// accepts the connection):
+//  1. Validate Origin against the same allow-list used for HTTP CORS, to
+//     close the cross-site WebSocket hijacking angle.
+//  2. Require a short-lived access token as `?token=...` (browsers cannot
+//     set custom headers — e.g. Authorization — during a WS handshake, so a
+//     query-string token is the standard pattern) and verify it with the
+//     exact same JWT check used by authMiddleware.
+// Per-connection authorization (job ownership, LSP session caps) happens in
+// the 'connection' handlers below, once we know who the caller is.
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = url.pathname;
+  logger.info && logger.info(`[ws-upgrade] ${req.method} ${req.url} origin=${req.headers.origin || ''} host=${req.headers.host || ''}`);
+
+  // Origin allow-list — mirrors the Express CORS origin check above. Missing
+  // Origin is allowed (non-browser clients, e.g. server-to-server or CLI
+  // tools); a present-but-disallowed Origin is rejected outright.
+  const origin = req.headers.origin;
+  if (origin && !allowedOrigins.includes(origin)) {
+    logger.warn && logger.warn(`[ws-upgrade] rejected — origin not allowed: ${origin}`);
+    return rejectUpgrade(socket, 403, 'Forbidden');
+  }
+
+  if (pathname !== '/ws/jobs' && pathname !== '/ws/terraform-lsp') {
+    logger.warn && logger.warn(`[ws-upgrade] Unknown websocket path: ${pathname}`);
+    return rejectUpgrade(socket, 404, 'Not Found');
+  }
+
+  const token = url.searchParams.get('token');
+  if (!token) {
+    logger.warn && logger.warn(`[ws-upgrade] rejected — no token provided for ${pathname}`);
+    return rejectUpgrade(socket, 401, 'Unauthorized');
+  }
+  let user;
+  try {
+    user = verifyAccessToken(token);
+  } catch (e) {
+    logger.warn && logger.warn(`[ws-upgrade] rejected — invalid/expired token: ${e.message}`);
+    return rejectUpgrade(socket, 401, 'Unauthorized');
+  }
+  req.tfgenUser = user;
+
+  try {
+    if (pathname === '/ws/jobs') {
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
       });
       return;
     }
-    if (pathname === '/ws/terraform-lsp' || pathname.startsWith('/ws/terraform-lsp')) {
-      lspWss.handleUpgrade(req, socket, head, (ws) => {
-        lspWss.emit('connection', ws, req);
-      });
-      return;
-    }
-    logger.warn && logger.warn(`[ws-upgrade] Unknown websocket path: ${pathname}`);
-    socket.destroy();
+    // pathname === '/ws/terraform-lsp'
+    lspWss.handleUpgrade(req, socket, head, (ws) => {
+      lspWss.emit('connection', ws, req);
+    });
   } catch (err) {
     logger.error && logger.error('[ws-upgrade] error handling upgrade: ' + (err && err.message));
     try { socket.destroy(); } catch (_) {}
@@ -297,11 +360,25 @@ server.on('upgrade', (req, socket, head) => {
 const wss = new WebSocketServer({ noServer: true });
 const lspWss = new WebSocketServer({ noServer: true });
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
+  const user = req.tfgenUser;
+  if (!user) { ws.close(1008, 'Unauthorized'); return; } // defensive — upgrade handler already enforces this
+
   // Extract jobId from URL: /ws/jobs?id=<jobId>
   const url = new URL(req.url, `http://${req.headers.host}`);
   const jobId = url.searchParams.get('id');
-  if (!jobId) { ws.close(1008, 'jobId required'); return; }
+  if (!jobId || !UUID_RE.test(jobId)) { ws.close(1008, 'Invalid or missing jobId'); return; }
+
+  // SECURITY FIX: re-run the same ownership/membership check used by
+  // GET /api/terraform/jobs/:jobId — do NOT wire up log/done listeners
+  // (i.e. do not leak anything) until access is confirmed.
+  let allowed = false;
+  try {
+    allowed = await hasJobAccess(jobId, user.id);
+  } catch (e) {
+    logger.error && logger.error('[ws-jobs] access check failed: ' + e.message);
+  }
+  if (!allowed) { ws.close(1008, 'Access denied'); return; }
 
   // Stream log lines to client
   const onLog = (data) => {
@@ -323,7 +400,43 @@ wss.on('connection', (ws, req) => {
   ws.send(JSON.stringify({ type: 'connected', jobId }));
 });
 
-lspWss.on('connection', (ws) => {
+// SECURITY FIX: per-user + global concurrent session caps for terraform-ls.
+// Previously unbounded — any (unauthenticated) client could spawn unlimited
+// terraform-ls processes. Now every session is authenticated (see upgrade
+// handler above) AND capped. This is in-memory/per-process; a multi-replica
+// deployment would need a shared store (e.g. Redis) for a global cap that
+// holds across instances — noted here as a scaling follow-up, not required
+// at this app's current single-instance scale.
+const MAX_LSP_SESSIONS_PER_USER = parseInt(process.env.MAX_LSP_SESSIONS_PER_USER || '2', 10);
+const MAX_LSP_SESSIONS_GLOBAL   = parseInt(process.env.MAX_LSP_SESSIONS_GLOBAL   || '50', 10);
+const lspSessionCountByUser = new Map();
+let lspSessionCountTotal = 0;
+
+lspWss.on('connection', (ws, req) => {
+  const user = req.tfgenUser;
+  if (!user) { ws.close(1008, 'Unauthorized'); return; } // defensive — upgrade handler already enforces this
+
+  if (lspSessionCountTotal >= MAX_LSP_SESSIONS_GLOBAL) {
+    logger.warn && logger.warn(`[ws-lsp] rejected — global session cap (${MAX_LSP_SESSIONS_GLOBAL}) reached`);
+    ws.close(1013, 'Server busy — try again shortly');
+    return;
+  }
+  const userCount = lspSessionCountByUser.get(user.id) || 0;
+  if (userCount >= MAX_LSP_SESSIONS_PER_USER) {
+    logger.warn && logger.warn(`[ws-lsp] rejected — user ${user.id} at session cap (${MAX_LSP_SESSIONS_PER_USER})`);
+    ws.close(1008, 'Too many concurrent editor sessions — close another tab and retry');
+    return;
+  }
+
+  lspSessionCountByUser.set(user.id, userCount + 1);
+  lspSessionCountTotal += 1;
+  ws.once('close', () => {
+    lspSessionCountTotal = Math.max(0, lspSessionCountTotal - 1);
+    const remaining = (lspSessionCountByUser.get(user.id) || 1) - 1;
+    if (remaining <= 0) lspSessionCountByUser.delete(user.id);
+    else lspSessionCountByUser.set(user.id, remaining);
+  });
+
   attachTerraformLspSession(ws, logger);
 });
 

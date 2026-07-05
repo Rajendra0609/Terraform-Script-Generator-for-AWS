@@ -45,64 +45,71 @@ async function validateJob(data, logFn) {
   return { ...validateResult, networkWarnings, checkov: checkovResult };
 }
 
-async function planJob(data, logFn) {
-  const networkWarnings = lintNetworkRules(data.hcl);
-  const [planResult, checkovResult] = await Promise.all([
-    runPlan(data.hcl, logFn, data.awsCredentials || null, data.mode),
-    runCheckov(data.hcl),
-  ]);
+/**
+ * Run the Checkov critical-finding gate and the OPA policy-as-code gate,
+ * and return a single, consistent verdict. Shared by planJob() and
+ * applyJob() so the two code paths can never silently diverge again — see
+ * the SECURITY FIX comment in applyJob() for why that divergence mattered.
+ *
+ * @param {string} hcl
+ * @param {object} ctx
+ * @param {string} ctx.phase          'plan' | 'apply' — used only for messaging
+ * @param {string|null} ctx.projectId
+ * @param {string|null} ctx.userId
+ * @param {object} ctx.planResult     terraform plan output to feed OPA context
+ * @param {object} [ctx.checkovResult] pre-computed Checkov result, if the
+ *                                     caller already ran it (planJob runs
+ *                                     Checkov in parallel with the plan) —
+ *                                     avoids scanning the same HCL twice.
+ */
+async function runSecurityGates(hcl, ctx) {
+  const { phase, projectId, userId, planResult } = ctx;
+  const checkovResult = ctx.checkovResult || await runCheckov(hcl);
 
-  // ── Phase 2: Checkov critical gate ───────────────────────────────────────
+  // ── Checkov critical gate ────────────────────────────────────────────────
   const criticalFindings = (checkovResult.findings || []).filter(f => f.severity === 'CRITICAL');
   const blockOnCritical  = process.env.BLOCK_PLAN_ON_CRITICAL !== 'false';
   if (criticalFindings.length > 0 && blockOnCritical) {
     // Alert the project's team — in-app notification bell (source of truth)
     // plus a best-effort email. Fire-and-forget: a notification failure must
-    // never delay or break the plan response the user is waiting on.
-    if (data.projectId && UUID_RE.test(data.projectId)) {
+    // never delay or break the plan/apply response the user is waiting on.
+    if (projectId && UUID_RE.test(projectId)) {
       (async () => {
         try {
-          const { rows } = await db.query('SELECT name FROM projects WHERE id=$1', [data.projectId]);
+          const { rows } = await db.query('SELECT name FROM projects WHERE id=$1', [projectId]);
           const projectName = rows[0]?.name;
           const { notifyProjectMembers } = require('./notify');
           const { sendCheckovCriticalAlert } = require('./mailer');
-          await notifyProjectMembers(data.projectId, {
+          await notifyProjectMembers(projectId, {
             type: 'checkov.critical',
-            title: `${criticalFindings.length} critical finding(s) blocked a plan`,
+            title: `${criticalFindings.length} critical finding(s) blocked a${phase === 'apply' ? 'n apply' : ' plan'}`,
             body: `${criticalFindings.slice(0, 3).map(f => f.check_id || f.id).join(', ')}${criticalFindings.length > 3 ? '…' : ''}`,
-            link: `/builder/${data.projectId}?tab=security`,
-            actor_id: data.userId || null,
+            link: `/builder/${projectId}?tab=security`,
+            actor_id: userId || null,
           }, {
             email: (toEmail) => sendCheckovCriticalAlert(toEmail, {
-              projectId: data.projectId,
-              projectName,
-              findings: criticalFindings,
+              projectId, projectName, findings: criticalFindings,
             }),
           });
-        } catch (_) { /* best-effort — never block the plan response on this */ }
+        } catch (_) { /* best-effort — never block the response on this */ }
       })().catch(() => {});
     }
 
     return {
-      success: false,
       blocked: true,
-      message: `Plan blocked: ${criticalFindings.length} CRITICAL security finding(s) detected`,
+      blocked_by: 'checkov',
+      message: `${phase === 'apply' ? 'Apply' : 'Plan'} blocked: ${criticalFindings.length} CRITICAL security finding(s) detected`,
       checkov: checkovResult,
-      networkWarnings,
-      resource_changes: [],
-      summary: { create_count: 0, update_count: 0, delete_count: 0, total: 0 },
     };
   }
 
-  // ── Phase 2: OPA policy-as-code gate ─────────────────────────────────────
+  // ── OPA policy-as-code gate ──────────────────────────────────────────────
   // Evaluate all enabled policy rules against plan output + project resources.
-  // If any blocking policy fires, surface it as a blocked plan (not a crash).
-  if (data.projectId && UUID_RE.test(data.projectId)) {
+  if (projectId && UUID_RE.test(projectId)) {
     try {
-      // Fetch current resources for this project to feed into policy context
       const { rows: resources } = await db.query(
         'SELECT service_type, resource_name, config FROM resources WHERE project_id=$1',
-        [data.projectId]
+        [projectId]
       ).catch(() => ({ rows: [] }));
 
       const policyResult = await evaluateAllPolicies(db, planResult, resources);
@@ -111,44 +118,80 @@ async function planJob(data, logFn) {
         const failedPolicies = policyResult.results.filter(r => !r.passed);
 
         if (policyResult.blocked) {
-          // At least one blocking policy fired — stop the plan
+          // blocks_plan is the only gating flag the schema has today; a
+          // policy severe enough to gate a plan is at least as severe when
+          // gating a real apply, so it's reused for both phases rather than
+          // adding a parallel blocks_apply column.
           const msgs = failedPolicies
             .filter(r => r.policy.blocks_plan && !r.passed)
             .flatMap(r => r.violations);
 
           return {
-            success: false,
             blocked: true,
             blocked_by: 'policy',
-            message: `Plan blocked by ${failedPolicies.filter(r => r.policy.blocks_plan).length} governance policy violation(s)`,
+            message: `${phase === 'apply' ? 'Apply' : 'Plan'} blocked by ${failedPolicies.filter(r => r.policy.blocks_plan).length} governance policy violation(s)`,
             policy_violations: msgs,
             policy_results:    policyResult.results,
             checkov: checkovResult,
-            networkWarnings,
-            resource_changes: [],
-            summary: { create_count: 0, update_count: 0, delete_count: 0, total: 0 },
           };
         }
 
-        // Non-blocking violations — attach as warnings but allow plan to proceed
+        // Non-blocking violations — attach as warnings, allow to proceed
         return {
-          ...planResult,
-          networkWarnings,
+          blocked: false,
           checkov: checkovResult,
-          policy_results:    policyResult.results,
-          policy_warnings:   failedPolicies.flatMap(r => r.violations),
+          policy_results:  policyResult.results,
+          policy_warnings: failedPolicies.flatMap(r => r.violations),
         };
       }
 
-      // All policies passed
-      return { ...planResult, networkWarnings, checkov: checkovResult, policy_results: policyResult.results };
+      return { blocked: false, checkov: checkovResult, policy_results: policyResult.results };
     } catch (policyErr) {
       // Policy evaluation failure is non-fatal — log and continue
       console.warn('[terraformJobs] OPA eval error (non-fatal):', policyErr.message);
     }
   }
 
-  return { ...planResult, networkWarnings, checkov: checkovResult };
+  return { blocked: false, checkov: checkovResult };
+}
+
+async function planJob(data, logFn) {
+  const networkWarnings = lintNetworkRules(data.hcl);
+  const [planResult, checkovResult] = await Promise.all([
+    runPlan(data.hcl, logFn, data.awsCredentials || null, data.mode),
+    runCheckov(data.hcl),
+  ]);
+
+  const gate = await runSecurityGates(data.hcl, {
+    projectId: data.projectId,
+    userId:    data.userId,
+    planResult,
+    phase:     'plan',
+    checkovResult, // reuse the checkov run above instead of scanning twice
+  });
+
+  if (gate.blocked) {
+    return {
+      success: false,
+      blocked: true,
+      blocked_by: gate.blocked_by,
+      message: gate.message,
+      checkov: gate.checkov,
+      policy_violations: gate.policy_violations,
+      policy_results:    gate.policy_results,
+      networkWarnings,
+      resource_changes: [],
+      summary: { create_count: 0, update_count: 0, delete_count: 0, total: 0 },
+    };
+  }
+
+  return {
+    ...planResult,
+    networkWarnings,
+    checkov: gate.checkov,
+    policy_results:  gate.policy_results,
+    policy_warnings: gate.policy_warnings,
+  };
 }
 
 async function applyJob(data, logFn) {
@@ -163,7 +206,46 @@ async function applyJob(data, logFn) {
       resource_changes: [],
     };
   }
-  return runApply(data.hcl, logFn, data.awsCredentials, data.mode);
+
+  // SECURITY FIX (critical — "governance/security-scan gate is a structural
+  // no-op ... wrong execution order"): applyJob() used to call runApply()
+  // directly with NO checkov scan and NO OPA policy evaluation at all — the
+  // gate that blocks a plan on CRITICAL findings or a blocking policy only
+  // existed in planJob(), a completely separate, non-mutating code path a
+  // caller could simply skip. A user with `deployer` role and saved AWS
+  // credentials could apply arbitrary insecure infrastructure (open SSH to
+  // 0.0.0.0/0, unencrypted storage, anything) with zero governance checks,
+  // as long as they called /apply instead of /plan first.
+  //
+  // Fix: run a dry-run plan first — exactly what `terraform apply` does
+  // internally anyway when not given a saved plan file — and gate on ITS
+  // checkov + OPA results before ever calling runApply(). This mirrors
+  // planJob()'s gate exactly (same shared runSecurityGates()) rather than a
+  // parallel, divergent copy.
+  const preApplyPlan = await runPlan(data.hcl, logFn, data.awsCredentials, data.mode);
+
+  const gate = await runSecurityGates(data.hcl, {
+    projectId:  data.projectId,
+    userId:     data.userId,
+    planResult: preApplyPlan,
+    phase:      'apply',
+  });
+
+  if (gate.blocked) {
+    return {
+      success: false,
+      blocked: true,
+      blocked_by: gate.blocked_by,
+      message: gate.message,
+      checkov: gate.checkov,
+      policy_violations: gate.policy_violations,
+      policy_results:    gate.policy_results,
+      resource_changes: [],
+    };
+  }
+
+  const applyResult = await runApply(data.hcl, logFn, data.awsCredentials, data.mode);
+  return { ...applyResult, checkov: gate.checkov, policy_results: gate.policy_results };
 }
 
 async function dispatch(data, logFn) {

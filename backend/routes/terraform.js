@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 const { runFmt, runInit } = require('../terraform/runner');
 const { runCheckov }   = require('../services/checkov');
 const { runInfracost } = require('../services/infracost');
-const { stripHtml, detectSecrets, lintNetworkRules, hasMarkup } = require('../utils/sanitize');
+const { stripHtml, detectSecrets, detectDangerousConstructs, lintNetworkRules, hasMarkup } = require('../utils/sanitize');
 const { authMiddleware, optionalAuth } = require('../middleware/auth');
 const { audit, attachAuditResponseHook } = require('../middleware/audit');
 const db = require('../db/connection');
@@ -45,6 +45,24 @@ function guardHcl(req, res) {
     res.status(413).json({ error: 'HCL payload too large (max 1 MB)' }); return null;
   }
   const clean = stripHtml(hcl);
+
+  // SECURITY FIX (critical, was missing entirely): reject Terraform code-
+  // execution primitives (provisioner "local-exec"/"remote-exec", data
+  // "external") BEFORE any HCL reaches `terraform` — whether that's fmt,
+  // validate, plan, cost, scan, init, or apply. This runs first, ahead of
+  // secret detection, because these constructs are dangerous independent of
+  // whether they also happen to contain a literal secret. See CHANGELOG for
+  // the full writeup of why this was critical (RCE + credential exfil via
+  // a single "read-only" plan request).
+  const dangerous = detectDangerousConstructs(clean);
+  if (dangerous.length > 0) {
+    res.status(400).json({
+      error: 'HCL contains a Terraform construct that executes code and is not permitted: ' +
+        dangerous.map(d => d.name).join(', ') + '.',
+      details: dangerous.map(d => d.hint),
+    });
+    return null;
+  }
 
   // Secret detection — block if literal AWS keys found
   const secrets = detectSecrets(clean);
@@ -227,11 +245,24 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
   const mode = readRunnerMode(req);
   const projectId = isValidProjectId(req.body.project_id) ? req.body.project_id : null;
 
-  // Optionally attach real AWS credentials so the plan runs against the
-  // user's real account (non-mock provider). If the user hasn't saved
-  // credentials we fall back to mock/offline plan (existing behaviour).
+  // SECURITY FIX (critical): use_real_credentials used to be gated by nothing
+  // more than authMiddleware (any authenticated user, any role). Attaching
+  // real credentials also flips the Docker sandbox network from `none` to
+  // `bridge` (see runner.js), which is a materially higher-privilege action
+  // than a normal offline/mock plan. Now that guardHcl() always blocks
+  // local-exec/remote-exec/data-external (see above), the direct RCE path is
+  // closed — but "plan with real credentials + network access" still now
+  // requires the same project role gate as /apply, instead of only auth.
   let awsCredentials = null;
   if (req.body.use_real_credentials) {
+    if (!projectId) {
+      return res.status(400).json({
+        error: 'project_id is required to plan with real AWS credentials.',
+      });
+    }
+    const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin', 'user']);
+    if (!project) return; // authoriseProjectById already sent 403/404
+
     try {
       const { getDecryptedAwsCredentials } = require('../utils/awsCrypto');
       awsCredentials = await getDecryptedAwsCredentials(req.user.id);

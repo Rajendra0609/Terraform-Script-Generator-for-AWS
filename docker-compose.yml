@@ -35,32 +35,116 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ── Docker socket proxy ───────────────────────────────────────────────────────
+  # SECURITY FIX (critical): the backend used to bind-mount the host's raw
+  # /var/run/docker.sock directly (see git history / CHANGELOG_AUDIT_FIXES.md).
+  # That is equivalent to giving the backend container root on the HOST — any
+  # process that can reach the socket can `docker run --privileged -v /:/host`
+  # and escape. This proxy (tecnativa/docker-socket-proxy) sits in front of the
+  # real socket and exposes only the narrow subset of the Docker Engine API the
+  # backend actually needs (spawning ephemeral terraform/checkov/infracost
+  # containers), over a plain TCP endpoint that is only reachable from other
+  # containers in this compose network — it is never published to the host.
+  #
+  # NOTE — residual risk, read before trusting this as a complete fix:
+  # this proxy filters by API *endpoint category* (CONTAINERS/IMAGES/etc.), not
+  # by the JSON body of each request. A backend process that is itself
+  # compromised (e.g. a future dependency RCE, unrelated to Terraform HCL) can
+  # still ask the proxy to start a container with `--privileged` or a host bind
+  # mount, because POST+CONTAINERS is enabled (it has to be — that's how
+  # `docker run` works). This config is real defense-in-depth (removes the
+  # "any RCE = instant host root" property, blocks EXEC/VOLUMES/NETWORKS/
+  # SWARM/SYSTEM/etc. entirely) but it is not a substitute for the follow-up
+  # item tracked in CHANGELOG_AUDIT_FIXES.md: move sandboxed Terraform
+  # execution to a dedicated microservice with a narrow custom RPC (or a
+  # managed executor — ECS Fargate RunTask / restricted Kubernetes Jobs) that
+  # never accepts arbitrary docker args from the backend at all.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    environment:
+      # Required for this app's actual usage (spawn ephemeral tf/checkov/
+      # infracost containers, check daemon availability):
+      CONTAINERS: 1   # create/start/wait/logs/rm/inspect containers
+      IMAGES:     1   # inspect/pull images
+      POST:       1   # without this the proxy is read-only — required to `docker run`
+      INFO:       1   # `docker info` (used by dockerAvailable() health check)
+      # Explicitly denied — no legitimate use in this app, and each of these
+      # is a known privilege-escalation surface if left open:
+      NETWORKS:      0
+      VOLUMES:       0
+      EXEC:          0
+      SWARM:         0
+      SYSTEM:        0
+      SERVICES:      0
+      NODES:         0
+      PLUGINS:       0
+      SECRETS:       0
+      CONFIGS:       0
+      BUILD:         0
+      COMMIT:        0
+      DISTRIBUTION:  0
+      SESSION:       0
+      TASKS:         0
+      AUTH:          0
+      ALLOW_RESTARTS: 0
+    volumes:
+      # Real host socket is mounted read-only into the PROXY only — never
+      # into the backend (or any other app) container.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # No `ports:` — intentionally not published to the host. Only reachable
+    # by other containers on this compose network, via the service name.
+    restart: unless-stopped
+
   # ── Backend (Node / Express) ─────────────────────────────────────────────────
   backend:
     image: daggu1997/tfgen_backend:v0.0.1
     ports:
       - "${BACKEND_PORT:-4000}:4000"
     env_file:
+      # SECURITY FIX (critical): every secret below used to be hardcoded
+      # directly under `environment:`, which OVERRIDES anything from .env and
+      # is what actually ends up committed. A real Gmail address + App
+      # Password and a real EC2 IP were leaked this way. Secrets now live
+      # ONLY in .env (git-ignored — see .gitignore), referenced below via
+      # ${VAR} interpolation, matching the pattern already used correctly for
+      # POSTGRES_*. If this repo/zip was ever shared with the old hardcoded
+      # values in place, treat that Gmail App Password as already compromised
+      # and revoke it in Google Account → Security → App Passwords immediately
+      # — rotating the code does not by itself revoke a leaked credential.
       - .env
     environment:
       NODE_ENV:     production
       PORT:         4000
       HOST:         0.0.0.0
-      CORS_ORIGIN:  http://localhost:3000,http://127.0.0.1:3000,http://13.232.187.242:3000
+      CORS_ORIGIN:  ${CORS_ORIGIN}
       DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
       REDIS_URL:    redis://redis:6379
-      SMTP_USER:  srirajendraprasaddaggubati@gmail.com
-      SMTP_PASS:  ohul sitk qapy hmzl       # Gmail app password (16 chars)
-      SMTP_FROM:  TFGen <tfgenadmin@gmail.com>
-      FRONTEND_URL:  http://13.232.187.242:3000
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      SMTP_USER:    ${SMTP_USER}
+      SMTP_PASS:    ${SMTP_PASS}
+      SMTP_HOST:    ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT:    ${SMTP_PORT:-587}
+      SMTP_FROM:    ${SMTP_FROM}
+      FRONTEND_URL: ${FRONTEND_URL}
+      # SECURITY FIX: points the `docker` CLI at the locked-down proxy
+      # instead of a raw socket mounted into this container. See
+      # docker-socket-proxy service above for what's allowed/denied.
+      DOCKER_HOST:  tcp://docker-socket-proxy:2375
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    volumes:
+      # SECURITY FIX (critical — see backend/utils/dockerScratch.js): this
+      # backend spawns sibling terraform/checkov/infracost containers via
+      # the Docker socket. A shared NAMED VOLUME (not a host bind mount) is
+      # required so files this container writes are actually visible inside
+      # those sibling containers — see the comment in dockerScratch.js for
+      # the full "why", including the fact that Checkov's critical-finding
+      # gate was previously a structural no-op because of this exact bug.
+      - tfgen_scratch:/tfgen-scratch
     restart: on-failure:5
   frontend:
     image: daggu1997/tfgen_frontend:v0.0.1
@@ -72,3 +156,8 @@ services:
 volumes:
   pgdata:
   redisdata:
+  tfgen_scratch:
+    # Explicit fixed name (not Compose's default <project>_<key> prefixing)
+    # so backend/utils/dockerScratch.js can reference it by a stable name
+    # regardless of COMPOSE_PROJECT_NAME.
+    name: tfgen_scratch

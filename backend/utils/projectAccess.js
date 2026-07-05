@@ -65,4 +65,31 @@ async function authoriseProjectById(req, res, projectId, allowedRoles = ['viewer
   return authoriseProject(fakeReq, res, allowedRoles);
 }
 
-module.exports = { authoriseProject, authoriseProjectById, UUID_RE };
+/**
+ * Check whether `userId` may read the given execution job (own job, or a
+ * job on a project they own/are an accepted member of). Boolean-returning
+ * (no req/res) so it can be reused outside Express route handlers — e.g.
+ * the /ws/jobs WebSocket connection handler in server.js, which previously
+ * had NO access check at all: any client that knew a jobId got a live
+ * subscription to that job's terraform plan/apply output. Mirrors the SQL
+ * already used by GET /api/terraform/jobs/:jobId.
+ */
+async function hasJobAccess(jobId, userId) {
+  if (!jobId || !UUID_RE.test(jobId) || !userId) return false;
+  const row = await db.query(
+    `SELECT 1
+       FROM execution_jobs ej
+      WHERE ej.id = $1
+        AND (ej.user_id = $2 OR EXISTS (
+              SELECT 1 FROM projects p
+              LEFT JOIN project_members pm
+                ON pm.project_id = p.id AND pm.user_id = $2 AND pm.accepted_at IS NOT NULL
+             WHERE p.id = ej.project_id
+               AND (p.user_id = $2 OR pm.user_id IS NOT NULL)
+            ))`,
+    [jobId, userId]
+  );
+  return row.rows.length > 0;
+}
+
+module.exports = { authoriseProject, authoriseProjectById, hasJobAccess, UUID_RE };

@@ -13,11 +13,17 @@ const os   = require('os');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { isDockerAvailable } = require('../utils/dockerAvailable');
+const { SCRATCH_MOUNT, SCRATCH_VOLUME_ARGS_RO, ensureScratchDir } = require('../utils/dockerScratch');
 
 const INFRACOST_IMAGE   = process.env.INFRACOST_IMAGE   || 'infracost/infracost:latest';
 const INFRACOST_API_KEY = process.env.INFRACOST_API_KEY || '';
-const WORKSPACE         = path.join(os.tmpdir(), 'tfgen-infracost');
-if (!fs.existsSync(WORKSPACE)) fs.mkdirSync(WORKSPACE, { recursive: true });
+// SECURITY FIX (see utils/dockerScratch.js) — same os.tmpdir() sibling-mount
+// bug as checkov.js/runner.js: the old path only existed inside this
+// container, so the sibling Infracost container always saw an empty
+// /workspace and every real breakdown silently fell back to static
+// estimates without anyone noticing.
+const WORKSPACE = path.join(SCRATCH_MOUNT, 'infracost-workspaces');
+ensureScratchDir(WORKSPACE);
 
 function cleanup(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
@@ -250,16 +256,18 @@ async function runInfracost(hcl) {
 
   const sessionId = uuidv4();
   const workDir   = path.join(WORKSPACE, sessionId);
-  fs.mkdirSync(workDir, { recursive: true });
+  ensureScratchDir(workDir);
   fs.writeFileSync(path.join(workDir, 'main.tf'), hcl, 'utf8');
 
   const dockerCmd = [
     'docker run --rm',
     '--network=bridge --memory=256m --cpus=0.5',
     '-e', `INFRACOST_API_KEY=${INFRACOST_API_KEY}`,
-    `-v "${workDir}":/workspace:ro`,
+    // SECURITY FIX: shared named volume, not a broken host-path bind mount
+    // (see utils/dockerScratch.js).
+    ...SCRATCH_VOLUME_ARGS_RO,
     INFRACOST_IMAGE,
-    'breakdown', '--path', '/workspace',
+    'breakdown', '--path', workDir,
     '--format', 'json', '--no-cache',
   ].join(' ');
 

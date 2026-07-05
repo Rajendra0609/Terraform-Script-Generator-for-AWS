@@ -55,9 +55,15 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 # ── System tools ──────────────────────────────────────────────────────────────
-# docker-cli  → lets the backend run checkov/infracost via the host Docker daemon
-#               (daemon is NOT running inside the container; the socket is bind-mounted
-#                in docker-compose.yml using /var/run/docker.sock)
+# docker-cli  → lets the backend run checkov/infracost/terraform-sandbox
+#               containers. SECURITY FIX: this used to talk to a raw
+#               /var/run/docker.sock bind-mounted straight into this
+#               container (equivalent to host root for anything that could
+#               reach it). It now talks over TCP to a locked-down
+#               `docker-socket-proxy` service instead — see DOCKER_HOST in
+#               docker-compose.yml and the comments on that service. This
+#               container never mounts the real socket and does not need
+#               (and no longer has) membership in a `docker` group.
 # ca-certificates, wget → needed by the HEALTHCHECK and HTTPS calls
 RUN apk add --no-cache \
       docker-cli \
@@ -69,22 +75,24 @@ COPY --from=tools /usr/local/bin/terraform      /usr/local/bin/terraform
 COPY --from=tools /usr/local/bin/terraform-ls   /usr/local/bin/terraform-ls
 
 # ── Non-root user ─────────────────────────────────────────────────────────────
-# appuser runs the Node process.
-# We also add appuser to the 'docker' group (created by the docker-cli package)
-# so it can talk to /var/run/docker.sock when the socket is bind-mounted.
-#
-# NOTE: on Linux hosts the Docker socket GID is typically 999 (same as the
-# Alpine docker group).  If your host uses a different GID, override at runtime:
-#   docker-compose run --group-add <HOST_DOCKER_GID> backend
+# appuser runs the Node process. It is NOT a member of any docker-socket
+# group — DOCKER_HOST points the `docker` CLI at the docker-socket-proxy
+# service over TCP, so no local socket permissions are needed at all.
 RUN addgroup -S appgroup \
- && addgroup -S docker \
- && adduser  -S appuser -G appgroup \
- && adduser  appuser docker
+ && adduser  -S appuser -G appgroup
 
 # ── Application files ─────────────────────────────────────────────────────────
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN chown -R appuser:appgroup /app
+
+# ── Shared scratch volume mount point ─────────────────────────────────────────
+# See backend/utils/dockerScratch.js + docker-compose.yml (tfgen_scratch
+# volume). Pre-created with appuser ownership so that when Compose mounts
+# the (initially empty) named volume here, Docker seeds the volume with this
+# directory's ownership instead of defaulting to root:root — appuser needs
+# to create session subdirectories under this mount at runtime.
+RUN mkdir -p /tfgen-scratch && chown appuser:appgroup /tfgen-scratch
 
 USER appuser
 

@@ -92,6 +92,54 @@ function lintNetworkRules(hcl) {
   return [...new Set(warnings)]; // deduplicate
 }
 
+// ─── Dangerous Terraform execution primitives ─────────────────────────────────
+// SECURITY FIX (critical): guardHcl() previously only screened for literal
+// secrets and HTML markup — it never blocked Terraform's own code-execution
+// primitives. Any authenticated user could submit HCL containing a
+// `provisioner "local-exec"` / `"remote-exec"` block or a `data "external"`
+// block and have it executed for real by `terraform plan`/`init`/`apply`
+// (data "external" runs during plan/refresh, not just apply). Combined with
+// `use_real_credentials`, this allowed a single "read-only" plan request to
+// exfiltrate a victim's live AWS credentials or pivot into the network.
+//
+// These patterns are deliberately conservative (they match the construct
+// regardless of surrounding whitespace/formatting) and are applied to every
+// HCL entry point via guardHcl(), so fmt/validate/suggest/plan/cost/scan/
+// init/apply are all covered by the same check.
+const DANGEROUS_CONSTRUCTS = [
+  {
+    name: 'local-exec provisioner',
+    re: /provisioner\s+"local-exec"/i,
+    hint: 'provisioner "local-exec" runs arbitrary shell commands on the machine executing Terraform and is not permitted here.',
+  },
+  {
+    name: 'remote-exec provisioner',
+    re: /provisioner\s+"remote-exec"/i,
+    hint: 'provisioner "remote-exec" runs arbitrary shell commands on provisioned infrastructure and is not permitted here.',
+  },
+  {
+    name: 'external data source',
+    re: /data\s+"external"/i,
+    hint: 'data "external" executes an arbitrary local program during plan/refresh (not just apply) and is not permitted here.',
+  },
+];
+
+/**
+ * Scan HCL for Terraform constructs that cause arbitrary code execution
+ * on the machine running `terraform` (host or sandbox container) — as
+ * opposed to detectSecrets(), which only looks for literal credential
+ * material. Returns [] if none found.
+ */
+function detectDangerousConstructs(input) {
+  if (!input) return [];
+  const text = String(input);
+  const findings = [];
+  for (const { name, re, hint } of DANGEROUS_CONSTRUCTS) {
+    if (re.test(text)) findings.push({ name, hint });
+  }
+  return findings;
+}
+
 // ─── HTML/CSS tag stripper (unchanged, defensive) ─────────────────────────────
 const htmlTagRe = /<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^>]*?)?>/;
 const htmlTagGlobalRe = /<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^>]*?)?>/g;
@@ -137,4 +185,4 @@ function hasMarkup(input) {
     || /\bclass\s*=\s*["'][^"']*["']/i.test(text);
 }
 
-module.exports = { stripHtml, detectSecrets, lintNetworkRules, hasMarkup };
+module.exports = { stripHtml, detectSecrets, detectDangerousConstructs, lintNetworkRules, hasMarkup };

@@ -31,6 +31,19 @@ function signRefreshToken(payload) {
   );
 }
 
+/**
+ * Verify a raw access-token string and return its normalised payload, or
+ * throw. Shared by authMiddleware/optionalAuth (Authorization header) AND
+ * the WebSocket upgrade handler in server.js (token passed as ?token=...,
+ * since browsers cannot set custom headers during a WS handshake). Keeping
+ * this in one place means the WS auth path can never silently drift from
+ * the HTTP auth path.
+ */
+function verifyAccessToken(token) {
+  const payload = jwt.verify(token, JWT_SECRET);
+  return { id: payload.id, email: payload.email, role: payload.role || 'user' };
+}
+
 /** Require a valid JWT access token. Attaches req.user on success. */
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
@@ -39,8 +52,7 @@ function authMiddleware(req, res, next) {
   }
   const token = header.slice(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = { id: payload.id, email: payload.email, role: payload.role || 'user' };
+    req.user = verifyAccessToken(token);
     next();
   } catch (e) {
     const msg = e.name === 'TokenExpiredError' ? 'Token expired — please refresh' : 'Invalid or expired token';
@@ -54,8 +66,7 @@ function optionalAuth(req, res, next) {
   if (!header || !header.startsWith('Bearer ')) return next();
   const token = header.slice(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = { id: payload.id, email: payload.email, role: payload.role || 'user' };
+    req.user = verifyAccessToken(token);
   } catch (_) { /* ignore */ }
   next();
 }
@@ -84,6 +95,7 @@ module.exports = {
   authMiddleware,
   optionalAuth,
   requireRole,
+  verifyAccessToken,
   signAccessToken,
   signRefreshToken,
   JWT_SECRET,

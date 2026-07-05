@@ -13,6 +13,13 @@ if (!fs.existsSync(WORKSPACE_BASE)) fs.mkdirSync(WORKSPACE_BASE, { recursive: tr
 // The binary path — set TF_LSP_PATH in backend/.env
 const TFLSP_CMD = process.env.TF_LSP_PATH || 'terraform-ls';
 
+// SECURITY FIX: sessions used to live forever as long as the socket stayed
+// open, with no bound on how long a spawned terraform-ls process + workspace
+// dir could sit idle. Combined with the per-user/global caps added in
+// server.js, an idle session now self-terminates instead of permanently
+// occupying one of those slots.
+const IDLE_TIMEOUT_MS = parseInt(process.env.TF_LSP_IDLE_TIMEOUT_MS || String(20 * 60 * 1000), 10); // 20 min
+
 // ── URI helpers ───────────────────────────────────────────────────────────────
 // The frontend uses stable virtual URIs: file:///terraform/<filename>
 // We translate these to the actual on-disk workspace paths so terraform-ls
@@ -103,6 +110,18 @@ class TerraformLspSession {
     this.stdoutBuffer = Buffer.alloc(0);
     this.alive        = true;
     this.process      = null;
+    this.idleTimer    = null;
+  }
+
+  _resetIdleTimer() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this.logger.info(`[terraform-lsp] session idle for ${IDLE_TIMEOUT_MS}ms — closing (workspace: ${this.workspaceDir})`);
+      this._sendClientError('Session closed due to inactivity.');
+      this.dispose();
+    }, IDLE_TIMEOUT_MS);
+    // Don't let this timer keep the Node process alive on its own.
+    if (this.idleTimer.unref) this.idleTimer.unref();
   }
 
   start() {
@@ -130,6 +149,7 @@ class TerraformLspSession {
     this.ws.on('close',   ()    => this.dispose());
     this.ws.on('error',   ()    => this.dispose());
 
+    this._resetIdleTimer();
     this._sendClientLog('info', `terraform-ls session started (workspace: ${this.workspaceDir})`);
   }
 
@@ -196,6 +216,7 @@ class TerraformLspSession {
   // ── stdin: frontend → terraform-ls ────────────────────────────────────────
   _onClientMessage(rawMsg) {
     if (!this.alive) return;
+    this._resetIdleTimer();
     let payload;
     try {
       payload = JSON.parse(typeof rawMsg === 'string' ? rawMsg : rawMsg.toString('utf8'));
@@ -304,6 +325,7 @@ class TerraformLspSession {
   dispose() {
     if (!this.alive) return;
     this.alive = false;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
     try { this.ws.close(); }                                         catch (_) {}
     try { if (this.process && !this.process.killed) this.process.kill('SIGKILL'); } catch (_) {}
     cleanupDir(this.workspaceDir);
