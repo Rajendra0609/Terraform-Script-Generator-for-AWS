@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import API from '../api/client';
 
 const PROVIDER_ICONS = { aws:'🟠', google:'🔵', azurerm:'🔷', kubernetes:'☸', helm:'⎈' };
+const NAME_RE = /^[a-z_][a-z0-9_]*$/i;
 
 export default function ModuleRegistry({ c, onImport, onClose }) {
   const [q, setQ]               = useState('');
@@ -17,23 +18,45 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
   const [generating, setGenerating] = useState(false);
   const [offline, setOffline]   = useState(false);
   const [step, setStep]         = useState('search'); // search | configure | preview
+  const [error, setError]       = useState('');       // inline banner instead of alert()
+  const [copied, setCopied]     = useState(false);
+  const [imported, setImported] = useState(false);
+  const searchDebounce = useRef(null);
+  const copyResetTimer = useRef(null);
 
   const search = useCallback(async (query) => {
     setLoading(true);
+    setError('');
     try {
       const r = await API.get(`/api/registry/search?q=${encodeURIComponent(query)}&provider=${provider}&limit=20`);
       setResults(r.data.modules||[]);
       setOffline(r.data.offline||false);
-    } catch { setResults([]); }
+    } catch (e) {
+      setResults([]);
+      setError(e.response?.data?.error || 'Could not reach the module registry. Showing no results — try again.');
+    }
     finally { setLoading(false); }
   }, [provider]);
 
   useEffect(() => { search(''); }, []);// eslint-disable-line
 
+  // Debounced live search as the user types, in addition to Enter/click.
+  useEffect(() => {
+    if (step !== 'search') return;
+    clearTimeout(searchDebounce.current);
+    searchDebounce.current = setTimeout(() => search(q), 350);
+    return () => clearTimeout(searchDebounce.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, provider]);
+
+  useEffect(() => () => clearTimeout(copyResetTimer.current), []);
+
   const selectModule = async (mod) => {
     setSelected(mod);
     setModuleName(mod.name.replace(/-/g,'_'));
     setStep('configure');
+    setError('');
+    setImported(false);
     // Load template inputs
     try {
       const r = await API.get(`/api/registry/module/${mod.namespace}/${mod.name}/${mod.provider}`);
@@ -51,14 +74,68 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
     } catch { setVersions([mod.latest||'latest']); setSelVersion(mod.latest||'latest'); }
   };
 
+  const nameValid = NAME_RE.test((moduleName||'').trim());
+
   const generate = async () => {
+    if (!nameValid) { setError('Module block name must be a valid identifier (letters, numbers, underscore — cannot start with a number).'); return; }
     setGenerating(true);
+    setError('');
     try {
-      const r = await API.post('/api/registry/import', { module: selected, version: selVersion, inputs, module_name: moduleName });
+      const r = await API.post('/api/registry/import', { module: selected, version: selVersion, inputs, module_name: moduleName.trim() });
       setGeneratedHCL(r.data.hcl||'');
+      setImported(false);
       setStep('preview');
-    } catch(e) { alert(e.response?.data?.error||e.message); }
+    } catch(e) { setError(e.response?.data?.error || e.message || 'Failed to generate the module block. Please try again.'); }
     finally { setGenerating(false); }
+  };
+
+  // Robust clipboard copy: the async Clipboard API silently throws in
+  // non-secure (non-HTTPS) contexts, sandboxed iframes without the
+  // clipboard-write permission, and some older browsers. Previously this
+  // rejection was never caught, so the click appeared to "throw an error."
+  // We now try the modern API first, fall back to the legacy execCommand
+  // approach, and only surface a friendly inline message if both fail —
+  // never an uncaught exception.
+  const copyToClipboard = async () => {
+    if (!generatedHCL) return;
+    setError('');
+    try {
+      if (!navigator.clipboard || !window.isSecureContext) throw new Error('clipboard-api-unavailable');
+      await navigator.clipboard.writeText(generatedHCL);
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = generatedHCL;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-1000px';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (!ok) throw new Error('execCommand-copy-failed');
+      } catch {
+        setError('Could not copy automatically in this browser — select the code below and copy it manually (Ctrl/Cmd+C).');
+        return;
+      }
+    }
+    setCopied(true);
+    clearTimeout(copyResetTimer.current);
+    copyResetTimer.current = setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleImportClick = () => {
+    if (!generatedHCL) { setError('Nothing to import yet — generate the module block first.'); return; }
+    setError('');
+    onImport({
+      hcl: generatedHCL,
+      name: (moduleName || selected?.name || 'imported_module').trim(),
+      source: selected ? `${selected.namespace}/${selected.name}/${selected.provider}` : '',
+      version: selVersion || selected?.latest || '',
+    });
+    setImported(true);
   };
 
   const S = {
@@ -83,9 +160,17 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
               {offline?'🔴 Offline — showing curated modules':'🟢 Live from registry.terraform.io'} · Browse & import into builder
             </div>
           </div>
-          {step!=='search'&&<button onClick={()=>setStep('search')} style={{padding:'5px 12px',borderRadius:7,border:`1px solid ${c.bd}`,background:'transparent',color:c.fg3,fontSize:12,cursor:'pointer'}}>← Back</button>}
+          {step!=='search'&&<button onClick={()=>{setStep('search');setError('');}} style={{padding:'5px 12px',borderRadius:7,border:`1px solid ${c.bd}`,background:'transparent',color:c.fg3,fontSize:12,cursor:'pointer'}}>← Back</button>}
           <button onClick={onClose} style={{background:'none',border:'none',color:c.fg3,cursor:'pointer',fontSize:22,lineHeight:1,padding:4}}>×</button>
         </div>
+
+        {error && (
+          <div style={{padding:'10px 20px',background:'rgba(220,38,38,0.1)',borderBottom:'1px solid rgba(220,38,38,0.25)',color:'#F87171',fontSize:12,display:'flex',alignItems:'center',gap:8,flexShrink:0}}>
+            <span>⚠</span>
+            <span style={{flex:1}}>{error}</span>
+            <button onClick={()=>setError('')} style={{background:'none',border:'none',color:'#F87171',cursor:'pointer',fontSize:14,lineHeight:1,padding:2}}>×</button>
+          </div>
+        )}
 
         <div style={S.body}>
           {/* SEARCH */}
@@ -148,7 +233,11 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
                 <div>
                   <label style={{fontSize:11,fontWeight:700,color:c.fg3,textTransform:'uppercase',letterSpacing:'.08em',display:'block',marginBottom:6}}>Module Block Name</label>
                   <input value={moduleName} onChange={e=>setModuleName(e.target.value.replace(/[^a-z0-9_]/gi,'_'))}
-                    style={S.inp} placeholder="e.g. main_vpc" onFocus={e=>e.target.style.borderColor=c.accent} onBlur={e=>e.target.style.borderColor=c.bd} />
+                    style={{...S.inp, borderColor: moduleName && !nameValid ? '#DC2626' : c.bd}} placeholder="e.g. main_vpc"
+                    onFocus={e=>e.target.style.borderColor=c.accent} onBlur={e=>e.target.style.borderColor= moduleName && !nameValid ? '#DC2626' : c.bd} />
+                  {moduleName && !nameValid && (
+                    <div style={{fontSize:11,color:'#F87171',marginTop:4}}>Must start with a letter or underscore, and contain only letters, numbers, underscores.</div>
+                  )}
                 </div>
 
                 {Object.keys(inputs).length>0&&(
@@ -164,7 +253,7 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
                   </div>
                 )}
 
-                <button onClick={generate} disabled={generating} style={{...S.btn('accent'),width:'100%',padding:'11px'}}>
+                <button onClick={generate} disabled={generating||!nameValid} style={{...S.btn('accent'),width:'100%',padding:'11px',opacity:(generating||!nameValid)?0.6:1,cursor:(generating||!nameValid)?'not-allowed':'pointer'}}>
                   {generating?'⏳ Generating…':'⚡ Generate HCL Module Block'}
                 </button>
               </div>
@@ -176,8 +265,12 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
             <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
               <div style={{padding:'12px 16px',borderBottom:`1px solid ${c.bd}`,background:c.bg2,display:'flex',gap:8,flexShrink:0}}>
                 <span style={{fontSize:13,fontWeight:600,color:c.fg,flex:1}}>Generated module block — ready to import</span>
-                <button onClick={()=>navigator.clipboard.writeText(generatedHCL)} style={{...S.btn('default'),padding:'6px 14px',fontSize:12}}>📋 Copy</button>
-                <button onClick={()=>onImport(generatedHCL)} style={S.btn('accent')}>⚡ Import to Builder</button>
+                <button onClick={copyToClipboard} style={{...S.btn('default'),padding:'6px 14px',fontSize:12,color:copied?'#00D4A1':c.fg2}}>
+                  {copied?'✓ Copied!':'📋 Copy'}
+                </button>
+                <button onClick={handleImportClick} style={{...S.btn('accent'), opacity: imported?0.75:1}}>
+                  {imported?'✓ Imported':'⚡ Import to Builder'}
+                </button>
               </div>
               <pre style={{flex:1,overflow:'auto',margin:0,padding:'16px 20px',fontFamily:'JetBrains Mono,monospace',fontSize:12.5,lineHeight:1.7,color:c.fg2,background:c.bg}}>
                 {generatedHCL}

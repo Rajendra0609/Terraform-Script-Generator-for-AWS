@@ -462,7 +462,15 @@ export default function ConfigPanel({ service, config, onChange, isModule, onTog
 
         {(service.schema_def || []).length === 0 && (
           <div style={{ textAlign: 'center', padding: '24px 0', color: c.fg3, fontSize: 13 }}>
-            No configuration fields for this resource.
+            {service.module_source ? (
+              <>
+                <div>This module was imported from the registry as raw HCL.</div>
+                <div style={{ marginTop: 6, fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>
+                  {service.module_source}{service.version ? ` @ ${service.version}` : ''}
+                </div>
+                <div style={{ marginTop: 6 }}>Edit its inputs directly in the Code view.</div>
+              </>
+            ) : 'No configuration fields for this resource.'}
           </div>
         )}
 

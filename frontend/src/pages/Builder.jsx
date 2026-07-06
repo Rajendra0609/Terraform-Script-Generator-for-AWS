@@ -622,6 +622,58 @@ export default function Builder() {
     setTimeout(() => setCodeFlash(false), 500);
   };
 
+  // BUG FIX: Module Registry "Import to Builder" previously appended the
+  // generated HCL directly onto `fullHCL` as a raw string. `fullHCL` is a
+  // *derived* value — the rebuildHCL effect above regenerates it from
+  // `resources`/`variables`/`outputs` on every change — so the very next
+  // time any resource, variable, or output changed, the manually-appended
+  // module text was silently overwritten and the import appeared to have
+  // "done nothing." Fix: turn the import into a real resource entry (like
+  // every other block in the builder) so it flows through the normal
+  // rebuild/save/undo/graph pipeline and survives future edits.
+  const handleImportModule = ({ hcl, name, source, version }) => {
+    if (!hcl) { show('Nothing to import', 'warning'); return; }
+    let cleanHcl = sanitizeHcl(hcl);
+    const base = (name || 'imported_module').replace(/[^a-z0-9_]/gi, '_').replace(/^(\d)/, '_$1') || 'imported_module';
+    const existingNames = new Set(resources.map(r => (r.resource_name || r.label || '').toLowerCase()));
+    let uniqueName = base;
+    let n = 1;
+    while (existingNames.has(uniqueName.toLowerCase())) { uniqueName = `${base}_${++n}`; }
+    // If we had to rename to avoid a collision, keep the terraform block
+    // identifier inside the generated HCL in sync with the new resource
+    // label/name — otherwise the sidebar would show "vpc_2" while the code
+    // still declares `module "vpc" { ... }`.
+    if (uniqueName !== base) {
+      cleanHcl = cleanHcl.replace(new RegExp(`module\\s+"${base}"\\s*{`), `module "${uniqueName}" {`);
+    }
+
+    const newResource = {
+      _id: Math.random().toString(36).slice(2),
+      service_type: `module:${source || uniqueName}`,
+      label: uniqueName,
+      resource_name: uniqueName,
+      category: 'Registry Module',
+      config: {},
+      is_module: true,
+      hcl_output: cleanHcl,
+      module_source: source || '',
+      version: version || '',
+      wiredFrom: {},
+      icon: '📦',
+      position_x: 0,
+      position_y: 0,
+      annotations: '',
+    };
+
+    setResources([...resources, newResource]);
+    setActiveIdx(resources.length); // select the newly added module
+    setShowModuleRegistry(false);
+    setViewMode('code');
+    setCodeFlash(true);
+    setTimeout(() => setCodeFlash(false), 700);
+    show(`Module "${uniqueName}" imported — added to resources & visible in Code view`, 'success');
+  };
+
   const handleToggleModule = () => {
     const r = resources[activeIdx];
     if (!r) return;
@@ -1353,12 +1405,7 @@ export default function Builder() {
       )}
       {showModuleRegistry && (
         <ModuleRegistry c={c}
-          onImport={(hcl) => {
-            // Append imported module HCL directly to the full HCL output
-            setFullHCL(prev => sanitizeHcl((prev ? prev + '\n\n' : '') + hcl));
-            setShowModuleRegistry(false);
-            show('Module imported — visible in Code view', 'success');
-          }}
+          onImport={handleImportModule}
           onClose={() => setShowModuleRegistry(false)} />
       )}
       {showMultiEnv && (
