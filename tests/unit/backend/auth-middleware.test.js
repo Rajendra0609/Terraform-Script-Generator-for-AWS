@@ -13,8 +13,11 @@ const path = require('path');
 const jwt  = require('jsonwebtoken');
 
 // Set required env vars before requiring the module
-process.env.JWT_SECRET         = 'unit-test-jwt-secret';
-process.env.JWT_REFRESH_SECRET = 'unit-test-refresh-secret';
+// NOTE: auth.js now fails fast if either secret is <32 chars (see the C-09
+// security fix) — these are padded out accordingly, purely so this test
+// file can require() the module; they're never used outside this process.
+process.env.JWT_SECRET         = 'unit-test-jwt-secret-padded-to-32-chars-minimum';
+process.env.JWT_REFRESH_SECRET = 'unit-test-refresh-secret-padded-to-32-chars-min';
 process.env.ENCRYPT_KEY        = 'test-encrypt-key-exactly-32-char';
 
 const {

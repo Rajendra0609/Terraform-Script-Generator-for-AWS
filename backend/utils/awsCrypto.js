@@ -67,4 +67,24 @@ async function getDecryptedAwsCredentials(userId) {
   };
 }
 
-module.exports = { encrypt, decrypt, getDecryptedAwsCredentials, ENCRYPT_KEY };
+/**
+ * Cheap existence check — does this user have AWS credentials saved at all?
+ * Does NOT decrypt anything. Used by route handlers that need to reject
+ * early (e.g. "no credentials saved" on POST /apply) WITHOUT pulling the
+ * decrypted secret into memory before it's actually needed at execution
+ * time — see the SECURITY FIX comment in routes/terraform.js / services/
+ * terraformJobs.js (C-06) for why decrypted credentials must never be
+ * fetched any earlier than the moment runPlan()/runApply() is about to use
+ * them, since anything fetched at request time historically ended up
+ * serialized into the BullMQ job payload in Redis.
+ */
+async function hasAwsCredentials(userId) {
+  if (!userId) return false;
+  const row = await db.query(
+    'SELECT 1 FROM user_aws_credentials WHERE user_id = $1',
+    [userId]
+  );
+  return row.rows.length > 0;
+}
+
+module.exports = { encrypt, decrypt, getDecryptedAwsCredentials, hasAwsCredentials, ENCRYPT_KEY };

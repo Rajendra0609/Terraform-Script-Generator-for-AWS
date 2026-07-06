@@ -253,7 +253,22 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
   // local-exec/remote-exec/data-external (see above), the direct RCE path is
   // closed — but "plan with real credentials + network access" still now
   // requires the same project role gate as /apply, instead of only auth.
-  let awsCredentials = null;
+  //
+  // SECURITY FIX (critical — C-06): this handler used to call
+  // getDecryptedAwsCredentials() right here and put the resulting plaintext
+  // accessKeyId/secretAccessKey/sessionToken directly into the object handed
+  // to enqueue(). enqueue() -> jobQueue.js's queue.add() serializes that
+  // entire object into a BullMQ job in Redis, and with the default
+  // removeOnComplete:100 / removeOnFail:200, Redis ends up holding a rolling
+  // window of up to 300 sets of plaintext AWS credentials — made far worse
+  // by Redis previously having no auth at all (see docker-compose.yml fix).
+  // Fix: never let credential material enter the job payload at all — only
+  // a boolean flag is enqueued, and the job processor (services/
+  // terraformJobs.js) fetches + decrypts credentials itself, inside the
+  // worker, at the moment it's about to call runPlan() — so secrets are
+  // decrypted once, held only in local process memory for the duration of
+  // that call, and never serialized anywhere.
+  let useRealCredentials = false;
   if (req.body.use_real_credentials) {
     if (!projectId) {
       return res.status(400).json({
@@ -262,17 +277,13 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
     }
     const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin', 'user']);
     if (!project) return; // authoriseProjectById already sent 403/404
-
-    try {
-      const { getDecryptedAwsCredentials } = require('../utils/awsCrypto');
-      awsCredentials = await getDecryptedAwsCredentials(req.user.id);
-    } catch (_) { /* fall back to mock plan */ }
+    useRealCredentials = true;
   }
 
   try {
     const jobId = await createExecutionJobRow({ projectId, userId: req.user.id, type: 'plan', hcl });
     const { result } = await enqueue(
-      { jobId, type: 'plan', hcl, mode, projectId, userId: req.user.id, awsCredentials },
+      { jobId, type: 'plan', hcl, mode, projectId, userId: req.user.id, useRealCredentials },
       dispatchAndPersist
     );
 
@@ -363,15 +374,24 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
   const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin', 'user']);
   if (!project) return; // authoriseProjectById already sent 403/404
 
-  // Credential check — must have saved real AWS credentials
-  let awsCredentials;
+  // Credential check — must have saved real AWS credentials.
+  // SECURITY FIX (critical — C-06): this used to call
+  // getDecryptedAwsCredentials() here and stash the plaintext result in
+  // `awsCredentials`, which was then put straight into the job payload
+  // passed to enqueue() — and from there into the BullMQ job in Redis (see
+  // the matching comment on POST /plan above for the full writeup). This
+  // route only needs to know WHETHER credentials exist, not what they are,
+  // so it now uses the cheap existence check hasAwsCredentials() (no
+  // decryption at all) and defers the actual decrypt to the job processor,
+  // at execution time, inside the worker.
+  let credentialsExist;
   try {
-    const { getDecryptedAwsCredentials } = require('../utils/awsCrypto');
-    awsCredentials = await getDecryptedAwsCredentials(req.user.id);
+    const { hasAwsCredentials } = require('../utils/awsCrypto');
+    credentialsExist = await hasAwsCredentials(req.user.id);
   } catch (credErr) {
-    return res.status(500).json({ error: 'Failed to retrieve AWS credentials: ' + credErr.message });
+    return res.status(500).json({ error: 'Failed to check AWS credentials: ' + credErr.message });
   }
-  if (!awsCredentials) {
+  if (!credentialsExist) {
     return res.status(422).json({
       error: 'No AWS credentials saved. Go to Settings → AWS Credentials and connect your account before running apply.',
       code: 'NO_CREDENTIALS',
@@ -385,9 +405,10 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
 
     // Always enqueue — never run apply inline on the HTTP request
     // (apply is too slow; even the in-process fallback fires the processor
-    //  asynchronously and returns immediately here).
+    //  asynchronously and returns immediately here). Note: no credential
+    // material in this payload — see SECURITY FIX comment above.
     await enqueue(
-      { jobId, type: 'apply', hcl, mode, projectId, userId: req.user.id, awsCredentials },
+      { jobId, type: 'apply', hcl, mode, projectId, userId: req.user.id, useRealCredentials: true },
       dispatchAndPersist
     );
 

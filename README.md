@@ -316,10 +316,17 @@ Open **http://localhost:3000** and sign in. Use **"Try with demo credentials"** 
 ### Alternative: Docker (one command)
 
 ```bash
+cp .env.example .env      # fill in POSTGRES_PASSWORD, REDIS_PASSWORD, JWT_SECRET,
+                           # JWT_REFRESH_SECRET, ENCRYPT_KEY — compose will refuse
+                           # to start without these (see .env.example comments)
 docker compose up -d
 ```
 
-Docker Compose starts PostgreSQL → Backend → Frontend in the correct order, applies schema + seed automatically, and maps all ports. No manual DB setup needed.
+Docker Compose starts PostgreSQL → Redis → Backend → Frontend in the correct
+order, applies schema + seed automatically, and publishes only the frontend
+port to the host — Postgres, Redis, and the backend API are reachable only
+over the internal Compose network (see `docker-compose.yml` for the
+reasoning). No manual DB setup needed.
 
 ---
 
@@ -484,13 +491,19 @@ curl http://localhost:4000/api/health   # → {"status":"ok"}
 
 ### 401 Unauthorized on every request
 - `JWT_SECRET` in `backend/.env` must match the secret used to sign the token
-- Generate a test token manually:
+- **Note:** the backend no longer has a hardcoded fallback secret — it fails
+  fast at startup with a `[FATAL]` error if `JWT_SECRET`/`JWT_REFRESH_SECRET`
+  are unset, too short (<32 chars), or equal to a former default value. If
+  the backend won't start, check its logs for that message first.
+- Generate a test token manually (reads your real secret from `backend/.env`
+  via `dotenv` — this only works if the backend process can also start):
 ```bash
 node -e "
+require('dotenv').config({ path: 'backend/.env' });
 const jwt = require('jsonwebtoken');
 const token = jwt.sign(
   { id: 'test-user', email: 'test@example.com', role: 'admin' },
-  process.env.JWT_SECRET || 'tfgen-dev-secret-change-in-production',
+  process.env.JWT_SECRET,
   { expiresIn: '1h' }
 );
 console.log('Bearer ' + token);

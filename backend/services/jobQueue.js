@@ -5,6 +5,17 @@
  *
  * Each job has: { type, hcl, projectId, userId, options }
  * Emits events via EventEmitter so WebSocket layer can stream logs.
+ *
+ * SECURITY INVARIANT (C-06): `data` passed to enqueue() is serialized
+ * verbatim into a BullMQ job in Redis (see queue.add() below) and — with the
+ * default removeOnComplete/removeOnFail settings — stays there for a
+ * rolling window of recent jobs. It MUST NEVER contain decrypted secrets
+ * (AWS credentials, etc.). Callers (routes/terraform.js) pass only a
+ * `useRealCredentials` boolean + `userId`; the job processor (services/
+ * terraformJobs.js's loadJobCredentials()) fetches and decrypts credentials
+ * itself, inside the worker, immediately before they're used. If you're
+ * adding a new job type that needs a secret, follow that pattern — don't
+ * put the secret on `data`.
  */
 const { Queue, Worker, QueueEvents } = require('bullmq');
 const Redis = require('ioredis');

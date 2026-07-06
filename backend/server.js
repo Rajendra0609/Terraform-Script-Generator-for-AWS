@@ -40,13 +40,75 @@ app.use(cors({
 // (e.g., Nginx/ALB). express-rate-limit validates that X-Forwarded-For is
 // only used when trust proxy is enabled.
 // Use a safe default: only trust the first proxy hop.
-app.set('trust proxy', process.env.TRUST_PROXY || 1);
+//
+// SECURITY FIX (C-10): TRUST_PROXY used to be read as
+// `process.env.TRUST_PROXY || 1`, which — because `||` only falls through on
+// falsy values — meant setting `TRUST_PROXY=false` in .env actually set
+// Express's trust-proxy option to the STRING `"false"`, not the boolean
+// `false` (a non-empty string is truthy). Express's trust-proxy setting
+// treats an unrecognised string as a hostname/subnet to trust, which is not
+// what anyone setting `TRUST_PROXY=false` intended. Parse it explicitly.
+function parseTrustProxy(raw) {
+  if (raw === undefined || raw === '') return 1; // safe default: trust exactly one hop
+  if (raw === 'false') return false;
+  if (raw === 'true') return true;
+  const n = Number(raw);
+  return Number.isInteger(n) ? n : raw; // allow a hostname/subnet/CSV list to pass through as-is
+}
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
 
 // Rate limiting
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || String(15 * 60 * 1000), 10);
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || (isDev ? '1000' : '100'), 10);
-// Comma-separated list of trusted IP fragments (e.g. '127.0.0.1,::1,10.244.24.67')
-const TRUSTED_IPS = (process.env.RATE_LIMIT_TRUSTED_IPS || '127.0.0.1,::1,10.244.24.67').split(',').map(s => s.trim()).filter(Boolean);
+
+// SECURITY FIX (critical — C-10): TRUSTED_IPS used to be matched with
+// `ip.includes(t)` — a SUBSTRING check, not equality. Any spoofed
+// X-Forwarded-For value that merely CONTAINED a trusted fragment anywhere in
+// it (e.g. an attacker-chosen string embedding "127.0.0.1") was exempted
+// from rate limiting entirely, including the strict authLimiter meant to
+// stop login brute-forcing — reproducible with
+// `curl -H "X-Forwarded-For: 127.0.0.1" ...` on every request. Fixed by
+// parsing each configured entry as an exact IP or CIDR range with ipaddr.js
+// (already a dependency — see utils/ssrfGuard.js) and comparing structurally
+// instead of by string containment. This closes the bypass on its own, but
+// it's paired with two other required fixes: nginx now overwrites (rather
+// than appends to) X-Forwarded-For at the true network edge, and the backend
+// port is no longer published directly to the host — see nginx.conf and
+// docker-compose.yml.
+const ipaddr = require('ipaddr.js');
+
+function parseTrustedEntry(raw) {
+  try {
+    if (raw.includes('/')) return ipaddr.parseCIDR(raw);
+    return ipaddr.process(raw); // normalises IPv4-mapped IPv6 (::ffff:a.b.c.d) too
+  } catch (_) {
+    console.warn(`[rate-limit] ignoring malformed RATE_LIMIT_TRUSTED_IPS entry: ${raw}`);
+    return null;
+  }
+}
+const TRUSTED_ENTRIES = (process.env.RATE_LIMIT_TRUSTED_IPS || '127.0.0.1,::1')
+  .split(',').map(s => s.trim()).filter(Boolean)
+  .map(parseTrustedEntry).filter(Boolean);
+
+function isTrustedIp(rawIp) {
+  if (!rawIp) return false;
+  let addr;
+  try {
+    addr = ipaddr.process(rawIp);
+  } catch (_) {
+    return false;
+  }
+  return TRUSTED_ENTRIES.some((entry) => {
+    try {
+      if (Array.isArray(entry)) { // parsed CIDR: [rangeAddr, prefixBits]
+        return addr.kind() === entry[0].kind() && addr.match(entry);
+      }
+      return addr.kind() === entry.kind() && addr.toString() === entry.toString();
+    } catch (_) {
+      return false;
+    }
+  });
+}
 
 const limiter = rateLimit({
   windowMs: RATE_LIMIT_WINDOW_MS,
@@ -59,7 +121,7 @@ const limiter = rateLimit({
     // prevent DoS via stolen/compromised admin tokens.
     // Skip for trusted local/dev IPs
     const ip = req.ip || req.connection?.remoteAddress || '';
-    if (TRUSTED_IPS.some(t => t && ip.includes(t))) return true;
+    if (isTrustedIp(ip)) return true;
     // In dev, be more permissive
     if (isDev) return false; // dev uses a higher RATE_LIMIT_MAX already
     return false;
@@ -84,7 +146,7 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => {
     const ip = req.ip || req.connection?.remoteAddress || '';
-    return TRUSTED_IPS.some(t => t && ip.includes(t));
+    return isTrustedIp(ip);
   },
   handler: (req, res) => {
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
@@ -95,6 +157,37 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login',    authLimiter);
 app.use('/api/auth/register', authLimiter);
+
+// SECURITY FIX (defense-in-depth — C-10): authLimiter above is keyed by
+// (trust-proxy-derived) IP, so it's only as strong as X-Forwarded-For
+// handling — which the other C-10 fixes (nginx, backend port, trust-proxy
+// parsing, exact-match TRUSTED_IPS) close, but a second, independent layer
+// keyed by the ACCOUNT being targeted means a brute-force against one
+// victim's account is still bounded even if some future proxy
+// misconfiguration lets IP-based limiting be bypassed again. Deliberately
+// does not consult TRUSTED_IPS/isTrustedIp at all — this is about
+// protecting the target account, not about who's asking.
+const loginPerAccountLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const email = String(req.body?.email || '').toLowerCase().trim();
+    return email ? `acct:${email}` : (req.ip || 'unknown');
+  },
+  handler: (req, res) => {
+    logger.warn(`[login-account-rate-limit] 429 for account lookup on ${req.method} ${req.originalUrl}`);
+    res.set('Retry-After', String(15 * 60));
+    res.status(429).json({ error: 'Too many login attempts for this account — try again later', retryAfter: 15 * 60 });
+  },
+});
+// NOTE: express.json() is mounted globally further below (after these
+// limiters), but keyGenerator here needs req.body.email — so parse the body
+// for this one route now. body-parser is idempotent (it no-ops if the body
+// was already parsed), so this doesn't double-consume the request when the
+// global parser runs again later.
+app.use('/api/auth/login', express.json({ limit: '10mb' }), loginPerAccountLimiter);
 
 // Dev-only request logger: log incoming requests to help trace whether
 // the browser's requests reach the backend. Enabled only in development.

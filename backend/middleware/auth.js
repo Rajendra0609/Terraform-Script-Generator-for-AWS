@@ -1,8 +1,60 @@
 'use strict';
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET         = process.env.JWT_SECRET          || 'tfgen-dev-secret-change-in-production';
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET  || 'tfgen-refresh-secret-change-in-production';
+// SECURITY FIX (critical — C-09, authentication bypass): this module used to
+// fall back to hardcoded, publicly-known secret strings
+// ('tfgen-dev-secret-change-in-production' / 'tfgen-refresh-secret-change-
+// in-production') whenever JWT_SECRET / JWT_REFRESH_SECRET were unset. The
+// shipped docker-compose.yml never set either var directly, so an operator
+// who ran `docker-compose up` without independently creating a correct
+// backend/.env got a backend that started up normally — no crash, no
+// warning — using the literal default string. Anyone who knew (or guessed,
+// since it's printed right here in the source) that string could forge a
+// valid token for any user, including `role: "admin"`, and use it directly
+// against every endpoint: a complete authentication bypass.
+//
+// Fix: apply the exact same fail-fast pattern already used correctly in
+// backend/utils/awsCrypto.js for ENCRYPT_KEY — throw at require()-time
+// (crashes startup with a clear [FATAL] message) if either secret is unset,
+// still equal to its known-insecure former default, or too short/weak to
+// resist brute force. The hardcoded default strings themselves are removed
+// entirely so they can't be reused even accidentally.
+const INSECURE_DEFAULTS = new Set([
+  'tfgen-dev-secret-change-in-production',
+  'tfgen-refresh-secret-change-in-production',
+  'secret', 'changeme', 'change-me', 'password',
+]);
+const MIN_SECRET_LENGTH = 32;
+
+function assertStrongSecret(name, value) {
+  if (!value) {
+    throw new Error(
+      `[FATAL] ${name} environment variable is not set. Generate a strong random ` +
+      `value (e.g. \`openssl rand -hex 32\`) and add it to backend/.env before starting. ` +
+      `See backend/.env.example.`
+    );
+  }
+  if (INSECURE_DEFAULTS.has(value)) {
+    throw new Error(
+      `[FATAL] ${name} is still set to a known insecure default value. ` +
+      `Generate a strong random value (e.g. \`openssl rand -hex 32\`) and put it in backend/.env.`
+    );
+  }
+  if (value.length < MIN_SECRET_LENGTH) {
+    throw new Error(
+      `[FATAL] ${name} is only ${value.length} characters — must be at least ${MIN_SECRET_LENGTH} ` +
+      `for adequate entropy. Generate one with \`openssl rand -hex 32\`.`
+    );
+  }
+}
+
+const JWT_SECRET         = process.env.JWT_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
+assertStrongSecret('JWT_SECRET', JWT_SECRET);
+assertStrongSecret('JWT_REFRESH_SECRET', JWT_REFRESH_SECRET);
+if (JWT_SECRET === JWT_REFRESH_SECRET) {
+  throw new Error('[FATAL] JWT_SECRET and JWT_REFRESH_SECRET must be different values.');
+}
 
 // Access token: 1 hour (short-lived for security)
 // Refresh token: 7 days

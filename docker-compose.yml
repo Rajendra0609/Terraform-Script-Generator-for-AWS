@@ -2,14 +2,30 @@ version: '3.9'
 services:
 
   # ── Postgres ─────────────────────────────────────────────────────────────────
+  # SECURITY FIX (critical — C-06): this service used to publish 5432 straight
+  # to the host with a weak default password (`tfgen123` via `:-tfgen123`
+  # fallback), so anything that could reach the host on 5432 got a full
+  # read/write shot at the application database with a guessable password.
+  # The backend already reaches Postgres over the internal Compose network by
+  # service name (`postgres:5432`) — there is no legitimate reason to publish
+  # this port to the host at all, so `ports:` is removed entirely. If you
+  # genuinely need external access (e.g. a one-off admin query with a GUI
+  # client), open a tunnel on demand — `docker compose exec postgres psql` or
+  # `docker compose port postgres 5432` + an SSH tunnel — instead of leaving
+  # it published permanently.
+  #
+  # POSTGRES_PASSWORD now uses `${VAR:?err}` (no fallback): Compose will
+  # refuse to start ANY service with a clear error if this isn't set in your
+  # .env, mirroring the same fail-fast principle applied to ENCRYPT_KEY /
+  # JWT_SECRET in the backend code. See .env.example.
   postgres:
     image: daggu1997/tfgen_postgres:v0.0.1
     environment:
       POSTGRES_USER:     ${POSTGRES_USER:-tfgen}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfgen123}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env — see .env.example. Do not use a weak/default value.}
       POSTGRES_DB:       ${POSTGRES_DB:-terraform_generator}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+    # No `ports:` — intentionally not published to the host. Only reachable
+    # by other containers on this Compose network, via the service name.
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,18 +37,39 @@ services:
     restart: unless-stopped
 
   # ── Redis ────────────────────────────────────────────────────────────────────
+  # SECURITY FIX (critical — C-06): this service used to publish 6379 to the
+  # host with NO `requirepass` at all — completely unauthenticated. Combined
+  # with plaintext AWS credentials that used to flow through the BullMQ job
+  # payload (see routes/terraform.js / services/terraformJobs.js SECURITY FIX
+  # comments), that meant `redis-cli -h <host> ping` from anywhere that could
+  # reach the host was enough to read every recent job, including plaintext
+  # AWS keys, with zero authentication. Two independent fixes, both required:
+  #   1. `ports:` removed — not published to the host at all, same reasoning
+  #      as Postgres above.
+  #   2. `--requirepass` now set from a required REDIS_PASSWORD env var (no
+  #      fallback — Compose refuses to start without it), and REDIS_URL below
+  #      is updated to include it.
   redis:
     image: redis:7-alpine
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
+    # No `ports:` — intentionally not published to the host.
     volumes:
       - redisdata:/data
-    command: ["redis-server", "--appendonly", "yes"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env — see .env.example}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # --no-auth-warning suppresses redis-cli's "password on command line"
+      # warning, which is harmless here (this runs inside the container /
+      # Compose network, not over a public shell history).
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env — see .env.example}
     restart: unless-stopped
 
   # ── Docker socket proxy ───────────────────────────────────────────────────────
@@ -96,10 +133,24 @@ services:
     restart: unless-stopped
 
   # ── Backend (Node / Express) ─────────────────────────────────────────────────
+  # SECURITY FIX (critical — C-10): this service used to publish 4000 straight
+  # to the host IN ADDITION to being reachable through nginx. Any client that
+  # connected directly to :4000 became the "trusted proxy hop" Express relies
+  # on (`app.set('trust proxy', 1)`), so it could set
+  # `X-Forwarded-For: 127.0.0.1` and Express would believe it — trivially
+  # defeating both the global and auth rate limiters (unlimited login
+  # brute-force) and falsifying `audit_logs.ip` for every logged action. All
+  # external traffic now goes through nginx (see frontend/nginx.conf, fixed
+  # to overwrite rather than append X-Forwarded-For) and reaches the backend
+  # only over the internal Compose network at `backend:4000` — never
+  # published to the host. If you need to hit the API directly while
+  # debugging locally, use `docker compose exec backend curl localhost:4000/...`
+  # or a `docker-compose.override.yml` that re-adds the port mapping for your
+  # own machine only — don't re-add it here.
   backend:
     image: daggu1997/tfgen_backend:v0.0.1
-    ports:
-      - "${BACKEND_PORT:-4000}:4000"
+    # No `ports:` — reachable only via nginx (frontend service) or other
+    # containers on this Compose network, by service name.
     env_file:
       # SECURITY FIX (critical): every secret below used to be hardcoded
       # directly under `environment:`, which OVERRIDES anything from .env and
@@ -117,8 +168,11 @@ services:
       PORT:         4000
       HOST:         0.0.0.0
       CORS_ORIGIN:  ${CORS_ORIGIN}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
-      REDIS_URL:    redis://redis:6379
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:-terraform_generator}
+      # SECURITY FIX (C-06): includes the now-required Redis password —
+      # previously `redis://redis:6379` with no credential at all, matching
+      # the unauthenticated `redis-server` command this connects to.
+      REDIS_URL:    redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379
       SMTP_USER:    ${SMTP_USER}
       SMTP_PASS:    ${SMTP_PASS}
       SMTP_HOST:    ${SMTP_HOST:-smtp.gmail.com}

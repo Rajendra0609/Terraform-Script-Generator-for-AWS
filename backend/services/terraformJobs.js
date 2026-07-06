@@ -155,10 +155,33 @@ async function runSecurityGates(hcl, ctx) {
   return { blocked: false, checkov: checkovResult };
 }
 
+/**
+ * Fetch-and-decrypt AWS credentials for a job, right before they're needed.
+ *
+ * SECURITY FIX (critical — C-06): routes/terraform.js used to decrypt
+ * credentials at REQUEST time and put the plaintext result straight into
+ * the object passed to jobQueue.enqueue() — which BullMQ then serializes
+ * into a Redis job (queue.add()). With default removeOnComplete:100 /
+ * removeOnFail:200, that meant a rolling window of up to 300 sets of
+ * plaintext AWS credentials sitting in Redis, made worse by Redis
+ * previously having no auth at all (see docker-compose.yml). Now the route
+ * only enqueues a `useRealCredentials` boolean + `userId`; this function is
+ * the ONLY place that actually decrypts, and it does so here — inside the
+ * worker, immediately before the credentials are used by runPlan()/
+ * runApply() — so the plaintext exists only in this process's memory for
+ * the duration of the call and is never part of any serialized job payload.
+ */
+async function loadJobCredentials(data) {
+  if (!data.useRealCredentials) return null;
+  const { getDecryptedAwsCredentials } = require('../utils/awsCrypto');
+  return getDecryptedAwsCredentials(data.userId) || null;
+}
+
 async function planJob(data, logFn) {
   const networkWarnings = lintNetworkRules(data.hcl);
+  const awsCredentials = await loadJobCredentials(data);
   const [planResult, checkovResult] = await Promise.all([
-    runPlan(data.hcl, logFn, data.awsCredentials || null, data.mode),
+    runPlan(data.hcl, logFn, awsCredentials, data.mode),
     runCheckov(data.hcl),
   ]);
 
@@ -199,7 +222,13 @@ async function applyJob(data, logFn) {
   // without saved AWS credentials before ever enqueuing a job, but a future
   // caller of jobQueue.enqueue({type:'apply', ...}) that skips that check
   // must not be able to "apply" with mock/no credentials.
-  if (!data.awsCredentials) {
+  //
+  // SECURITY FIX (C-06): decrypt here, inside the worker, rather than
+  // trusting a pre-decrypted value on `data` (see loadJobCredentials() /
+  // the routes/terraform.js comment for the full writeup of why credentials
+  // must never travel through the job payload).
+  const awsCredentials = await loadJobCredentials({ ...data, useRealCredentials: true });
+  if (!awsCredentials) {
     return {
       success: false,
       message: 'AWS credentials are required to apply. Connect an AWS account under Settings → AWS Credentials first.',
@@ -222,7 +251,7 @@ async function applyJob(data, logFn) {
   // checkov + OPA results before ever calling runApply(). This mirrors
   // planJob()'s gate exactly (same shared runSecurityGates()) rather than a
   // parallel, divergent copy.
-  const preApplyPlan = await runPlan(data.hcl, logFn, data.awsCredentials, data.mode);
+  const preApplyPlan = await runPlan(data.hcl, logFn, awsCredentials, data.mode);
 
   const gate = await runSecurityGates(data.hcl, {
     projectId:  data.projectId,
@@ -244,7 +273,7 @@ async function applyJob(data, logFn) {
     };
   }
 
-  const applyResult = await runApply(data.hcl, logFn, data.awsCredentials, data.mode);
+  const applyResult = await runApply(data.hcl, logFn, awsCredentials, data.mode);
   return { ...applyResult, checkov: gate.checkov, policy_results: gate.policy_results };
 }
 
