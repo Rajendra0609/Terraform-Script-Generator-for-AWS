@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { iamAPI } from '../api/client';
+import { copyToClipboard } from '../utils/clipboard';
 
 export default function IamPolicyModal({ resources = [], onClose, c }) {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState('');
   const [mode, setMode] = useState('merged'); // 'merged' | 'breakdown'
 
   const serviceTypes = [...new Set(resources.map(r => r.service_type || r.serviceType).filter(Boolean))];
@@ -20,9 +22,9 @@ export default function IamPolicyModal({ resources = [], onClose, c }) {
 
   const copyPolicy = async () => {
     const text = mode === 'merged' ? result?.merged_policy_json : JSON.stringify(result?.breakdown, null, 2);
-    await navigator.clipboard.writeText(text || '');
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    const ok = await copyToClipboard(text || '');
+    if (ok) { setCopied(true); setTimeout(() => setCopied(false), 2000); }
+    else { setCopyError('Copy failed — select the text and copy manually.'); setTimeout(() => setCopyError(''), 3000); }
   };
 
   const s = {
@@ -68,8 +70,9 @@ export default function IamPolicyModal({ resources = [], onClose, c }) {
                 <strong style={{ color: c.fg }}>⚠️ Before using this policy:</strong><br />
                 {result.notes?.join(' ')}
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
                 <span style={{ fontSize: 11, color: c.fg3 }}>aws_iam_policy document (JSON)</span>
+                {copyError && <span style={{ fontSize: 11, color: '#F87171', flex: 1, textAlign: 'right' }}>{copyError}</span>}
                 <button style={s.btn('accent')} onClick={copyPolicy}>
                   {copied ? '✓ Copied!' : '📋 Copy JSON'}
                 </button>

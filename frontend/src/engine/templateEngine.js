@@ -492,9 +492,19 @@ export function generateReadme(resources = [], region = DEFAULT_AWS_REGION, envi
     .join('\n');
 
   // terraform-docs style: Modules section
+  // BUG FIX: this previously read `r.source`/`r.version`, but no resource
+  // object in the app ever sets those bare field names — every module
+  // resource (both the schema-driven "toggle to module" feature and the
+  // Registry-imported modules) stores it as `module_source`, sometimes as
+  // "namespace/name/provider@version". As a result this table has always
+  // rendered empty. Read the field that's actually populated, and split
+  // out an embedded version suffix if present.
   const moduleRows = resources
-    .filter(r => r.is_module && r.source)
-    .map(r => `| \`${r.resource_name || r.label}\` | \`${r.source}\` | \`${r.version || '*'}\` |`)
+    .filter(r => r.is_module && r.module_source)
+    .map(r => {
+      const [src, ver] = String(r.module_source).split('@');
+      return `| \`${r.resource_name || r.label}\` | \`${src}\` | \`${ver || '*'}\` |`;
+    })
     .join('\n');
 
   // terraform-docs style: Inputs (from resource configs, best-effort)

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import API from '../api/client';
 import { DEFAULT_AWS_REGION } from '../utils/awsRegions';
+import { copyToClipboard } from '../utils/clipboard';
 
 const ENVS = ['dev','staging','prod'];
 const ENV_COLORS = { dev:'#10B981', staging:'#F59E0B', prod:'#EF4444' };
@@ -13,6 +14,7 @@ export default function MultiEnvPanel({ c, project, variables = [], onClose }) {
   const [activeFile, setActiveFile] = useState('');
   const [loading, setLoading]       = useState(false);
   const [copied, setCopied]         = useState('');
+  const [copyError, setCopyError]   = useState('');
   const [tab, setTab]               = useState('vars'); // vars | files
 
   const addVar = () => setExtraVars(v=>[...v,{name:'',type:'string',description:'',dev:'',staging:'',prod:''}]);
@@ -48,8 +50,9 @@ export default function MultiEnvPanel({ c, project, variables = [], onClose }) {
   };
 
   const copy = async (name) => {
-    await navigator.clipboard.writeText(files[name]||'');
-    setCopied(name); setTimeout(()=>setCopied(''),2000);
+    const ok = await copyToClipboard(files[name]||'');
+    if (ok) { setCopied(name); setTimeout(()=>setCopied(''),2000); }
+    else { setCopyError('Copy failed — select the text and copy manually.'); setTimeout(()=>setCopyError(''),3000); }
   };
 
   const S = {
@@ -179,6 +182,7 @@ export default function MultiEnvPanel({ c, project, variables = [], onClose }) {
                   <button onClick={()=>copy(activeFile)} style={{padding:'4px 12px',borderRadius:6,border:`1px solid ${c.bd}`,background:'transparent',color:c.fg3,fontSize:11,cursor:'pointer'}}>
                     {copied===activeFile?'✓ Copied':'📋 Copy'}
                   </button>
+                  {copyError && <span style={{fontSize:11,color:'#F87171'}}>{copyError}</span>}
                 </div>
                 <pre style={{flex:1,overflow:'auto',margin:0,padding:'14px 18px',fontFamily:'JetBrains Mono,monospace',fontSize:12,lineHeight:1.7,color:c.fg2,background:c.bg}}>
                   {files[activeFile]||''}

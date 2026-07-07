@@ -466,7 +466,7 @@ export default function ConfigPanel({ service, config, onChange, isModule, onTog
               <>
                 <div>This module was imported from the registry as raw HCL.</div>
                 <div style={{ marginTop: 6, fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>
-                  {service.module_source}{service.version ? ` @ ${service.version}` : ''}
+                  {service.module_source}
                 </div>
                 <div style={{ marginTop: 6 }}>Edit its inputs directly in the Code view.</div>
               </>

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import API from '../api/client';
+import { copyToClipboard } from '../utils/clipboard';
 
 const PROVIDER_ICONS = { aws:'🟠', google:'🔵', azurerm:'🔷', kubernetes:'☸', helm:'⎈' };
 const NAME_RE = /^[a-z_][a-z0-9_]*$/i;
@@ -40,9 +41,13 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
 
   useEffect(() => { search(''); }, []);// eslint-disable-line
 
-  // Debounced live search as the user types, in addition to Enter/click.
+  const didMount = useRef(false);
+
+  // Debounced live search as the user types (skips the debounce delay for
+  // the very first render, which already ran an immediate search above).
   useEffect(() => {
     if (step !== 'search') return;
+    if (!didMount.current) { didMount.current = true; return; }
     clearTimeout(searchDebounce.current);
     searchDebounce.current = setTimeout(() => search(q), 350);
     return () => clearTimeout(searchDebounce.current);
@@ -84,42 +89,24 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
       const r = await API.post('/api/registry/import', { module: selected, version: selVersion, inputs, module_name: moduleName.trim() });
       setGeneratedHCL(r.data.hcl||'');
       setImported(false);
+      setCopied(false);
       setStep('preview');
     } catch(e) { setError(e.response?.data?.error || e.message || 'Failed to generate the module block. Please try again.'); }
     finally { setGenerating(false); }
   };
 
-  // Robust clipboard copy: the async Clipboard API silently throws in
-  // non-secure (non-HTTPS) contexts, sandboxed iframes without the
-  // clipboard-write permission, and some older browsers. Previously this
-  // rejection was never caught, so the click appeared to "throw an error."
-  // We now try the modern API first, fall back to the legacy execCommand
-  // approach, and only surface a friendly inline message if both fail —
-  // never an uncaught exception.
-  const copyToClipboard = async () => {
+  // See `copyToClipboard` (utils/clipboard.js) for why this needs a
+  // fallback at all: the async Clipboard API silently rejects over
+  // non-HTTPS origins, in permission-restricted iframes, and in some
+  // older browsers — previously that rejection was never caught here,
+  // so the click appeared to "throw an error."
+  const handleCopy = async () => {
     if (!generatedHCL) return;
     setError('');
-    try {
-      if (!navigator.clipboard || !window.isSecureContext) throw new Error('clipboard-api-unavailable');
-      await navigator.clipboard.writeText(generatedHCL);
-    } catch {
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = generatedHCL;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.top = '-1000px';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
-        const ok = document.execCommand('copy');
-        document.body.removeChild(ta);
-        if (!ok) throw new Error('execCommand-copy-failed');
-      } catch {
-        setError('Could not copy automatically in this browser — select the code below and copy it manually (Ctrl/Cmd+C).');
-        return;
-      }
+    const ok = await copyToClipboard(generatedHCL);
+    if (!ok) {
+      setError('Could not copy automatically in this browser — select the code below and copy it manually (Ctrl/Cmd+C).');
+      return;
     }
     setCopied(true);
     clearTimeout(copyResetTimer.current);
@@ -265,7 +252,7 @@ export default function ModuleRegistry({ c, onImport, onClose }) {
             <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
               <div style={{padding:'12px 16px',borderBottom:`1px solid ${c.bd}`,background:c.bg2,display:'flex',gap:8,flexShrink:0}}>
                 <span style={{fontSize:13,fontWeight:600,color:c.fg,flex:1}}>Generated module block — ready to import</span>
-                <button onClick={copyToClipboard} style={{...S.btn('default'),padding:'6px 14px',fontSize:12,color:copied?'#00D4A1':c.fg2}}>
+                <button onClick={handleCopy} style={{...S.btn('default'),padding:'6px 14px',fontSize:12,color:copied?'#00D4A1':c.fg2}}>
                   {copied?'✓ Copied!':'📋 Copy'}
                 </button>
                 <button onClick={handleImportClick} style={{...S.btn('accent'), opacity: imported?0.75:1}}>

@@ -647,6 +647,14 @@ export default function Builder() {
       cleanHcl = cleanHcl.replace(new RegExp(`module\\s+"${base}"\\s*{`), `module "${uniqueName}" {`);
     }
 
+    // NOTE: the backend `resources` table has an `is_module` boolean and a
+    // `module_source` varchar column — but no separate `version` column.
+    // A bare `version` field on the resource object would round-trip fine
+    // in memory but silently vanish the moment the project is saved and
+    // reloaded. Fold it into `module_source` (e.g. "hashicorp/vpc/aws@5.1.0")
+    // so it actually persists through the existing schema.
+    const fullSource = source ? (version ? `${source}@${version}` : source) : '';
+
     const newResource = {
       _id: Math.random().toString(36).slice(2),
       service_type: `module:${source || uniqueName}`,
@@ -656,8 +664,7 @@ export default function Builder() {
       config: {},
       is_module: true,
       hcl_output: cleanHcl,
-      module_source: source || '',
-      version: version || '',
+      module_source: fullSource,
       wiredFrom: {},
       icon: '📦',
       position_x: 0,

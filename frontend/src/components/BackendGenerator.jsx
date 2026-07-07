@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import API from '../api/client';
 import { DEFAULT_AWS_REGION } from '../utils/awsRegions';
+import { copyToClipboard } from '../utils/clipboard';
 
 export default function BackendGenerator({ c, project, onClose }) {
   const [form, setForm] = useState({
@@ -15,6 +16,7 @@ export default function BackendGenerator({ c, project, onClose }) {
   const [activeFile, setActiveFile] = useState('');
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState('');
+  const [copyError, setCopyError] = useState('');
   const [apiWarnings, setApiWarnings] = useState([]);
 
   const set = (k,v) => setForm(p=>({...p,[k]:v}));
@@ -44,8 +46,9 @@ export default function BackendGenerator({ c, project, onClose }) {
   };
 
   const copy = async (name) => {
-    await navigator.clipboard.writeText(files[name]||'');
-    setCopied(name); setTimeout(()=>setCopied(''),2000);
+    const ok = await copyToClipboard(files[name]||'');
+    if (ok) { setCopied(name); setTimeout(()=>setCopied(''),2000); }
+    else { setCopyError('Copy failed — select the text and copy manually.'); setTimeout(()=>setCopyError(''),3000); }
   };
 
   const REGIONS = ['ap-south-1','us-east-1','us-west-2','eu-west-1','eu-central-1','ap-southeast-1','ap-northeast-1'];
@@ -189,6 +192,7 @@ export default function BackendGenerator({ c, project, onClose }) {
                     <button onClick={()=>copy(activeFile)} style={{padding:'4px 12px',borderRadius:6,border:`1px solid ${c.bd}`,background:'transparent',color:c.fg3,fontSize:11,cursor:'pointer'}}>
                       {copied===activeFile?'✓ Copied':'📋 Copy'}
                     </button>
+                    {copyError && <span style={{fontSize:11,color:'#F87171'}}>{copyError}</span>}
                   </div>
                 )}
 
