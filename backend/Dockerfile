@@ -5,8 +5,8 @@ WORKDIR /app
 
 # Copy only manifests first so Docker can cache the npm install layer
 COPY package*.json ./
-RUN npm install --verbose
 
+RUN npm install --verbose
 # ─── Stage 2: Download Terraform & terraform-ls binaries ──────────────────────
 FROM alpine:3.21 AS tools
 
@@ -77,7 +77,6 @@ COPY --from=tools /usr/local/bin/terraform-ls   /usr/local/bin/terraform-ls
 # Alpine docker group).  If your host uses a different GID, override at runtime:
 #   docker-compose run --group-add <HOST_DOCKER_GID> backend
 RUN addgroup -S appgroup \
- && addgroup -S docker \
  && adduser  -S appuser -G appgroup \
  && adduser  appuser docker
 
