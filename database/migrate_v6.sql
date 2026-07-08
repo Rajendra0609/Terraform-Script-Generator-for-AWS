@@ -1,45 +1,17 @@
 -- ─────────────────────────────────────────────────────────────────────────────
--- One-time admin fix: make tfgen the owner of public.project_versions
--- Run as: postgres (or superuser)
+-- migrate_v6.sql  — INTENTIONALLY EMPTY / DEPRECATED
 --
--- Usage examples:
---   sudo -u postgres psql -d terraform_generator -f database/fix_project_versions_owner.sql
---   psql -U postgres -h localhost -d terraform_generator -f database/fix_project_versions_owner.sql
+-- FIX: this file was a byte-for-byte duplicate of fix_project_versions_owner.sql
+-- and caused the entire migration run to abort with ON_ERROR_STOP=on whenever
+-- the 'tfgen' PostgreSQL role did not exist in the target environment.
+--
+-- The ownership transfer is a one-time, superuser-only admin operation.
+-- Run it manually ONLY after confirming the 'tfgen' role exists:
+--
+--   sudo -u postgres psql -d terraform_generator \
+--        -f database/fix_project_versions_owner.sql
+--
+-- This file is kept as an empty placeholder so migration runners that iterate
+-- over migrate_v*.sql files by glob do not error on a missing file.
 -- ─────────────────────────────────────────────────────────────────────────────
-
-\set ON_ERROR_STOP on
-
-DO $$
-DECLARE
-  tbl_owner text;
-BEGIN
-  -- Ensure tfgen role exists
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tfgen') THEN
-    RAISE EXCEPTION 'Role "tfgen" does not exist. Create it first, then re-run.';
-  END IF;
-
-  -- Identify current owner
-  SELECT r.rolname INTO tbl_owner
-  FROM pg_class c
-  JOIN pg_roles r ON r.oid = c.relowner
-  JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE n.nspname = 'public'
-    AND c.relname = 'project_versions'
-    AND c.relkind = 'r';
-
-  IF tbl_owner IS NULL THEN
-    RAISE EXCEPTION 'Table public.project_versions does not exist.';
-  END IF;
-
-  RAISE NOTICE 'Current owner of public.project_versions = %', tbl_owner;
-END $$;
-
--- Transfer ownership (requires postgres/superuser or current table owner)
-ALTER TABLE public.project_versions OWNER TO tfgen;
-
--- Confirm
-SELECT n.nspname AS schema, c.relname AS table, r.rolname AS owner
-FROM pg_class c
-JOIN pg_roles r ON r.oid = c.relowner
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname='public' AND c.relname='project_versions' AND c.relkind='r';
+SELECT 1; -- no-op

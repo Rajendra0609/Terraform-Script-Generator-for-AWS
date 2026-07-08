@@ -10,6 +10,7 @@ const {
   JWT_REFRESH_SECRET,
 } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
+const { sendPasswordReset } = require('../services/mailer');
 
 const PASSWORD_MIN_LENGTH = 8;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -118,6 +119,89 @@ router.get('/me', authMiddleware, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: 'Failed to fetch user' }); }
+});
+
+// ─── Forgot password ──────────────────────────────────────────────────────────
+// Always returns 200 regardless of whether the email exists — prevents user
+// enumeration attacks (attacker cannot tell if an address is registered).
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email || !EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: 'Valid email required' });
+  }
+  try {
+    const rawToken  = crypto.randomBytes(32).toString('hex');
+    // FIX: store only the SHA-256 hash — mirrors the refresh-token pattern.
+    // A compromised DB cannot be used to reset accounts via stolen reset tokens.
+    const tokenHash = hashToken(rawToken);
+    const expires   = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    // Only store the token if the email actually exists; silently no-op otherwise.
+    await db.query(
+      'UPDATE users SET reset_token=$1, reset_token_expires_at=$2 WHERE email=$3',
+      [tokenHash, expires, email.toLowerCase()]
+    );
+    // Send the reset email only when the address is actually registered.
+    // We check the UPDATE rowCount so the API always returns 200 regardless
+    // (prevents user-enumeration: caller cannot tell if an address exists).
+    const updateResult = await db.query(
+      'SELECT id FROM users WHERE email = $1',
+      [email.toLowerCase()]
+    );
+    if (updateResult.rows.length > 0) {
+      try {
+        await sendPasswordReset(email.toLowerCase(), rawToken);
+        console.info(`[auth] password reset email sent to ${email}`);
+      } catch (mailErr) {
+        // Log but never bubble mail errors to the client — they still get 200.
+        console.error(`[auth] failed to send reset email to ${email}:`, mailErr.message);
+      }
+    } else {
+      console.info(`[auth] password reset requested for unknown address ${email} — silently ignored`);
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[auth] forgot-password error:', e.message);
+    res.status(500).json({ error: 'Failed to process request' });
+  }
+});
+
+// ─── Reset password ───────────────────────────────────────────────────────────
+router.post('/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) {
+    return res.status(400).json({ error: 'Token and new password required' });
+  }
+  if (password.length < PASSWORD_MIN_LENGTH) {
+    return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters` });
+  }
+  try {
+    // FIX: compare the hash of the supplied token against the stored hash —
+    // never store or compare raw tokens (mirrors the refresh-token pattern).
+    const tokenHash = hashToken(token);
+    const result = await db.query(
+      `SELECT id FROM users
+       WHERE reset_token = $1
+         AND reset_token_expires_at > NOW()`,
+      [tokenHash]
+    );
+    if (!result.rows.length) {
+      return res.status(400).json({ error: 'Reset token is invalid or has expired' });
+    }
+    const salt         = await bcrypt.genSalt(12);
+    const password_hash = await bcrypt.hash(password, salt);
+    await db.query(
+      `UPDATE users
+       SET password_hash = $1, reset_token = NULL, reset_token_expires_at = NULL
+       WHERE id = $2`,
+      [password_hash, result.rows[0].id]
+    );
+    // Revoke all existing refresh tokens so old sessions cannot persist
+    await db.query('UPDATE refresh_tokens SET revoked=true WHERE user_id=$1', [result.rows[0].id]).catch(() => {});
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[auth] reset-password error:', e.message);
+    res.status(500).json({ error: 'Password reset failed' });
+  }
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

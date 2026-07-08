@@ -52,7 +52,7 @@ BEGIN
   ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS checkov_passed      INT DEFAULT 0;
   ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS checkov_failed      INT DEFAULT 0;
   ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS resource_graph_json JSONB;
-  ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS saved_by            UUID;
+  ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS saved_by UUID REFERENCES users(id) ON DELETE SET NULL; -- BUG-008 fix: add FK constraint to prevent dangling references on user deletion
   ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS change_summary      TEXT DEFAULT '';
   ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS resource_count      INT DEFAULT 0;
 EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'project_versions: %', SQLERRM; END
@@ -147,5 +147,23 @@ CREATE TABLE IF NOT EXISTS execution_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_exec_jobs_project ON execution_jobs(project_id);
 CREATE INDEX IF NOT EXISTS idx_exec_jobs_status  ON execution_jobs(status);
+
+-- BUG-016 fix: schema.sql adds CONSTRAINT uq_project_version UNIQUE (project_id, version_number)
+-- on project_versions as a DB-level duplicate-version safety net (BUG-007 fix). migrate.sql
+-- previously omitted this, so databases migrated from an older schema had no constraint and
+-- were vulnerable to race-condition duplicate version_numbers under high concurrency.
+DO $$ BEGIN
+  ALTER TABLE project_versions
+    ADD CONSTRAINT uq_project_version UNIQUE (project_id, version_number);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- FIX: password-reset columns (Phase-5).  Without these, the UPDATE in
+-- POST /api/auth/forgot-password executes as a silent zero-row no-op and
+-- password reset permanently fails.  The stored value is a SHA-256 hash of
+-- the raw token — see auth.js forgot-password handler.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token              TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at   TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_users_reset_token
+  ON users(reset_token) WHERE reset_token IS NOT NULL;
 
 \echo 'Migration complete — all columns and tables are up to date.'

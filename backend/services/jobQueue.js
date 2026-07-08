@@ -44,6 +44,22 @@ function initQueue(processJob) {
       jobEvents.emit(`done:${job.id}`, result);
     });
 
+    // BUG-017 fix: BullMQ connects lazily — the Queue/Worker constructors succeed
+    // even when Redis is unreachable. Connection errors surface later as async
+    // 'error' events. Without listeners, Node.js treats unhandled EventEmitter
+    // errors as thrown exceptions and crashes the process.
+    queue.on('error', (err) => {
+      console.error('[jobQueue] Queue connection error:', err.message);
+    });
+    worker.on('error', (err) => {
+      console.error('[jobQueue] Worker connection error:', err.message);
+    });
+    if (queueEvents) {
+      queueEvents.on('error', (err) => {
+        console.error('[jobQueue] QueueEvents connection error:', err.message);
+      });
+    }
+
     redisAvailable = true;
     console.info('[jobQueue] BullMQ connected to Redis');
   } catch (err) {
@@ -84,8 +100,9 @@ async function enqueue(data, processJobFn) {
 async function getJobStatus(jobId) {
   if (!redisAvailable || !queue) return null;
   try {
-    const { Job } = require('bullmq');
-    const job = await Job.fromId(queue, jobId);
+    // BUG-011 fix: Job.fromId() was removed in BullMQ v4+.
+    // Use queue.getJob(jobId) which works across all supported versions.
+    const job = await queue.getJob(jobId);
     if (!job) return null;
     const state = await job.getState();
     return { id: jobId, state, progress: job.progress, returnvalue: job.returnvalue };

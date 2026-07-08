@@ -51,9 +51,11 @@ const createGraphSlice = (set, get) => ({
   setNodes(nodes) { set({ nodes }); },
   setEdges(edges) { set({ edges }); },
 
-  /** Replace entire graph (e.g. on project load) */
+  /** Replace entire graph (e.g. on project load).
+   *  Also marks resourcesLoaded=true so advanced-mode panels know the API
+   *  data has arrived (BUG-018 flash-suppression). */
   loadGraph({ nodes = [], edges = [], layout = {} }) {
-    set({ nodes, edges, layout });
+    set({ nodes, edges, layout, resourcesLoaded: true });
   },
 });
 
@@ -89,18 +91,25 @@ const createProjectSlice = (set) => ({
 // --- UI slice ------------------------------------------------------------------
 const createUISlice = (set) => ({
   selectedNodeId:  null,
+  // BUG-018: advancedMode is persisted in localStorage so it survives page
+  // reloads.  On mount, nodes/edges are still empty (they come from the API),
+  // which means the advanced-mode panels would render briefly against an empty
+  // graph.  We suppress that flash with `resourcesLoaded` — components that
+  // render advanced-mode content should gate on both flags.
   advancedMode:    localStorage.getItem('tfgen.advancedMode') === 'true',
+  resourcesLoaded: false,   // set to true once the project graph arrives from the API
   showValidPanel:  false,
   validType:       null,   // 'fmt' | 'validate' | 'plan'
   saving:          false,
   activeTab:       'config', // 'config' | 'variables' | 'outputs' | 'lifecycle'
 
-  selectNode:         (id)    => set({ selectedNodeId: id }),
-  setAdvancedMode:    (v)     => { set({ advancedMode: v }); localStorage.setItem('tfgen.advancedMode', v ? 'true' : 'false'); },
-  setShowValidPanel:  (v)     => set({ showValidPanel: v }),
-  setValidType:       (t)     => set({ validType: t }),
-  setSaving:          (v)     => set({ saving: v }),
-  setActiveTab:       (tab)   => set({ activeTab: tab }),
+  selectNode:          (id)    => set({ selectedNodeId: id }),
+  setAdvancedMode:     (v)     => { set({ advancedMode: v }); localStorage.setItem('tfgen.advancedMode', v ? 'true' : 'false'); },
+  setResourcesLoaded:  (v)     => set({ resourcesLoaded: v }),
+  setShowValidPanel:   (v)     => set({ showValidPanel: v }),
+  setValidType:        (t)     => set({ validType: t }),
+  setSaving:           (v)     => set({ saving: v }),
+  setActiveTab:        (tab)   => set({ activeTab: tab }),
 });
 
 // --- Execution slice -----------------------------------------------------------

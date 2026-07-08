@@ -1,9 +1,10 @@
 'use strict';
 const router = require('express').Router();
-const { runFmt, runValidate, runPlan } = require('../terraform/runner');
+const rateLimit = require('express-rate-limit');
+const { runFmt, runValidate, runPlan, runInit } = require('../terraform/runner');
 const { runCheckov }   = require('../services/checkov');
 const { runInfracost } = require('../services/infracost');
-const { stripHtml, detectSecrets, lintNetworkRules } = require('../utils/sanitize');
+const { stripHtml, detectSecrets, lintNetworkRules, hasMarkup } = require('../utils/sanitize');
 const { authMiddleware, optionalAuth } = require('../middleware/auth');
 const { audit, attachAuditResponseHook } = require('../middleware/audit');
 const db = require('../db/connection');
@@ -11,7 +12,26 @@ const db = require('../db/connection');
 // Attach audit hook to all terraform routes
 router.use(attachAuditResponseHook);
 
-// ─── Input guard ──────────────────────────────────────────────────────────────
+// FIX: dedicated stricter rate limiter for compute-heavy unauthenticated endpoints.
+// /fmt and /validate each spawn a Docker container or shell process; without a
+// tight per-IP limit, any anonymous caller can exhaust CPU/Docker resources.
+// 20 req/15 min mirrors the authLimiter ceiling used for login/register.
+const terraformComputeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip || req.connection?.remoteAddress || 'unknown',
+  handler: (req, res) => {
+    res.set('Retry-After', String(15 * 60));
+    res.status(429).json({
+      error: 'Too many formatting/validation requests — slow down',
+      retryAfter: 15 * 60,
+    });
+  },
+});
+
+// ── Input guard ────────────────────────────────────────────────
 function guardHcl(req, res) {
   const { hcl } = req.body;
   if (!hcl || typeof hcl !== 'string') {
@@ -32,39 +52,104 @@ function guardHcl(req, res) {
     return null;
   }
 
-  if (/[<>]|&lt;|color:|style=/.test(hcl)) {
-    console.warn(`[sanitize] Suspicious content; correlationId=${req.headers['x-correlation-id'] || 'none'}`);
+  if (hasMarkup(hcl)) {
+    console.warn(`[sanitize] Suspicious markup detected; correlationId=${req.headers['x-correlation-id'] || 'none'}`);
   }
   return clean;
 }
 
-// ─── POST /api/terraform/fmt ──────────────────────────────────────────────────
-router.post('/fmt', optionalAuth, audit('terraform.fmt'), async (req, res) => {
+/**
+ * Read the optional `runner` field from the request body.
+ * Accepts 'local' | 'docker' | 'auto'; anything else collapses to 'auto'.
+ */
+function readRunnerMode(req) {
+  const mode = req.body?.runner;
+  if (mode === 'local' || mode === 'docker') return mode;
+  return 'auto';
+}
+
+function localSuggestions(hcl) {
+  const t = String(hcl || '');
+  const line = t.split('\n').slice(-1)[0] || '';
+  const trimmed = line.trim();
+
+  const base = [];
+
+  if (/^provider\s+"?aws"?\b/.test(trimmed) || /\brequired_providers\b/.test(trimmed)) {
+    base.push({
+      label: 'region = "ap-south-1"',
+      insertText: '  region = "ap-south-1"',
+      kind: 'property',
+    });
+  }
+
+  if (/^resource\s+"/.test(trimmed) || /\bresource\s+\"aws_/.test(trimmed)) {
+    base.push({
+      label: 'Example: resource "aws_s3_bucket" "example" {}',
+      insertText: 'resource "aws_s3_bucket" "example" {\n  bucket = "example-bucket"\n}',
+      kind: 'snippet',
+    });
+    base.push({
+      label: 'Example: tags = { ... }',
+      insertText: '  tags = {\n    project = var.project_name\n  }',
+      kind: 'snippet',
+    });
+  }
+
+  if (/\bvariable\s+"/.test(trimmed)) {
+    base.push({ label: 'type = string', insertText: '  type = string', kind: 'property' });
+    base.push({ label: 'default = ""', insertText: '  default = ""', kind: 'property' });
+  }
+
+  if (/\boutput\s+"/.test(trimmed)) {
+    base.push({ label: 'value = <expr>', insertText: '  value = <expression>', kind: 'property' });
+  }
+
+  base.push({
+    label: 'Format document (Ctrl+Shift+F)',
+    insertText: null,
+    kind: 'action',
+    action: 'fmt',
+  });
+
+  return base.filter(x => x.insertText !== undefined).slice(0, 12);
+}
+
+// ── POST /api/terraform/fmt ─────────────────────────────────────
+// FIX: was optionalAuth (anonymous callers could exhaust Docker resources).
+// Now requires authentication AND a dedicated tight rate limiter.
+router.post('/fmt', authMiddleware, terraformComputeLimiter, audit('terraform.fmt'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
+  const mode = readRunnerMode(req);
   try {
-    const result = await runFmt(hcl);
+    const result = await runFmt(hcl, null, mode);
     res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ─── POST /api/terraform/validate ────────────────────────────────────────────
-router.post('/validate', optionalAuth, audit('terraform.validate'), async (req, res) => {
+// ── POST /api/terraform/validate ───────────────────────────────
+// FIX: was optionalAuth — same reasoning as /fmt above.
+router.post('/validate', authMiddleware, terraformComputeLimiter, audit('terraform.validate'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
+  const mode = readRunnerMode(req);
 
   // Network security linting (fast, synchronous — always runs)
   const networkWarnings = lintNetworkRules(hcl);
 
   try {
     const [validateResult, checkovResult] = await Promise.all([
-      runValidate(hcl),
+      runValidate(hcl, null, mode),
       runCheckov(hcl),
     ]);
 
-    // Persist validation log if project_id supplied
+    // Persist validation log if project_id is a valid UUID.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const projectId = req.body.project_id;
-    if (projectId) {
+    if (projectId && UUID_RE.test(projectId)) {
       db.query(
         'INSERT INTO validation_logs (project_id, is_valid, diagnostics) VALUES ($1,$2,$3)',
         [projectId, validateResult.valid ?? false, JSON.stringify(validateResult.diagnostics || [])]
@@ -76,20 +161,43 @@ router.post('/validate', optionalAuth, audit('terraform.validate'), async (req, 
       networkWarnings,
       checkov: checkovResult,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ─── POST /api/terraform/plan ─────────────────────────────────────────────────
-// Synchronous for small projects; use /api/jobs/plan for async streaming.
+// ── POST /api/terraform/suggest ────────────────────────────────
+router.post('/suggest', optionalAuth, audit('terraform.suggest'), async (req, res) => {
+  const hcl = guardHcl(req, res);
+  if (hcl === null) return;
+
+  try {
+    const cursor = req.body?.cursor;
+    const suggestions = localSuggestions(hcl);
+
+    res.json({
+      suggestions,
+      meta: {
+        receivedCursor: !!cursor,
+        count: suggestions.length,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/terraform/plan ────────────────────────────────────
 router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
+  const mode = readRunnerMode(req);
 
   const networkWarnings = lintNetworkRules(hcl);
 
   try {
     const [planResult, checkovResult] = await Promise.all([
-      runPlan(hcl),
+      runPlan(hcl, null, null, mode),
       runCheckov(hcl),
     ]);
 
@@ -105,20 +213,24 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
     }
 
     res.json({ ...planResult, networkWarnings, checkov: checkovResult });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ─── POST /api/terraform/cost ─────────────────────────────────────────────────
+// ── POST /api/terraform/cost ─────────────────────────────────────
 router.post('/cost', optionalAuth, async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
   try {
     const result = await runInfracost(hcl);
     res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ─── POST /api/terraform/scan ─────────────────────────────────────────────────
+// ── POST /api/terraform/scan ─────────────────────────────────────
 router.post('/scan', optionalAuth, async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
@@ -128,7 +240,23 @@ router.post('/scan', optionalAuth, async (req, res) => {
       Promise.resolve(lintNetworkRules(hcl)),
     ]);
     res.json({ checkov, networkWarnings });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ── POST /api/terraform/init ──────────────────────────────────────────────────
+router.post('/init', optionalAuth, audit('terraform.init'), async (req, res) => {
+  const hcl = guardHcl(req, res);
+  if (hcl === null) return;
+  const mode = readRunnerMode(req);
+  try {
+    const result = await runInit(hcl, null, mode);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 module.exports = router;

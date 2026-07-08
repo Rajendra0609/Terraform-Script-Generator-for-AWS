@@ -58,11 +58,9 @@ const ROADMAP_STEP = {
   'Containers':     { step: 'Step 10',  label: 'ECS + EKS + ECR',         color: '#22D3EE' },
   'CI/CD':          { step: 'Step 9',   label: 'CodePipeline + Build',    color: '#FCD34D' },
   'Admin & Ops':    { step: 'Step 9-12',label: 'SysOps Path',             color: '#A78BFA' },
-  'Analytics':      { step: 'Step 11',  label: 'Kinesis, Glue, Athena',   color: '#F97316' },
-  'App Integration':{ step: 'Step 12',  label: 'Step Functions, Cognito', color: '#14B8A6' },
-  'Machine Learning':{ step: 'Step 13', label: 'SageMaker + Bedrock',     color: '#EC4899' },
   'Analytics':       { step: 'Step 11', label: 'Kinesis, Glue, Athena',   color: '#F97316' },
   'App Integration': { step: 'Step 12', label: 'Step Functions, Cognito', color: '#14B8A6' },
+  'Machine Learning':{ step: 'Step 13', label: 'SageMaker + Bedrock',     color: '#EC4899' },
 };
 
 // --- Field grouping by service type ------------------------------------------

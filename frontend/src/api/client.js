@@ -70,6 +70,11 @@ API.interceptors.response.use(
         API.defaults.headers.common['Authorization'] = `Bearer ${newAccessToken}`;
         original.headers['Authorization'] = `Bearer ${newAccessToken}`;
         processRefreshQueue(null, newAccessToken);
+        // BUG-014 fix: carry _retryCount forward to the refreshed config so the
+        // retry interceptor treats the fresh request as a continuation of the same
+        // attempt chain. Without this, a 503 after a successful 401-refresh could
+        // loop up to MAX_RETRIES extra times because _retryCount reset to 0.
+        original._retryCount = original._retryCount || 0;
         return API(original);
       } catch (refreshErr) {
         processRefreshQueue(refreshErr, null);
@@ -114,6 +119,12 @@ API.interceptors.response.use(
       err.code === 'ECONNABORTED' ||
       (err.response && [429, 502, 503].includes(err.response.status));
 
+    // BUG-018 fix: the health check previously skipped retries by pre-seeding
+    // _retryCount: MAX_RETRIES — an off-by-one hack that silently broke whenever
+    // MAX_RETRIES changed. Use an explicit _skipRetry flag instead so the intent
+    // is unambiguous and immune to constant changes.
+    if (config._skipRetry) return Promise.reject(err);
+
     if (isRetryable && config._retryCount < MAX_RETRIES) {
       config._retryCount++;
       const delay = RETRY_DELAY * Math.pow(2, config._retryCount - 1);
@@ -147,7 +158,7 @@ if (window[_HEALTH_INTERVAL_KEY]) {
 }
 window[_HEALTH_INTERVAL_KEY] = setInterval(async () => {
   try {
-    await API.get('/api/health', { timeout: 5000, _retryCount: MAX_RETRIES }); // skip retry for health
+    await API.get('/api/health', { timeout: 5000, _skipRetry: true }); // skip retry for health — BUG-018 fix: explicit flag, not fragile _retryCount seed
     _healthOk = true;
   } catch {
     _healthOk = false;
@@ -190,12 +201,15 @@ export const templatesAPI = {
 };
 
 export const terraformAPI = {
-  fmt:      (hcl) => API.post('/api/terraform/fmt', { hcl }),
-  validate: (hcl) => API.post('/api/terraform/validate', { hcl }),
-  plan:     (hcl) => API.post('/api/terraform/plan', { hcl }),
-  cost:     (hcl) => API.post('/api/terraform/cost', { hcl }),
-  scan:     (hcl) => API.post('/api/terraform/scan', { hcl }),
+  fmt:      (hcl, runner = 'auto') => API.post('/api/terraform/fmt',      { hcl, runner }),
+  validate: (hcl, runner = 'auto') => API.post('/api/terraform/validate', { hcl, runner }),
+  suggest:  (payload)              => API.post('/api/terraform/suggest',   payload),
+  plan:     (hcl, runner = 'auto') => API.post('/api/terraform/plan',     { hcl, runner }),
+  init:     (hcl, runner = 'auto') => API.post('/api/terraform/init',     { hcl, runner }),
+  cost:     (hcl)                  => API.post('/api/terraform/cost',     { hcl }),
+  scan:     (hcl)                  => API.post('/api/terraform/scan',     { hcl }),
 };
+
 
 /** WebSocket job stream — returns a WebSocket instance. */
 export const jobsAPI = {
@@ -203,6 +217,14 @@ export const jobsAPI = {
     const wsBase = (process.env.REACT_APP_API_URL || 'http://localhost:4000')
       .replace(/^http/, 'ws');
     return new WebSocket(`${wsBase}/ws/jobs?id=${encodeURIComponent(jobId)}`);
+  },
+};
+
+export const terraformLspAPI = {
+  connect() {
+    const wsBase = (process.env.REACT_APP_API_URL_LS || 'http://localhost:4000')
+      .replace(/^http/, 'ws');
+    return new WebSocket(`${wsBase}/ws/terraform-lsp`);
   },
 };
 
@@ -215,8 +237,12 @@ export const exportAPI = {
 export const authAPI = {
   login:    (body)  => API.post('/api/auth/login', body),
   register: (body)  => API.post('/api/auth/register', body),
-  refresh:  (token) => API.post('/api/auth/refresh', { refreshToken: token }),
-  logout:   (token) => API.post('/api/auth/logout', { refreshToken: token }),
+  // BUG-002 fix: do not accept or forward a token in the request body.
+  // After the BUG-008 fix, the backend reads the refresh token exclusively
+  // from the HttpOnly cookie, which the browser sends automatically via
+  // withCredentials: true. Passing a body token was misleading and broken.
+  refresh:  () => API.post('/api/auth/refresh'),
+  logout:   () => API.post('/api/auth/logout'),
   me:       ()      => API.get('/api/auth/me'),
 };
 

@@ -14,8 +14,11 @@ export default function BackendGenerator({ c, project, onClose }) {
   const [activeFile, setActiveFile] = useState('');
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState('');
+  const [apiWarnings, setApiWarnings] = useState([]);
 
   const set = (k,v) => setForm(p=>({...p,[k]:v}));
+
+  const isAccountIdPlaceholder = !form.aws_account_id || form.aws_account_id === 'ACCOUNT_ID';
 
   const generate = async () => {
     setLoading(true);
@@ -23,6 +26,7 @@ export default function BackendGenerator({ c, project, onClose }) {
       const r = await API.post('/api/envconfig/backend', form);
       setFiles(r.data.files||{});
       setActiveFile('bootstrap.tf');
+      setApiWarnings(r.data.warnings||[]);
     } catch(e) { alert(e.response?.data?.error||e.message); }
     finally { setLoading(false); }
   };
@@ -99,8 +103,14 @@ export default function BackendGenerator({ c, project, onClose }) {
 
             <div>
               <label style={S.label}>AWS Account ID</label>
-              <input value={form.aws_account_id} onChange={e=>set('aws_account_id',e.target.value)} style={S.inp()} placeholder="123456789012"
-                onFocus={e=>e.target.style.borderColor=c.accent} onBlur={e=>e.target.style.borderColor=c.bd} />
+              <input value={form.aws_account_id} onChange={e=>set('aws_account_id',e.target.value)} style={{...S.inp(),borderColor:isAccountIdPlaceholder?'#f59e0b':undefined}} placeholder="123456789012"
+                onFocus={e=>e.target.style.borderColor=c.accent} onBlur={e=>e.target.style.borderColor=isAccountIdPlaceholder?'#f59e0b':c.bd} />
+              {isAccountIdPlaceholder && (
+                <div style={{marginTop:6,padding:'6px 10px',background:'#451a03',border:'1px solid #f59e0b',borderRadius:6,fontSize:11,color:'#fbbf24',display:'flex',gap:6,alignItems:'flex-start'}}>
+                  <span style={{flexShrink:0}}>⚠️</span>
+                  <span><strong>Replace this placeholder</strong> before using the generated <code>iam-policy.json</code>. Leaving it as <code>ACCOUNT_ID</code> will produce a silently malformed IAM policy that grants no DynamoDB permissions.</span>
+                </div>
+              )}
             </div>
 
             <div>
@@ -148,6 +158,16 @@ export default function BackendGenerator({ c, project, onClose }) {
               </div>
             ):(
               <>
+                {/* Placeholder warnings from API */}
+                {apiWarnings.length > 0 && (
+                  <div style={{padding:"8px 14px",background:"#451a03",borderBottom:"1px solid #f59e0b"}}>
+                    {apiWarnings.map((w,i) => (
+                      <div key={i} style={{fontSize:11,color:"#fbbf24",display:"flex",gap:6,alignItems:"flex-start"}}>
+                        <span style={{flexShrink:0}}>⚠️</span><span>{w}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {/* File tabs */}
                 <div style={{display:'flex',gap:0,borderBottom:`1px solid ${c.bd}`,background:c.bg2,flexShrink:0,overflowX:'auto'}}>
                   {Object.keys(files).map(name=>(

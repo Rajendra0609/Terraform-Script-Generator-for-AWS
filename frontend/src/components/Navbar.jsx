@@ -1,13 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { useTheme } from '../contexts/ThemeContext';
 import { awsAPI } from '../api/client';
 import AwsCredentialsModal from './AwsCredentialsModal';
 
 export default function Navbar() {
   const { user, logout } = useAuth();
-  const { c } = useTheme();
   const nav = useNavigate();
   const loc = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -134,6 +132,9 @@ export default function Navbar() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
           <Link to="/dashboard" style={s.navLink(isActive('/dashboard'))}>
             <span className="navbar-emoji">🏠</span>{' '}Dashboard
+          </Link>
+          <Link to="/studio" style={s.navLink(isActive('/studio'))}>
+            <span className="navbar-emoji">🧪</span>{' '}Studio
           </Link>
           <Link to={historyHref} style={s.navLink(isActive('/history'))}>
             <span className="navbar-emoji">🕘</span>{' '}History

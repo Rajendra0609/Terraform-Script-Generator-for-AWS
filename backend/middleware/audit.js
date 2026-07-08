@@ -1,14 +1,25 @@
 'use strict';
 /**
  * Audit logging middleware.
- * Wraps mutating routes (POST/PUT/DELETE) and writes a structured record to
- * the audit_logs table after the response is sent.
+ * Wraps mutating routes (POST/PUT/PATCH/DELETE) and writes a structured record
+ * to the audit_logs table after the response is sent.
  *
  * Usage:
  *   router.post('/', authMiddleware, audit('project.create'), handler)
  *   router.delete('/:id', authMiddleware, audit('project.delete'), handler)
+ *
+ * IMPORTANT: audit() should only be applied to mutating routes (POST/PUT/PATCH/
+ * DELETE). attachAuditResponseHook() must be added once per router via
+ * router.use(attachAuditResponseHook) BEFORE the route definitions.  If
+ * audit() is accidentally applied to a GET route the hook will skip it
+ * because GET is not in the AUDITED_METHODS set below.
  */
 const db = require('../db/connection');
+
+// BUG-012 fix: only audit genuinely mutating HTTP methods.  This prevents
+// spurious audit records when audit() is accidentally applied to a GET route,
+// and makes the intent explicit in one place.
+const AUDITED_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 function audit(action) {
   return (req, _res, next) => {
@@ -25,20 +36,29 @@ function audit(action) {
 function attachAuditResponseHook(req, res, next) {
   const originalJson = res.json.bind(res);
   res.json = function (body) {
-    if (req._auditAction && req.user) {
+    // BUG-012 fix: skip read-only (GET/HEAD/OPTIONS) requests even if
+    // _auditAction was accidentally set upstream.
+    if (req._auditAction && req.user && AUDITED_METHODS.has(req.method)) {
       const userId     = req.user?.id || null;
       const action     = req._auditAction;
       const method     = req.method;
       const path       = req.originalUrl;
       const statusCode = res.statusCode;
       const ip         = req.ip || req.connection?.remoteAddress || 'unknown';
+
+      // BUG-012 fix: promote success/failure to a top-level field so the audit
+      // viewer can filter successful mutations from failed attempts without
+      // parsing the nested meta.status value.
+      const success = statusCode < 400;
+
       // Capture safe metadata only — never log full HCL or secrets
       const meta = {
-        params: req.params,
-        query:  req.query,
+        params:  req.params,
+        query:   req.query,
         // Only include non-sensitive body keys
-        body:   sanitizeBodyForAudit(req.body),
-        status: statusCode,
+        body:    sanitizeBodyForAudit(req.body),
+        success,                    // top-level for easy filtering
+        status:  statusCode,        // kept for backwards compatibility
       };
       // Fire-and-forget — never block the response
       db.query(

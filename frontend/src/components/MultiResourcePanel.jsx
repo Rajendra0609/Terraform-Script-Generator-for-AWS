@@ -56,8 +56,6 @@ function FocusInput({ value, onChange, placeholder, style, c }) {
 }
 
 // --- SUBNET LIST -------------------------------------------------------------
-const DEFAULT_SUBNET = () => ({ id: uid(), cidr: '', az: '', type: 'public', name: '', map_public_ip: true, tags: '' });
-
 function SubnetList({ items, onChange, region, c, allResources, vpcId }) {
   const [azs, setAzs] = useState([]);
   const [azSrc, setAzSrc] = useState('');
@@ -70,10 +68,33 @@ function SubnetList({ items, onChange, region, c, allResources, vpcId }) {
     return () => { mounted = false; };
   }, [region]);
 
-  const add = () => onChange([...items, DEFAULT_SUBNET()]);
-  const remove = (idx) => onChange(items.filter((_, i) => i !== idx));
-  const update = (idx, key, val) => onChange(items.map((s, i) => i === idx ? { ...s, [key]: val } : s));
-  const duplicate = (idx) => onChange([...items.slice(0, idx + 1), { ...items[idx], id: uid(), name: items[idx].name + '-copy' }, ...items.slice(idx + 1)]);
+  // Smart subnet factory — auto-fills every field from available context so
+  // clicking "+ Public Subnet" or "+ Private Subnet" produces a ready-to-use
+  // entry instead of a blank form.
+  //
+  // Auto-fill logic:
+  //   az        → cycles through loaded AZs (index = total items so far)
+  //   cidr      → 10.0.{total}.0/24  (unique per position in the list)
+  //   name      → "{type}-subnet-{n+1}" where n = existing subnets of that type
+  //   map_public_ip → true for public, false for private
+  const makeSubnet = (type = 'public') => {
+    const total     = items.length;
+    const typeCount = items.filter(s => s.type === type).length;
+    return {
+      id:           uid(),
+      type,
+      name:         `${type}-subnet-${typeCount + 1}`,
+      cidr:         `10.0.${total}.0/24`,
+      az:           azs.length ? azs[total % azs.length] : '',
+      map_public_ip: type === 'public',
+      tags:         '',
+    };
+  };
+
+  const add       = ()          => onChange([...items, makeSubnet('public')]);
+  const remove    = (idx)       => onChange(items.filter((_, i) => i !== idx));
+  const update    = (idx, k, v) => onChange(items.map((s, i) => i === idx ? { ...s, [k]: v } : s));
+  const duplicate = (idx)       => onChange([...items.slice(0, idx + 1), { ...items[idx], id: uid(), name: items[idx].name + '-copy' }, ...items.slice(idx + 1)]);
 
   const publicCount = items.filter(s => s.type === 'public').length;
   const privateCount = items.filter(s => s.type === 'private').length;
@@ -82,32 +103,61 @@ function SubnetList({ items, onChange, region, c, allResources, vpcId }) {
     <div>
       <SectionHeader title="Subnets" count={items.length} onAdd={add} addLabel="Add Subnet" c={c} />
 
-      {/* Parent VPC display (when editing subnets under a VPC) */}
-      {vpcId && (
-        <div style={{ marginBottom: 8, fontSize: 12, color: c.fg3 }}>
-          <strong style={{ color: c.fg }}>{'VPC:'}</strong>&nbsp;
-          {(() => {
-            try {
-              if (allResources && typeof vpcId === 'string') {
-                const m = vpcId.match(/aws_vpc\.([A-Za-z0-9_\-]+)\.id/);
-                if (m && m[1]) {
-                  const found = allResources.find(r => r.service_type === 'vpc' && (r.config?.name === m[1] || r.label === m[1]));
-                  if (found) return found.config?.name || found.label || vpcId;
-                }
-              }
-            } catch (_) {}
-            return vpcId;
-          })()}
-        </div>
-      )}
+      {/* Parent VPC display + auto-fill preview */}
+      {vpcId && (() => {
+        // Resolve a human-readable VPC name for display
+        let vpcName = vpcId;
+        try {
+          if (allResources && typeof vpcId === 'string') {
+            const m = vpcId.match(/aws_vpc\.([A-Za-z0-9_-]+)\.id/);
+            if (m && m[1]) {
+              const found = allResources.find(r => r.service_type === 'vpc' && (r.config?.name === m[1] || r.label === m[1]));
+              if (found) vpcName = found.config?.name || found.label || vpcId;
+            }
+          }
+        } catch (_) {}
+        const nextAz   = azs.length ? azs[items.length % azs.length] : '—';
+        const nextCidr = `10.0.${items.length}.0/24`;
+        return (
+          <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 6, background: c.bg3, border: `1px solid ${c.bd}`, fontSize: 11, color: c.fg3 }}>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+              <span><strong style={{ color: c.fg }}>VPC:</strong> {vpcName}</span>
+              <span><strong style={{ color: c.fg }}>Next AZ:</strong> {nextAz}</span>
+              <span><strong style={{ color: c.fg }}>Next CIDR:</strong> {nextCidr}</span>
+            </div>
+            <div style={{ marginTop: 4, fontSize: 10, color: c.fg3 }}>
+              These values are auto-filled when you click + Public Subnet or + Private Subnet — edit them after if needed.
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Bug-017/018 fix: clarify that "public" vs "private" is a routing
+          convention controlled by Route Tables, not an AWS-level subnet flag.
+          A subnet becomes public when its associated Route Table has a 0.0.0.0/0
+          route via an Internet Gateway (IGW); private subnets route outbound
+          traffic through a NAT Gateway instead. The TYPE selector below is a
+          convenience label used to pre-set map_public_ip_on_launch and name
+          suggestions — the actual public/private behaviour is determined by your
+          Route Table associations in AWS. */}
+      <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 6, background: '#EFF6FF', border: '1px solid #BFDBFE', fontSize: 11, color: '#1E40AF', lineHeight: 1.5 }}>
+        💡 <strong>Public vs Private is a routing concept.</strong> A subnet is
+        effectively <em>public</em> when its Route Table routes <code>0.0.0.0/0</code> through an{' '}
+        <strong>Internet Gateway (IGW)</strong>. It is <em>private</em> when it routes outbound
+        traffic through a <strong>NAT Gateway</strong>. The TYPE field below sets{' '}
+        <code>map_public_ip_on_launch</code> and naming defaults — adjust Route Tables in your
+        VPC config to control actual internet accessibility.
+      </div>
 
       {azSrc === 'aws' && <div style={{ marginBottom: 6, fontSize: 10.5, color: '#4ade80' }}>🟢 Live AZs from AWS API</div>}
       {azSrc === 'curated' && <div style={{ marginBottom: 6, fontSize: 10.5, color: c.fg3 }}>📋 Curated AZs — connect AWS creds for live data</div>}
 
-      {/* Quick-add bar */}
+      {/* Quick-add bar — each button calls makeSubnet(type) which auto-fills
+          az, cidr, name, and map_public_ip from current context so users get
+          a ready-to-use subnet instead of an empty form. */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
         {[{ label: '+ Public', type: 'public' }, { label: '+ Private', type: 'private' }].map(q => (
-          <button key={q.type} onClick={() => onChange([...items, { ...DEFAULT_SUBNET(), type: q.type }])}
+          <button key={q.type} onClick={() => onChange([...items, makeSubnet(q.type)])}
             style={{ flex: 1, padding: '4px 0', fontSize: 11, fontWeight: 600, borderRadius: 5, cursor: 'pointer', fontFamily: 'inherit', border: `1px solid ${q.type === 'public' ? '#38BDF844' : '#818CF844'}`, background: q.type === 'public' ? '#38BDF810' : '#818CF810', color: q.type === 'public' ? '#38BDF8' : '#818CF8' }}>
             {q.label} Subnet
           </button>
@@ -220,15 +270,71 @@ function Ec2InstanceList({ items, onChange, region, c, allResources, vpcId }) {
   const remove = (idx) => onChange(items.filter((_, i) => i !== idx));
   const update = (idx, key, val) => onChange(items.map((inst, i) => i === idx ? { ...inst, [key]: val } : inst));
   const toggleExpand = (id) => setExpanded(e => ({ ...e, [id]: !e[id] }));
+  // Bug-014/015/016 fix: allow duplicating an existing EC2 instance so users
+  // can quickly create multiple instances sharing the same base configuration
+  // (AMI, instance type, subnet, key pair, etc.). Each copy gets a new unique
+  // id and a "-copy" suffix on the name so Terraform resource names stay
+  // distinct. VPC-scoped fields (subnet_ref) are intentionally preserved so
+  // all copies land in the same network by default.
+  const duplicate = (idx) => {
+    const src = items[idx];
+    const copy = {
+      ...src,
+      id:   uid(),
+      name: src.name ? `${src.name}-copy` : `instance-${items.length + 1}`,
+    };
+    const next = [...items.slice(0, idx + 1), copy, ...items.slice(idx + 1)];
+    onChange(next);
+    setExpanded(e => ({ ...e, [copy.id]: true }));
+  };
 
   const iTypes = instanceTypes.length ? instanceTypes : ['t3.nano', 't3.micro', 't3.small', 't3.medium', 't3.large', 't3.xlarge', 't3.2xlarge', 'm5.large', 'm5.xlarge', 'c5.large', 'c5.xlarge', 'r5.large'];
 
-  // Prepare subnet list (optionally scoped to a parent VPC)
-  const allSubnets = Array.isArray(allResources) ? allResources.filter(r => r.service_type === 'subnet') : [];
+  // Prepare subnet list — combine standalone subnet resources AND subnets
+  // embedded inside VPC resources (stored as vpc.config.subnets_multi).
+  // Bug-013 fix: VPC-embedded subnets were previously invisible to the EC2
+  // subnet picker because they are not top-level resources.
+  const standAloneSubnets = Array.isArray(allResources)
+    ? allResources.filter(r => r.service_type === 'subnet')
+    : [];
+
+  // Lift subnets from every VPC's subnets_multi into a normalised shape that
+  // matches a standalone subnet resource so the picker can treat them uniformly.
+  const embeddedSubnets = [];
+  if (Array.isArray(allResources)) {
+    for (const r of allResources) {
+      if (r.service_type !== 'vpc') continue;
+      const multi = r.config?.subnets_multi;
+      if (!Array.isArray(multi)) continue;
+      const vpcRef = r.config?.name ? `aws_vpc.${r.config.name}.id` : r._id;
+      for (const s of multi) {
+        embeddedSubnets.push({
+          _id: s.id || `${r._id}-${s.name || s.cidr}`,
+          service_type: 'subnet',
+          label: s.name || s.cidr || 'unnamed-subnet',
+          config: {
+            name:                    s.name   || '',
+            cidr_block:              s.cidr   || '',
+            availability_zone:       s.az     || '',
+            vpc_id:                  vpcRef,
+            // Bug-017/018 fix: carry the explicit type chosen in SubnetList so
+            // the EC2 dropdown shows the correct label without falling back to
+            // unreliable name-based heuristics.
+            type:                    s.type   || 'public',
+            map_public_ip_on_launch: s.map_public_ip !== false,
+          },
+          _fromVpc: r._id,
+        });
+      }
+    }
+  }
+
+  const allSubnets = [...standAloneSubnets, ...embeddedSubnets];
+
   let filteredSubnets = allSubnets;
   if (vpcId) {
     try {
-      const m = typeof vpcId === 'string' && vpcId.match(/aws_vpc\.([A-Za-z0-9_\-]+)\.id/);
+      const m = typeof vpcId === 'string' && vpcId.match(/aws_vpc\.([A-Za-z0-9_-]+)\.id/);
       if (m && m[1]) {
         filteredSubnets = allSubnets.filter(s => {
           const svcVpc = s.config?.vpc_id;
@@ -248,6 +354,32 @@ function Ec2InstanceList({ items, onChange, region, c, allResources, vpcId }) {
 
       {itSrc === 'aws' && <div style={{ marginBottom: 6, fontSize: 10.5, color: '#4ade80' }}>🟢 Live instance types from AWS API</div>}
 
+      {/* Bug-013 fix: warn when no subnets exist at all — a subnet (inside a VPC
+          with an Availability Zone and CIDR) is a prerequisite for EC2 launch. */}
+      {allSubnets.length === 0 && (
+        <div style={{
+          marginBottom: 10, padding: '10px 12px', borderRadius: 8,
+          background: '#FEF3C7', border: '1px solid #F59E0B',
+          fontSize: 12, color: '#92400E', lineHeight: 1.6,
+        }}>
+          <strong>⚠ No subnets found.</strong> A subnet is required before you can launch
+          an EC2 instance inside a VPC. To fix this:
+          <ol style={{ margin: '6px 0 0 16px', padding: 0 }}>
+            <li>Add a <strong>VPC</strong> resource and configure its CIDR block.</li>
+            <li>Inside the VPC config, use the <em>Subnets</em> section to add at least
+                one subnet — specify an <strong>Availability Zone</strong> and a
+                <strong> CIDR block</strong> (e.g. <code>10.0.1.0/24</code>).</li>
+            <li>Return here and select that subnet from the dropdown below.</li>
+          </ol>
+          <div style={{ marginTop: 6, fontSize: 11, color: '#B45309' }}>
+            💡 Subnets labelled <em>Public</em> route traffic through an Internet Gateway;
+            subnets labelled <em>Private</em> use a NAT Gateway for outbound-only access.
+            This distinction is set via <strong>Route Tables</strong>, not the subnet
+            resource itself.
+          </div>
+        </div>
+      )}
+
       {items.length === 0 && <EmptySlate message="No EC2 instances defined — click + Add Instance to begin" c={c} />}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -264,6 +396,13 @@ function Ec2InstanceList({ items, onChange, region, c, allResources, vpcId }) {
                 </span>
                 <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
                   <span style={{ fontSize: 11, color: c.fg3 }}>{isOpen ? '▲' : '▼'}</span>
+                  {/* Bug-014/015/016: Duplicate button mirrors the subnet pattern. Each
+                      copy gets a unique id so Terraform generates separate resource
+                      blocks while sharing VPC ID, subnet, AMI and other fields. */}
+                  <button onClick={e => { e.stopPropagation(); duplicate(i); }} title="Duplicate instance"
+                    style={{ background: 'none', border: 'none', color: c.fg3, cursor: 'pointer', fontSize: 13, padding: '0 4px', lineHeight: 1 }}
+                    onMouseEnter={e => e.currentTarget.style.color = c.accent}
+                    onMouseLeave={e => e.currentTarget.style.color = c.fg3}>⎘</button>
                   <button onClick={e => { e.stopPropagation(); remove(i); }} title="Remove"
                     style={{ background: 'none', border: 'none', color: c.fg3, cursor: 'pointer', fontSize: 15, padding: '0 4px', lineHeight: 1 }}
                     onMouseEnter={e => e.currentTarget.style.color = '#f87171'}
@@ -298,26 +437,46 @@ function Ec2InstanceList({ items, onChange, region, c, allResources, vpcId }) {
                         <select value={inst.subnet_ref} onChange={e => update(i, 'subnet_ref', e.target.value)} style={selectSt(c)}>
                           <option value="">— select subnet —</option>
                           {filteredSubnets.map(s => {
-                            const name = String(s.config?.name || s.label || '').toLowerCase();
-                            const mp = s.config?.map_public_ip_on_launch ?? s.config?.map_public_ip;
+                            // Bug-017/018 fix: resolve public/private label with a clear
+                            // priority so the dropdown is always accurate.
+                            // 1) Explicit `type` field set by SubnetList (most reliable).
+                            // 2) `map_public_ip_on_launch` boolean from standalone subnets.
+                            // 3) Name-based heuristic as last resort.
+                            // Clarification: "public" / "private" is a routing convention
+                            // (Internet Gateway vs NAT Gateway in the Route Table) — it is
+                            // NOT an intrinsic AWS attribute of the subnet resource itself.
                             let type = 'unknown';
-                            if (mp !== undefined) {
-                              const mpStr = String(mp);
-                              if (mpStr === 'true' || mpStr === 'True' || mpStr === '1') type = 'public';
-                              if (mpStr === 'false' || mpStr === 'False' || mpStr === '0') type = 'private';
+                            if (s.config?.type === 'public' || s.config?.type === 'private') {
+                              type = s.config.type;
+                            } else {
+                              const mp = s.config?.map_public_ip_on_launch ?? s.config?.map_public_ip;
+                              if (mp !== undefined) {
+                                const mpStr = String(mp);
+                                if (mpStr === 'true'  || mpStr === 'True'  || mpStr === '1') type = 'public';
+                                if (mpStr === 'false' || mpStr === 'False' || mpStr === '0') type = 'private';
+                              }
+                              if (type === 'unknown') {
+                                const nameLower = String(s.config?.name || s.label || '').toLowerCase();
+                                if (nameLower.includes('public'))  type = 'public';
+                                if (nameLower.includes('private')) type = 'private';
+                              }
                             }
-                            if (type === 'unknown') {
-                              if (name.includes('public')) type = 'public';
-                              if (name.includes('private')) type = 'private';
-                            }
-                            const display = `${s.config?.name || s.label || s._id} ${type === 'public' ? '(PUBLIC)' : type === 'private' ? '(PRIVATE)' : ''}`;
-                            const value = s.config?.name ? `aws_subnet.${s.config.name}.id` : s._id;
+                            const typeLabel = type === 'public'  ? ' (public)'
+                                            : type === 'private' ? ' (private)'
+                                            : '';
+                            const display = `${s.config?.name || s.label || s._id}${typeLabel}`;
+                            const value   = s.config?.name ? `aws_subnet.${s.config.name}.id` : s._id;
                             return <option key={s._id} value={value}>{display}</option>;
                           })}
                         </select>
                       ) : (
                         <FocusInput value={inst.subnet_ref} onChange={v => update(i, 'subnet_ref', v)} placeholder="aws_subnet.public_0.id" c={c} />
                       )}
+                      {/* Bug-017/018: clarify that public/private is a route-table
+                          concept so users know where to change it. */}
+                      <div style={{ marginTop: 4, fontSize: 10, color: c.fg3, lineHeight: 1.4 }}>
+                        Public/private routing is set via the subnet's <em>Route Table</em> (IGW = public, NAT-GW = private), not the subnet resource itself.
+                      </div>
                     </div>
                     {/* Key pair */}
                     <div>
@@ -418,7 +577,7 @@ const PROTOCOLS = [
 function SGRuleRow({ rule, idx, onUpdate, onRemove, c }) {
   const isAllTraffic = rule.protocol === '-1';
   return (
-    <div style={{ background: c.bg3, border: `1px solid ${rule.direction === 'ingress' ? '#38BDF820' : '#F87171' + '20'}`, borderRadius: 8, padding: '10px 12px' }}>
+    <div style={{ background: c.bg3, border: `1px solid ${rule.direction === 'ingress' ? '#38BDF820' : '#F8717120'}`, borderRadius: 8, padding: '10px 12px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
         <span style={{ fontSize: 10, fontWeight: 700, color: rule.direction === 'ingress' ? '#38BDF8' : '#F87171' }}>
           {rule.direction === 'ingress' ? '← INBOUND' : '→ OUTBOUND'} RULE #{idx + 1}

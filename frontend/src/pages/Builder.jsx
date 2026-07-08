@@ -16,7 +16,7 @@ import OutputsEditor from '../components/OutputsEditor';
 import sanitizeHcl from '../utils/sanitizeHcl';
 import { useToast, ToastContainer } from '../components/Toast';
 import { useTheme } from '../contexts/ThemeContext';
-import { projectsAPI, templatesAPI, terraformAPI, jobsAPI, exportAPI } from '../api/client';
+import { projectsAPI, templatesAPI, terraformAPI, jobsAPI } from '../api/client';
 import { generateHCL, buildFullHCL, buildSplitHCL, detectSecretsInHcl } from '../engine/templateEngine';
 import { getAwsRegionLabel } from '../utils/awsRegions';
 import { applyWiringToAll } from '../utils/dependencyWiring';

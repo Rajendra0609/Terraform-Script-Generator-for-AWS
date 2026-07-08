@@ -395,7 +395,17 @@ terraform apply -var-file="dev.tfvars"
     'BACKEND_README.md': readmeMd,
   };
 
-  res.json({ files, bucket_name: bucketName, table_name: tableName, region: aws_region });
+  const warnings = [];
+  if (!req.body.aws_account_id || req.body.aws_account_id === 'ACCOUNT_ID') {
+    warnings.push(
+      'aws_account_id was not provided. The generated iam-policy.json contains a literal ' +
+      '"ACCOUNT_ID" placeholder in the DynamoDB Resource ARN. Replace it with your 12-digit ' +
+      'AWS account ID before attaching this policy, otherwise the policy will be silently ' +
+      'malformed and DynamoDB permissions will not be granted.'
+    );
+  }
+
+  res.json({ files, bucket_name: bucketName, table_name: tableName, region: aws_region, warnings });
 });
 
 // ─── TERRAGRUNT GENERATOR ──────────────────────────────────────────────────────

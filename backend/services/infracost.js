@@ -12,6 +12,7 @@ const path = require('path');
 const os   = require('os');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
+const { isDockerAvailable } = require('../utils/dockerAvailable');
 
 const INFRACOST_IMAGE   = process.env.INFRACOST_IMAGE   || 'infracost/infracost:latest';
 const INFRACOST_API_KEY = process.env.INFRACOST_API_KEY || '';
@@ -178,25 +179,58 @@ function getStaticCost(resourceType, config = {}) {
   return table[instanceType] ?? table['default'] ?? null;
 }
 
+/**
+ * Extract all resource blocks from HCL using brace-depth tracking.
+ * The regex approach (/[\s\S]+?)^}/) fails on resources that contain nested
+ * blocks with their own closing braces (lifecycle {}, tags {}, etc.).
+ * This function correctly handles arbitrary nesting depth.
+ *
+ * Returns an array of { resourceType, resourceName, body } objects where
+ * body is the text between (not including) the outer braces of the block.
+ */
+function extractAllResourceBlocks(hcl) {
+  const blocks = [];
+  const headerRe = /resource\s+"([^"]+)"\s+"([^"]+)"\s*\{/g;
+  let headerMatch;
+  while ((headerMatch = headerRe.exec(hcl)) !== null) {
+    const resourceType = headerMatch[1];
+    const resourceName = headerMatch[2];
+    // Start just after the opening brace
+    let depth = 1;
+    let i = headerMatch.index + headerMatch[0].length;
+    const bodyStart = i;
+    while (i < hcl.length && depth > 0) {
+      const ch = hcl[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+      i++;
+    }
+    // Slice excludes the final closing brace (depth hit 0 at i-1)
+    const body = hcl.slice(bodyStart, i - 1);
+    blocks.push({ resourceType, resourceName, body });
+  }
+  return blocks;
+}
+
 function estimateStatic(hcl) {
   const items = [];
   let total = 0;
 
-  // Extract resource blocks from HCL text (basic regex-based parse)
-  const resourceRe = /resource\s+"([^"]+)"\s+"([^"]+)"\s*{([\s\S]+?)^}/gm;
-  let match;
-  while ((match = resourceRe.exec(hcl)) !== null) {
-    const [, resourceType, resourceName, body] = match;
-    // Extract simple key = "value" pairs from block
+  // Use brace-depth extraction so nested blocks (lifecycle {}, tags {}, etc.)
+  // do not prematurely truncate the captured body, which previously caused
+  // instance_type and other key lookups to fail on real-world HCL.
+  const blocks = extractAllResourceBlocks(hcl);
+  for (const { resourceType, resourceName, body } of blocks) {
+    // Extract simple key = "value" and key = number pairs from block body
     const config = {};
-    const kvRe = /^\s*(\w+)\s*=\s*"([^"]+)"/gm;
+    const kvRe = /^\s*(\w+)\s*=\s*["']?([^"'\n]+?)["']?\s*$/gm;
     let kv;
     while ((kv = kvRe.exec(body)) !== null) {
-      config[kv[1]] = kv[2];
+      config[kv[1]] = kv[2].trim();
     }
     const cost = getStaticCost(resourceType, config);
     items.push({
-      resource:   `${resourceType}.${resourceName}`,
+      resource:    `${resourceType}.${resourceName}`,
       monthly_usd: cost,
       note: cost === 0 ? 'Usage-based' : cost === null ? 'Not estimated' : null,
     });
@@ -207,10 +241,6 @@ function estimateStatic(hcl) {
 }
 
 // ─── Docker Infracost runner ───────────────────────────────────────────────────
-function isDockerAvailable() {
-  return new Promise(resolve => exec('docker info', { timeout: 3000 }, err => resolve(!err)));
-}
-
 async function runInfracost(hcl) {
   const useDocker = await isDockerAvailable();
 

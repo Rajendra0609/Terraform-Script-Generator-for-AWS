@@ -1,11 +1,27 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
+-- ── Migration tracking ────────────────────────────────────────────────────────
+-- Records which migration files have been applied to this database.
+-- Each migration runner (node-pg-migrate, Flyway, or a custom script) should
+-- INSERT a row here after successfully executing a migration file.
+-- This prevents re-running already-applied migrations and makes it possible
+-- to query the current schema version at any time.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version     VARCHAR(255) PRIMARY KEY,   -- e.g. '001', '002', or a timestamp
+  filename    TEXT         NOT NULL,       -- original filename for traceability
+  applied_at  TIMESTAMP    NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS users (
-  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email      VARCHAR(255) UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  role       VARCHAR(50) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW()
+  id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email                  VARCHAR(255) UNIQUE NOT NULL,
+  password_hash          TEXT NOT NULL,
+  role                   VARCHAR(50) DEFAULT 'user',
+  -- FIX: reset_token stores the SHA-256 hash of the raw token (never plaintext).
+  -- reset_token_expires_at enforces a 1-hour TTL server-side.
+  reset_token            TEXT,
+  reset_token_expires_at TIMESTAMP,
+  created_at             TIMESTAMP DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -32,6 +48,13 @@ CREATE TABLE IF NOT EXISTS resources (
   module_source VARCHAR(500),
   hcl_output    TEXT,
   position      INT DEFAULT 0,
+  -- FIX: columns required by /api/projects/:id/resources on every save;
+  -- previously only added by auto-migration, causing fresh-DB failures.
+  lifecycle_config  JSONB    DEFAULT '{}',
+  position_x        NUMERIC  DEFAULT 0,
+  position_y        NUMERIC  DEFAULT 0,
+  annotations       TEXT     DEFAULT '',
+  security_findings JSONB    DEFAULT '[]',
   created_at    TIMESTAMP DEFAULT NOW()
 );
 
@@ -82,6 +105,11 @@ CREATE TABLE IF NOT EXISTS validation_logs (
   diagnostics JSONB,
   ran_at     TIMESTAMP DEFAULT NOW()
 );
+
+-- BUG-022 fix: add index to support future validation-history queries and
+-- prevent sequential scans as the table grows.
+CREATE INDEX IF NOT EXISTS idx_validation_logs_project
+  ON validation_logs(project_id, ran_at DESC);
 
 -- Upgrade existing schema when tables already exist
 DO $$
@@ -145,6 +173,11 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash);
+-- BUG-013 fix: partial index so the 6-hour cleanup query (DELETE WHERE revoked=true OR
+-- expires_at < NOW()) and per-user revocation queries can use an index scan instead of
+-- a full sequential scan on large tables.
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_cleanup
+  ON refresh_tokens(expires_at) WHERE revoked = false;
 
 -- Project team membership
 CREATE TABLE IF NOT EXISTS project_members (
@@ -298,6 +331,22 @@ CREATE INDEX IF NOT EXISTS idx_project_versions_project ON project_versions(proj
 
 -- NOTE: Phase-3 ALTER TABLE block removed — all columns were already added
 -- in the Phase-2 DO blocks above with correct types and FK constraints.
+
+-- ─── Phase-5: Password reset columns ────────────────────────────────────────
+-- Added for forgot-password / reset-password flow.
+-- reset_token      : SHA-256 hash of a 64-char hex token (32 random bytes).
+--                    The raw token is sent to the user by email; only the hash
+--                    is persisted so a DB dump cannot be used to take over accounts.
+-- reset_token_expires_at : 1-hour TTL; checked server-side before accepting reset
+DO $$
+BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token              TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at   TIMESTAMP;
+EXCEPTION WHEN insufficient_privilege THEN
+  RAISE NOTICE 'Skipping Phase-5 users columns: insufficient privilege';
+END
+$$;
+CREATE INDEX IF NOT EXISTS idx_users_reset_token ON users(reset_token) WHERE reset_token IS NOT NULL;
 
 -- ─── Phase-4: Idempotent safety net — always run these on startup ─────────────
 -- These columns were added in Phase-2 blocks but may not exist if the DB was

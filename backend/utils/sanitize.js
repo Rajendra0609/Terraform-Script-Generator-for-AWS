@@ -34,32 +34,52 @@ function detectSecrets(input) {
 /**
  * Check HCL for dangerous network rules (0.0.0.0/0 on privileged ports).
  * Returns array of warning strings.
+ *
+ * BUG-015 fix: the previous implementation split the HCL on block-boundary
+ * keywords (resource / ingress { / egress {) which (a) discards the delimiter
+ * itself and (b) can split a single ingress block across two fragments,
+ * causing false negatives when the CIDR and the port land in different pieces.
+ * The fix captures each complete ingress/egress block (including nested braces)
+ * and checks the CIDR + port conditions on the full captured block only.
  */
 function lintNetworkRules(hcl) {
   if (!hcl) return [];
-  const warnings = [];
   const text = String(hcl);
 
-  // Find all ingress/egress blocks that reference 0.0.0.0/0
   const openWorldRe = /0\.0\.0\.0\/0|::\/0/;
   const privilegedPorts = [
-    { port: 22,   name: 'SSH' },
-    { port: 3389, name: 'RDP' },
-    { port: 5432, name: 'PostgreSQL' },
-    { port: 3306, name: 'MySQL' },
+    { port: 22,    name: 'SSH' },
+    { port: 3389,  name: 'RDP' },
+    { port: 5432,  name: 'PostgreSQL' },
+    { port: 3306,  name: 'MySQL' },
     { port: 27017, name: 'MongoDB' },
-    { port: 6379, name: 'Redis' },
+    { port: 6379,  name: 'Redis' },
   ];
 
   if (!openWorldRe.test(text)) return [];
 
-  // Check each block for both open-world CIDR and privileged port in the same block
-  // Split on resource blocks for context
-  const blocks = text.split(/resource\s+"|ingress\s*{|egress\s*{/);
-  for (const block of blocks) {
+  // Extract complete ingress/egress blocks by tracking brace depth.
+  // This correctly handles nested blocks and preserves all content needed
+  // to check both the CIDR and the port in a single coherent block.
+  const ingressBlocks = [];
+  const blockStartRe = /\b(ingress|egress)\s*\{/g;
+  let m;
+  while ((m = blockStartRe.exec(text)) !== null) {
+    let depth = 1;
+    let i = m.index + m[0].length;
+    while (i < text.length && depth > 0) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') depth--;
+      i++;
+    }
+    // Include the keyword + brace so port/cidr at the very start isn't missed
+    ingressBlocks.push(text.slice(m.index, i));
+  }
+
+  const warnings = [];
+  for (const block of ingressBlocks) {
     if (!openWorldRe.test(block)) continue;
     for (const { port, name } of privilegedPorts) {
-      // Match from_port / to_port / port patterns
       const portRe = new RegExp(`(from_port|to_port|port)\\s*=\\s*${port}\\b`);
       if (portRe.test(block)) {
         warnings.push(
@@ -73,15 +93,19 @@ function lintNetworkRules(hcl) {
 }
 
 // ─── HTML/CSS tag stripper (unchanged, defensive) ─────────────────────────────
+const htmlTagRe = /<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^>]*?)?>/;
+const htmlTagGlobalRe = /<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^>]*?)?>/g;
+const htmlEntityRe = /&(?:lt|gt|amp|quot|#39);/i;
+
 function stripHtml(input) {
   if (!input) return '';
   let t = String(input);
   try {
     // Only perform heavy work if suspicious characters present
-    if (/[<>\u00AB\u00BB]/.test(t) || /&lt;|&gt;|&amp;/.test(t) || /color:|style=/.test(t)) {
+    if (htmlTagRe.test(t) || htmlEntityRe.test(t) || /\b(?:color|font-weight|font-style|display|user-select)\s*:/i.test(t) || /\bstyle\s*=\s*["'][^"']*["']/i.test(t) || /\bclass\s*=\s*["'][^"']*["']/i.test(t)) {
       t = t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-      // Remove tags
-      t = t.replace(/<[^>]+>/g, '');
+      // Remove HTML tags only; preserve HCL placeholders and operators.
+      t = t.replace(htmlTagGlobalRe, '');
       // Remove inline CSS fragments left as plain text
       t = t.replace(/(?:["']?)?color:\s*[^;"'<>]+;?/gi, '');
       t = t.replace(/(?:["']?)?font-weight:\s*[^;"'<>]+;?/gi, '');
@@ -99,8 +123,18 @@ function stripHtml(input) {
     }
     return t;
   } catch (e) {
-    return String(input).replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\n{3,}/g, '\n\n').trim();
+    return String(input).replace(htmlTagGlobalRe, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\n{3,}/g, '\n\n').trim();
   }
 }
 
-module.exports = { stripHtml, detectSecrets, lintNetworkRules };
+function hasMarkup(input) {
+  if (!input) return false;
+  const text = String(input);
+  return htmlTagRe.test(text)
+    || htmlEntityRe.test(text)
+    || /\b(?:color|font-weight|font-style|display|user-select)\s*:/i.test(text)
+    || /\bstyle\s*=\s*["'][^"']*["']/i.test(text)
+    || /\bclass\s*=\s*["'][^"']*["']/i.test(text);
+}
+
+module.exports = { stripHtml, detectSecrets, lintNetworkRules, hasMarkup };
