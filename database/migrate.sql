@@ -161,9 +161,31 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 -- POST /api/auth/forgot-password executes as a silent zero-row no-op and
 -- password reset permanently fails.  The stored value is a SHA-256 hash of
 -- the raw token — see auth.js forgot-password handler.
-ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token              TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at   TIMESTAMP;
-CREATE INDEX IF NOT EXISTS idx_users_reset_token
-  ON users(reset_token) WHERE reset_token IS NOT NULL;
+--
+-- BUG-FIX: These were previously bare ALTER TABLE statements outside any DO
+-- block. With psql -v ON_ERROR_STOP=1 (used by docker-entrypoint-initdb.d)
+-- any unexpected error from a bare statement aborts the entire script and
+-- poisons all subsequent migration files. Wrapping in a DO block with a
+-- RAISE NOTICE fallback makes this file safe to re-run under all conditions.
+DO $$
+BEGIN
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token              TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at   TIMESTAMP;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Phase-5 users columns: %', SQLERRM;
+END $$;
 
-\echo 'Migration complete — all columns and tables are up to date.'
+DO $$
+BEGIN
+  CREATE INDEX IF NOT EXISTS idx_users_reset_token
+    ON users(reset_token) WHERE reset_token IS NOT NULL;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Phase-5 index: %', SQLERRM;
+END $$;
+
+-- BUG-FIX: \echo is a psql meta-command that works in interactive psql but
+-- can cause parse errors in scripts run via docker-entrypoint-initdb.d when
+-- the client locale does not match the database encoding (the em-dash in the
+-- original string was the trigger). Replaced with a plain SQL SELECT so the
+-- completion message is always safe in any environment.
+SELECT 'Migration complete: all columns and tables are up to date.' AS migration_status;

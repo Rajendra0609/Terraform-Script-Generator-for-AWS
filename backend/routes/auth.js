@@ -108,7 +108,16 @@ router.post('/logout', authMiddleware, async (req, res) => {
     const tokenHash = hashToken(refreshToken);
     await db.query('UPDATE refresh_tokens SET revoked=true WHERE token_hash=$1', [tokenHash]).catch(() => {});
   }
-  res.clearCookie('refreshToken', { httpOnly: true, secure: true, sameSite: 'strict' });
+  // FIX: clearCookie must include the same `path` used in setRefreshCookie.
+  // Without it the browser sees them as different cookies and never removes the
+  // old one — the user appears logged out in-app but the cookie persists and
+  // auto-logs them back in on the next page load via the /refresh call.
+  res.clearCookie('refreshToken', {
+    httpOnly : true,
+    secure   : process.env.NODE_ENV !== 'development',
+    sameSite : 'strict',
+    path     : '/api/auth',
+  });
   res.json({ success: true });
 });
 

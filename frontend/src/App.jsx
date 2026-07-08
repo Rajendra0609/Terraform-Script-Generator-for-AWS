@@ -1,4 +1,4 @@
-import React, { lazy, Suspense } from 'react';
+import React, { lazy, Suspense, Component } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -9,13 +9,10 @@ import Login from './pages/Login';
 import ResetPassword from './pages/ResetPassword';
 
 // ── Lazily loaded (heavy; only needed after auth) ─────────────────────────────
-// Each page is split into its own chunk so the login screen loads immediately
-// and subsequent navigations only download the code they actually need.
-// Studio is split separately because it carries the Monaco editor (~2 MB).
-const Dashboard    = lazy(() => import('./pages/Dashboard'));
-const Builder      = lazy(() => import('./pages/Builder'));
-const History      = lazy(() => import('./pages/History'));
-const Studio       = lazy(() => import('./pages/Studio'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Builder   = lazy(() => import('./pages/Builder'));
+const History   = lazy(() => import('./pages/History'));
+const Studio    = lazy(() => import('./pages/Studio'));
 
 /** Shown while a lazy page chunk is downloading */
 function PageLoader() {
@@ -28,6 +25,52 @@ function PageLoader() {
       <span>Loading…</span>
     </div>
   );
+}
+
+/**
+ * Error boundary that catches ChunkLoadErrors (and any other render errors).
+ * Shows a simple "Reload page" prompt instead of a blank screen.
+ */
+class ChunkErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error) {
+    // ChunkLoadError means a JS chunk file is missing — a hard reload fixes it
+    if (error && error.name === 'ChunkLoadError') {
+      window.location.reload();
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{
+          flex: 1, display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          background: '#0f0f0f', color: '#a0a0a0', fontSize: 14, gap: 16,
+        }}>
+          <p>Something went wrong loading this page.</p>
+          <button
+            onClick={() => window.location.reload()}
+            style={{
+              padding: '8px 20px', borderRadius: 6, border: 'none',
+              background: '#3b82f6', color: '#fff', cursor: 'pointer', fontSize: 14,
+            }}
+          >
+            Reload page
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 /** Redirect unauthenticated users to /login. Shows nothing while auth state loads. */
@@ -45,20 +88,22 @@ function AppContent() {
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: c.bg }}>
       {!hideNav && <Navbar />}
-      <Suspense fallback={<PageLoader />}>
-        <Routes>
-          <Route path="/" element={<Navigate to="/dashboard" />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Login initialMode="register" />} />
-          <Route path="/reset-password" element={<ResetPassword />} />
-          <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
-          <Route path="/builder" element={<ProtectedRoute><Builder /></ProtectedRoute>} />
-          <Route path="/builder/:projectId" element={<ProtectedRoute><Builder /></ProtectedRoute>} />
-          <Route path="/history" element={<ProtectedRoute><History /></ProtectedRoute>} />
-          <Route path="/history/:projectId" element={<ProtectedRoute><History /></ProtectedRoute>} />
-          <Route path="/studio" element={<ProtectedRoute><Studio /></ProtectedRoute>} />
-        </Routes>
-      </Suspense>
+      <ChunkErrorBoundary>
+        <Suspense fallback={<PageLoader />}>
+          <Routes>
+            <Route path="/" element={<Navigate to="/dashboard" />} />
+            <Route path="/login" element={<Login />} />
+            <Route path="/register" element={<Login initialMode="register" />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
+            <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+            <Route path="/builder" element={<ProtectedRoute><Builder /></ProtectedRoute>} />
+            <Route path="/builder/:projectId" element={<ProtectedRoute><Builder /></ProtectedRoute>} />
+            <Route path="/history" element={<ProtectedRoute><History /></ProtectedRoute>} />
+            <Route path="/history/:projectId" element={<ProtectedRoute><History /></ProtectedRoute>} />
+            <Route path="/studio" element={<ProtectedRoute><Studio /></ProtectedRoute>} />
+          </Routes>
+        </Suspense>
+      </ChunkErrorBoundary>
     </div>
   );
 }

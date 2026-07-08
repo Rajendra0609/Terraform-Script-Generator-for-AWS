@@ -706,6 +706,9 @@ function AmiInput({ region, value, onChange, c }) {
   const [searching, setSearching] = useState(false);
   const [source, setSource]   = useState('');
   const dropdownRef           = useRef(null);
+  // FIX: cancelClose ref lets any element inside the dropdown cancel the
+  // onBlur timer that would close it when focus moves within the panel.
+  const closeTimer            = useRef(null);
 
   useEffect(() => { setQ(''); setList([]); setSource(''); }, [region]);
 
@@ -714,6 +717,16 @@ function AmiInput({ region, value, onChange, c }) {
     fetchAmis('');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, region]);
+
+  // FIX: clean up the timer if the component unmounts while it is pending.
+  useEffect(() => () => clearTimeout(closeTimer.current), []);
+
+  function scheduleClose() {
+    closeTimer.current = setTimeout(() => setOpen(false), 200);
+  }
+  function cancelClose() {
+    clearTimeout(closeTimer.current);
+  }
 
   async function fetchAmis(term) {
     setSearching(true);
@@ -735,8 +748,8 @@ function AmiInput({ region, value, onChange, c }) {
     <div style={{ position: 'relative' }}>
       <input type="text" value={value} onChange={e => onChange(e.target.value)}
         placeholder="ami-… or click to browse"
-        onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 200)}
+        onFocus={() => { cancelClose(); setOpen(true); }}
+        onBlur={scheduleClose}
         style={inputStyle}
         onMouseEnter={e => e.target.style.borderColor = c.bd2}
         onMouseLeave={e => !open && (e.target.style.borderColor = c.bd)}
@@ -752,11 +765,16 @@ function AmiInput({ region, value, onChange, c }) {
           <div style={{ padding: '8px 10px', borderBottom: `1px solid ${c.bd}`, display: 'flex', gap: 6 }}>
             <input placeholder="Search AMIs…" value={q}
               onChange={e => setQ(e.target.value)}
-              onMouseDown={e => e.stopPropagation()}
+              // FIX: cancel the blur-close timer when the user focuses the
+              // search box, and reschedule it when they leave it.
+              onFocus={cancelClose}
+              onBlur={scheduleClose}
               onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); fetchAmis(q); } }}
               style={{ ...inputStyle, flex: 1, fontSize: 12, borderRadius: 6, padding: '5px 8px' }}
             />
-            <button onMouseDown={e => e.preventDefault()} onClick={() => fetchAmis(q)}
+            <button
+              onMouseDown={e => e.preventDefault()}
+              onClick={() => fetchAmis(q)}
               style={{ padding: '5px 10px', background: c.accent, color: '#001A0F', border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700, fontFamily: 'inherit' }}>
               {searching ? '…' : 'Search'}
             </button>

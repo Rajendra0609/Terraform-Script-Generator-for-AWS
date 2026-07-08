@@ -414,7 +414,9 @@ router.get('/availability-zones', optionalAuth, async (req, res) => {
 router.get('/amis', optionalAuth, async (req, res) => {
   const region = req.query.region || process.env.AWS_REGION || 'us-east-1';
   const q      = (req.query.q || '').trim();
-  const limit  = Math.min(parseInt(req.query.limit || '12', 10), 50);
+  // FIX-1: raised default from 12 → 50, hard cap from 50 → 200 so a live
+  // AWS search actually returns useful breadth instead of just 12 results.
+  const limit  = Math.min(parseInt(req.query.limit || '50', 10), 200);
 
   // Check if live creds available
   let hasUserCreds = false;
@@ -428,19 +430,63 @@ router.get('/amis', optionalAuth, async (req, res) => {
     try {
       const client = await makeClient(region, req.user?.id);
       const filters = [
-        { Name: 'state', Values: ['available'] },
+        { Name: 'state',               Values: ['available'] },
         { Name: 'virtualization-type', Values: ['hvm'] },
-        { Name: 'architecture', Values: ['x86_64'] },
+        { Name: 'architecture',        Values: ['x86_64'] },
+        { Name: 'image-type',          Values: ['machine'] },
       ];
-      if (q) filters.push({ Name: 'name', Values: [`*${q}*`] });
-      const out = await client.send(new DescribeImagesCommand({ Owners: ['amazon','099720109477','309956199498'], Filters: filters }));
-      if (out?.Images?.length > 0) {
-        const images = out.Images.filter(i => i.ImageId && i.Name)
-          .sort((a,b) => new Date(b.CreationDate) - new Date(a.CreationDate)).slice(0, limit)
-          .map(i => ({ id: i.ImageId, name: i.Name, desc: i.Description || '', owner: i.OwnerId, created: i.CreationDate }));
-        return res.json({ region, query: q, count: images.length, images, source: 'aws-live' });
+
+      // FIX-2: when no search query is given, apply a name-pattern filter so
+      // AWS returns only the well-known distro families instead of tens of
+      // thousands of marketplace/community images that are useless noise.
+      // When the user types a query, use their term instead.
+      if (q) {
+        filters.push({ Name: 'name', Values: [`*${q}*`] });
+      } else {
+        filters.push({
+          Name: 'name',
+          Values: [
+            'al2023-ami-*',          // Amazon Linux 2023
+            'amzn2-ami-hvm-*',       // Amazon Linux 2
+            'ubuntu/images/hvm-ssd/ubuntu-*',   // Ubuntu (Canonical)
+            'ubuntu/images/hvm-ssd-gp3/ubuntu-*',
+            'RHEL-*',                // Red Hat
+            'debian-*',              // Debian
+            'Windows_Server-*',      // Windows
+            'suse-sles-*',           // SUSE
+          ],
+        });
       }
-    } catch (_) { /* fall through */ }
+
+      // FIX-3: paginate through all result pages so we are not silently
+      // capped at whatever the SDK returns on the first response (~1000 max
+      // per page from AWS). Collect up to `limit` images across all pages.
+      let allImages = [];
+      let nextToken;
+      do {
+        const cmd = new DescribeImagesCommand({
+          Owners: ['amazon', '099720109477', '309956199498'], // amazon, Canonical, Red Hat
+          Filters: filters,
+          ...(nextToken ? { NextToken: nextToken } : {}),
+        });
+        const out = await client.send(cmd);
+        const page = (out.Images || []).filter(i => i.ImageId && i.Name);
+        allImages = allImages.concat(page);
+        nextToken = out.NextToken;
+        // Stop paginating once we have enough candidates to sort and slice from
+      } while (nextToken && allImages.length < limit * 4);
+
+      if (allImages.length > 0) {
+        const images = allImages
+          .sort((a, b) => new Date(b.CreationDate) - new Date(a.CreationDate))
+          .slice(0, limit)
+          .map(i => ({ id: i.ImageId, name: i.Name, desc: i.Description || '', owner: i.OwnerId, created: i.CreationDate }));
+        return res.json({ region, query: q, count: images.length, total_found: allImages.length, images, source: 'aws' });
+      }
+    } catch (err) {
+      // Log the real error so it's visible in backend logs, then fall through to curated list
+      console.error('[AMI] DescribeImages failed:', err?.message || err);
+    }
   }
 
   let images = CURATED_AMIS[region] || DEFAULT_AMIS;
