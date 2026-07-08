@@ -13,7 +13,7 @@
     "pg": "^8.11.3",
     "@aws-sdk/client-ec2": "^3.476.0",
     "@aws-sdk/client-sts": "^3.476.0",
-    "uuid": "^9.0.0",
+    "uuid": "^14.0.1",
     "winston": "^3.11.0",
     "express-rate-limit": "^7.1.5",
     "bcryptjs": "^2.4.3",
@@ -22,8 +22,10 @@
     "ioredis": "^5.3.2",
     "ws": "^8.16.0",
     "cookie-parser": "^1.4.6",
-    "nodemailer": "^6.9.13",
-    "ipaddr.js": "^2.4.0"
+    "nodemailer": "^9.0.3",
+    "ipaddr.js": "^2.4.0",
+    "helmet": "^8.1.0",
+    "google-auth-library": "^10.9.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

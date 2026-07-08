@@ -9,6 +9,7 @@ const { stripHtml, detectSecrets, detectDangerousConstructs, lintNetworkRules, h
 const { authMiddleware, optionalAuth } = require('../middleware/auth');
 const { audit, attachAuditResponseHook } = require('../middleware/audit');
 const db = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { enqueue, getJobStatus } = require('../services/jobQueue');
 const { dispatchAndPersist } = require('../services/terraformJobs');
 const { authoriseProjectById, UUID_RE } = require('../utils/projectAccess');
@@ -172,7 +173,7 @@ router.post('/fmt', authMiddleware, terraformComputeLimiter, audit('terraform.fm
     const result = await runFmt(hcl, null, mode);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform fmt failed');
   }
 });
 
@@ -208,7 +209,7 @@ router.post('/validate', authMiddleware, terraformComputeLimiter, audit('terrafo
     // poll GET /api/terraform/jobs/:jobId for the result.
     return res.status(202).json({ jobId, status: 'queued' });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform validate failed');
   }
 });
 
@@ -229,7 +230,7 @@ router.post('/suggest', optionalAuth, audit('terraform.suggest'), async (req, re
       },
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to generate suggestions');
   }
 });
 
@@ -295,24 +296,31 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
     }
     return res.status(202).json({ jobId, status: 'queued' });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform plan failed');
   }
 });
 
 // ── POST /api/terraform/cost ─────────────────────────────────────
-router.post('/cost', optionalAuth, async (req, res) => {
+// SECURITY FIX (H-02): was optionalAuth with no dedicated rate limiter —
+// unlike /fmt and /validate, an anonymous caller could repeatedly trigger
+// Infracost subprocess spawns to exhaust host CPU. Now matches the
+// authMiddleware + terraformComputeLimiter treatment already given to /fmt.
+router.post('/cost', authMiddleware, terraformComputeLimiter, audit('terraform.cost'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
   try {
     const result = await runInfracost(hcl);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Cost estimation failed');
   }
 });
 
 // ── POST /api/terraform/scan ─────────────────────────────────────
-router.post('/scan', optionalAuth, async (req, res) => {
+// SECURITY FIX (H-02): was optionalAuth with no dedicated rate limiter —
+// an anonymous caller could repeatedly trigger Checkov Docker container
+// spawns to exhaust host CPU/memory. Now matches /fmt's treatment.
+router.post('/scan', authMiddleware, terraformComputeLimiter, audit('terraform.scan'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
   try {
@@ -322,13 +330,16 @@ router.post('/scan', optionalAuth, async (req, res) => {
     ]);
     res.json({ checkov, networkWarnings });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Security scan failed');
   }
 });
 
 
 // ── POST /api/terraform/init ──────────────────────────────────────────────────
-router.post('/init', optionalAuth, audit('terraform.init'), async (req, res) => {
+// SECURITY FIX (H-02): was optionalAuth with no dedicated rate limiter — same
+// unauthenticated Docker-spawn DoS vector as /cost and /scan above. Now
+// matches /fmt's treatment.
+router.post('/init', authMiddleware, terraformComputeLimiter, audit('terraform.init'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
   const mode = readRunnerMode(req);
@@ -336,7 +347,7 @@ router.post('/init', optionalAuth, audit('terraform.init'), async (req, res) => 
     const result = await runInit(hcl, null, mode);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform init failed');
   }
 });
 
@@ -419,7 +430,7 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
       wsUrl: `/ws/jobs?id=${jobId}`,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform apply failed');
   }
 });
 
@@ -453,7 +464,7 @@ router.get('/jobs/:jobId', authMiddleware, async (req, res) => {
     }
     res.json(row.rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch job status');
   }
 });
 
@@ -498,7 +509,7 @@ router.get('/jobs', authMiddleware, async (req, res) => {
     );
     res.json({ jobs: rows.rows, total: rows.rows.length });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch jobs');
   }
 });
 

@@ -152,10 +152,21 @@ CREATE INDEX IF NOT EXISTS idx_exec_jobs_status  ON execution_jobs(status);
 -- on project_versions as a DB-level duplicate-version safety net (BUG-007 fix). migrate.sql
 -- previously omitted this, so databases migrated from an older schema had no constraint and
 -- were vulnerable to race-condition duplicate version_numbers under high concurrency.
+--
+-- FIX (found during Round-3 audit verification, no ID assigned in the source report — flagged
+-- here as it blocks C-13's fix from ever running on a fresh deployment): schema.sql runs before
+-- this file on every fresh deployment and already creates this exact constraint via a DO block
+-- that catches BOTH `duplicate_table OR duplicate_object`. This block only caught
+-- `duplicate_object` — but re-adding a UNIQUE constraint whose name collides with an existing
+-- one raises `duplicate_table` (42P07, the implicit backing index's name collides), NOT
+-- `duplicate_object` (42710). Verified live: this uncaught exception aborted psql with
+-- ON_ERROR_STOP=1, which (per docker-entrypoint.sh's `set -Eeo pipefail`) aborts the ENTIRE
+-- docker-entrypoint-initdb.d sequence — every fresh `docker-compose up` from a clean volume
+-- would fail database initialization entirely, silently skipping every script after this one.
 DO $$ BEGIN
   ALTER TABLE project_versions
     ADD CONSTRAINT uq_project_version UNIQUE (project_id, version_number);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL; END $$;
 
 -- FIX: password-reset columns (Phase-5).  Without these, the UPDATE in
 -- POST /api/auth/forgot-password executes as a silent zero-row no-op and

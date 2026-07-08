@@ -16,6 +16,42 @@ const logger = winston.createLogger({
 
 const isDev = (process.env.NODE_ENV || 'development') !== 'production';
 
+// SECURITY FIX (M-01): neither the backend nor nginx set any HTTP security
+// headers previously — no CSP, no X-Frame-Options/frame-ancestors, no HSTS,
+// no Referrer-Policy. helmet() adds sane defaults for all of those; CSP is
+// tuned below for what this app actually needs (Monaco Editor's tokenizer
+// workers load via blob: URLs, and the CRA build injects the app's own
+// inline runtime chunk hash — everything else stays locked to 'self').
+// This is defense-in-depth alongside the equivalent nginx `add_header`
+// directives (see frontend/nginx.conf) — the two are redundant on purpose:
+// nginx protects static/SPA responses, helmet protects the API responses
+// nginx proxies straight through.
+const helmet = require('helmet');
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc: ["'self'"],
+      // Monaco's syntax highlighting/language workers are spun up from
+      // blob: URLs generated at runtime by monaco-editor's AMD loader.
+      workerSrc: ["'self'", 'blob:'],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"], // Monaco injects <style> tags for themes
+      imgSrc: ["'self'", 'data:', 'https:'],   // OAuth avatar_url values (Google/GitHub CDNs)
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'", 'data:'],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"], // clickjacking protection (belt-and-suspenders with X-Frame-Options)
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+    },
+  },
+  // Backend is not the TLS terminator here (nginx/ALB is) — still safe to
+  // send HSTS; browsers only honour it once they've seen it over HTTPS.
+  hsts: { maxAge: 15552000, includeSubDomains: true },
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // API is called cross-origin by the frontend
+}));
+
 // CORS: use a strict whitelist. In dev we allow common local origins including
 // localhost:3000 and the host IP used in your environment. Set `CORS_ORIGIN`
 // in `backend/.env` to a comma-separated list of allowed origins in production.
@@ -761,6 +797,27 @@ server.listen(PORT, HOST, () => {
         // the UPDATE in POST /api/auth/forgot-password silently touches 0 rows.
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT',
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMP',
+        // SECURITY FIX (C-13): oauth_provider/oauth_subject/display_name/
+        // avatar_url/last_login_at were previously defined ONLY in migration
+        // 011, which never actually ran against the shipped Postgres image
+        // (see database/Dockerfile + CHANGELOG). Every "Sign in with Google/
+        // GitHub" attempt failed with a masked "column does not exist" error.
+        // Re-asserting them here means the backend self-heals this on every
+        // restart, independent of which migration mechanism the operator
+        // actually runs — see also database/012_security_hardening_c11_c13.sql
+        // and database/Dockerfile for the belt-and-suspenders fixes.
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_provider VARCHAR(50)',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_subject TEXT',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMP',
+        // SECURITY FIX (C-12): email verification gate — see backend/routes/auth.js
+        // (POST /register, GET /verify-email) and backend/routes/oauth.js
+        // (upsertOAuthUser only auto-links by email when email_verified=true).
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_token TEXT',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_token_expires_at TIMESTAMP',
       ];
       for (const sql of alterStatements) {
         await db.query(sql).catch(() => {});
@@ -784,9 +841,51 @@ server.listen(PORT, HOST, () => {
         'CREATE INDEX IF NOT EXISTS idx_project_versions_project ON project_versions(project_id)',
         // FIX: partial index for reset-token lookups (sparse column, WHERE avoids indexing NULLs)
         'CREATE INDEX IF NOT EXISTS idx_users_reset_token ON users(reset_token) WHERE reset_token IS NOT NULL',
+        // SECURITY FIX (C-13 / C-12): supporting indexes for the OAuth and
+        // email-verification columns added above.
+        'CREATE INDEX IF NOT EXISTS idx_users_oauth ON users(oauth_provider, oauth_subject) WHERE oauth_provider IS NOT NULL',
+        'CREATE INDEX IF NOT EXISTS idx_users_email_verify_token ON users(email_verify_token) WHERE email_verify_token IS NOT NULL',
       ];
       for (const sql of indexes) {
         await db.query(sql).catch(() => {});
+      }
+
+      // SECURITY FIX (C-13): one user per (oauth_provider, oauth_subject) —
+      // without this, upsertOAuthUser()'s "check by subject" fast path can
+      // race under concurrent first-time OAuth logins from the same provider
+      // account and create duplicate rows.
+      await db.query(
+        'ALTER TABLE users ADD CONSTRAINT uq_oauth_provider_subject UNIQUE (oauth_provider, oauth_subject)'
+      ).catch(() => {}); // no-op if it already exists
+
+      // SECURITY FIX (C-12): grandfather every account that existed BEFORE
+      // email-verification was enforced, so upgrading an existing deployment
+      // doesn't silently lock current users out of OAuth auto-linking
+      // (upsertOAuthUser requires email_verified=true to link-by-email — see
+      // routes/oauth.js). This must run ONLY ONCE — not on every restart, or
+      // it would grandfather (and thus silently un-gate) every brand-new
+      // unverified registration too, defeating the point of C-12 on every
+      // subsequent deploy. Guarded by a row in schema_migrations (the same
+      // table migrate.js uses) so it is safe to leave in autoMigrate()
+      // permanently without re-running.
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version    VARCHAR(255) PRIMARY KEY,
+          filename   TEXT NOT NULL,
+          applied_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+      `).catch(() => {});
+      const backfillMarker = 'auto_012_email_verified_backfill';
+      const alreadyBackfilled = await db.query(
+        'SELECT 1 FROM schema_migrations WHERE version = $1', [backfillMarker]
+      ).catch(() => ({ rows: [] }));
+      if (!alreadyBackfilled.rows.length) {
+        await db.query('UPDATE users SET email_verified = true WHERE email_verified = false')
+          .catch((e) => logger.warn('C-12 one-time email_verified backfill failed:', e.message));
+        await db.query(
+          'INSERT INTO schema_migrations (version, filename) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [backfillMarker, '(autoMigrate one-time backfill, not a file)']
+        ).catch(() => {});
       }
 
       // ── Phase 2-5 table auto-creation ──────────────────────────────────────

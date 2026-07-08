@@ -14,6 +14,7 @@
  */
 const router = require('express').Router();
 const db     = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { authMiddleware, requireRole } = require('../middleware/auth');
 const https  = require('https');
 const http   = require('http');
@@ -80,7 +81,7 @@ router.get('/', async (req, res) => {
     `, params);
     res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch notifications');
   }
 });
 
@@ -93,7 +94,7 @@ router.get('/unread-count', async (req, res) => {
     );
     res.json({ count: parseInt(rows[0].count, 10) });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch unread count');
   }
 });
 
@@ -107,7 +108,7 @@ router.post('/:id/read', async (req, res) => {
     );
     res.json({ marked: rowCount > 0 });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to mark notification as read');
   }
 });
 
@@ -120,7 +121,7 @@ router.post('/read-all', async (req, res) => {
     );
     res.json({ marked: rowCount });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to mark notifications as read');
   }
 });
 
@@ -131,7 +132,7 @@ router.delete('/:id', async (req, res) => {
     await db.query('DELETE FROM notifications WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
     res.json({ deleted: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to delete notification');
   }
 });
 
@@ -160,7 +161,7 @@ router.get('/preferences', async (req, res) => {
     delete pref.webhook_secret;
     res.json(pref);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch notification preferences');
   }
 });
 
@@ -200,7 +201,7 @@ router.put('/preferences', async (req, res) => {
     delete pref.webhook_secret;
     res.json(pref);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to update notification preferences');
   }
 });
 
@@ -318,6 +319,12 @@ router.post('/webhook-test', webhookTestLimiter, async (req, res) => {
     response.on('error', () => finish(200, { success: true, status: response.statusCode }));
     response.on('close', () => finish(200, { success: true, status: response.statusCode }));
   });
+  // NOTE (H-04 scope): unlike every other e.message occurrence fixed in this
+  // pass, this one is intentionally left as-is. err here is a Node
+  // http/https client connection error (ECONNREFUSED, ETIMEDOUT, etc.) about
+  // a URL the caller themselves configured as their own webhook target — it
+  // is diagnostic feedback about their own external endpoint, not internal
+  // TFGen/DB detail, so surfacing it is the whole point of this test button.
   reqOut.on('error', (err) => {
     finish(400, { success: false, error: err.message });
   });

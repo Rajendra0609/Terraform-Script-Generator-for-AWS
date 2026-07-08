@@ -19,8 +19,9 @@
  */
 const router   = require('express').Router();
 const db       = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { authMiddleware, requireRole } = require('../middleware/auth');
-const { audit } = require('../middleware/audit');
+const { audit, attachAuditResponseHook } = require('../middleware/audit');
 const { authoriseProject } = require('../utils/projectAccess');
 const { notifyProjectMembers } = require('../services/notify');
 const { sendChangeRequestSubmitted } = require('../services/mailer');
@@ -75,6 +76,10 @@ async function ensureTables() {
 ensureTables();
 
 router.use(authMiddleware);
+// SECURITY FIX (H-01): audit() calls below were a silent no-op without this —
+// the entire change-request approve/reject/merge/withdraw governance
+// workflow had no audit trail at all.
+router.use(attachAuditResponseHook);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const CR_SELECT = `
@@ -131,7 +136,7 @@ router.get('/', requireRole('user'), async (req, res) => {
     );
     res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch change requests');
   }
 });
 
@@ -151,7 +156,7 @@ router.get('/project/:projectId', async (req, res) => {
     );
     res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch change requests');
   }
 });
 
@@ -179,7 +184,7 @@ router.get('/:id', async (req, res) => {
 
     res.json(cr);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch change request');
   }
 });
 
@@ -248,7 +253,7 @@ router.post('/', requireRole('user'), audit('change_request.create'), async (req
 
     res.status(201).json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to create change request');
   }
 });
 
@@ -294,7 +299,7 @@ router.post('/:id/approve', requireRole('deployer'), audit('change_request.appro
 
     res.json(await loadCR(req.params.id));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to approve change request');
   }
 });
 
@@ -337,7 +342,7 @@ router.post('/:id/reject', requireRole('deployer'), audit('change_request.reject
 
     res.json(await loadCR(req.params.id));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to reject change request');
   }
 });
 
@@ -357,7 +362,7 @@ router.post('/:id/merge', requireRole('deployer'), audit('change_request.merge')
     }
     res.json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to merge change request');
   }
 });
 
@@ -378,7 +383,7 @@ router.delete('/:id', audit('change_request.withdraw'), async (req, res) => {
     await db.query('DELETE FROM change_requests WHERE id = $1', [req.params.id]);
     res.json({ withdrawn: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to delete change request');
   }
 });
 
@@ -395,7 +400,7 @@ router.get('/:id/comments', async (req, res) => {
     `, [req.params.id]);
     res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch comments');
   }
 });
 
@@ -416,7 +421,7 @@ router.post('/:id/comments', requireRole('user'), async (req, res) => {
 
     res.status(201).json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to add comment');
   }
 });
 
