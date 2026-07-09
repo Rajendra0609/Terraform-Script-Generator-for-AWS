@@ -6,7 +6,7 @@
  *
  * Infracost docs: https://www.infracost.io/docs/
  */
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { isDockerAvailable } = require('../utils/dockerAvailable');
 const { SCRATCH_MOUNT, SCRATCH_VOLUME_ARGS_RO, ensureScratchDir } = require('../utils/dockerScratch');
+const { writeEnvFile } = require('../utils/dockerEnvFile');
 
 const INFRACOST_IMAGE   = process.env.INFRACOST_IMAGE   || 'infracost/infracost:latest';
 const INFRACOST_API_KEY = process.env.INFRACOST_API_KEY || '';
@@ -259,21 +260,49 @@ async function runInfracost(hcl) {
   ensureScratchDir(workDir);
   fs.writeFileSync(path.join(workDir, 'main.tf'), hcl, 'utf8');
 
-  const dockerCmd = [
-    'docker run --rm',
-    '--network=bridge --memory=256m --cpus=0.5',
-    '-e', `INFRACOST_API_KEY=${INFRACOST_API_KEY}`,
+  // SECURITY FIX (M-07): INFRACOST_API_KEY used to be interpolated straight
+  // into a `-e KEY=VALUE` CLI argument on a joined shell command string —
+  // visible to any local user/process via `ps auxww` / `/proc/<pid>/
+  // cmdline` for the whole life of this process (and, as a shell string,
+  // one extra unnecessary risk surface on top of that). It's now written to
+  // a 0600 temp file and passed via --env-file, and the command is run
+  // through spawn() with an argv array instead of a shell string.
+  const envFile = writeEnvFile({ INFRACOST_API_KEY });
+
+  const args = [
+    'run', '--rm',
+    '--network=bridge', '--memory=256m', '--cpus=0.5',
+    ...envFile.dockerArgs,
     // SECURITY FIX: shared named volume, not a broken host-path bind mount
     // (see utils/dockerScratch.js).
     ...SCRATCH_VOLUME_ARGS_RO,
     INFRACOST_IMAGE,
     'breakdown', '--path', workDir,
     '--format', 'json', '--no-cache',
-  ].join(' ');
+  ];
 
   return new Promise(resolve => {
-    exec(dockerCmd, { timeout: 60000 }, (_, stdout, stderr) => {
+    let stdout = '', stderr = '';
+    const finish = (result) => {
+      envFile.cleanup();
       cleanup(workDir);
+      resolve(result);
+    };
+
+    let proc;
+    try {
+      proc = spawn('docker', args);
+    } catch (err) {
+      finish({ ...estimateStatic(hcl), offline: true });
+      return;
+    }
+
+    proc.stdout.on('data', d => { stdout += d; });
+    proc.stderr.on('data', d => { stderr += d; });
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); }, 60000);
+
+    proc.on('close', () => {
+      clearTimeout(timer);
       try {
         const data = JSON.parse(stdout);
         const projects = data.projects || [];
@@ -286,11 +315,16 @@ async function runInfracost(hcl) {
             items.push({ resource: res.name, monthly_usd: Math.round(cost * 100) / 100 });
           }
         }
-        resolve({ engine: 'infracost', total_monthly_usd: Math.round(total * 100) / 100, items });
+        finish({ engine: 'infracost', total_monthly_usd: Math.round(total * 100) / 100, items });
       } catch (_) {
         console.warn('[infracost] Could not parse Infracost JSON, falling back to static estimates');
-        resolve({ ...estimateStatic(hcl), offline: true });
+        finish({ ...estimateStatic(hcl), offline: true });
       }
+    });
+    proc.on('error', () => {
+      clearTimeout(timer);
+      console.warn('[infracost] docker spawn error, falling back to static estimates');
+      finish({ ...estimateStatic(hcl), offline: true });
     });
   });
 }

@@ -76,11 +76,24 @@ class ChunkErrorBoundary extends Component {
   }
 }
 
-/** Redirect unauthenticated users to /login. Shows nothing while auth state loads. */
-function ProtectedRoute({ children }) {
-  const { isAuthenticated, loading } = useAuth();
+/**
+ * Redirect unauthenticated users to /login. Shows nothing while auth state
+ * loads. If `requiredRole` is given, users authenticated but lacking that
+ * role are redirected to /dashboard instead of rendering the page.
+ *
+ * SECURITY FIX (L-01): previously accepted no role at all, so any
+ * logged-in non-admin could navigate straight to /admin and the AdminPanel
+ * shell would attempt to mount (every /api/admin/* call it makes still
+ * correctly gets a 403 from requireRole('admin') server-side — no data was
+ * ever actually exposed — but the route revealed the admin panel's
+ * structure to any authenticated user and rendered a broken-looking UI
+ * instead of a clean redirect).
+ */
+function ProtectedRoute({ children, requiredRole }) {
+  const { isAuthenticated, loading, user } = useAuth();
   if (loading) return null;
   if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (requiredRole && user?.role !== requiredRole) return <Navigate to="/dashboard" replace />;
   return children;
 }
 
@@ -105,7 +118,7 @@ function AppContent() {
             <Route path="/history" element={<ProtectedRoute><History /></ProtectedRoute>} />
             <Route path="/history/:projectId" element={<ProtectedRoute><History /></ProtectedRoute>} />
             <Route path="/studio" element={<ProtectedRoute><Studio /></ProtectedRoute>} />
-            <Route path="/admin" element={<ProtectedRoute><AdminPanel /></ProtectedRoute>} />
+            <Route path="/admin" element={<ProtectedRoute requiredRole="admin"><AdminPanel /></ProtectedRoute>} />
             <Route path="/team" element={<ProtectedRoute><Team /></ProtectedRoute>} />
             <Route path="/team/:projectId" element={<ProtectedRoute><Team /></ProtectedRoute>} />
           </Routes>

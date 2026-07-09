@@ -641,9 +641,23 @@ export default function Studio() {
       } catch (_) {}
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       lspRef.current.open = false;
       lspRef.current.ws   = null;
+      // BUG FIX: code 4001 means the backend confirmed terraform-ls isn't
+      // installed / TF_LSP_PATH is wrong (see terraformLsp.js's
+      // _handleSpawnError/_onProcessError) — every retry would fail with
+      // the exact same ENOENT, so retrying is pure wasted time. Previously
+      // this went through the same 5x exponential-backoff loop as any other
+      // disconnect (~60s of "offline (retry N/5...)" before finally landing
+      // on the real message), which could easily look like the status was
+      // stuck/not updating if you weren't watching it the whole time.
+      if (ev.code === 4001) {
+        lspRef.current.retryCount = 0;
+        if (lspRef.current.retryTimer) clearTimeout(lspRef.current.retryTimer);
+        setLspStatus('offline — terraform-ls not installed (see Output panel for install steps)');
+        return;
+      }
       if (lspRef.current.retryCount < 5) {
         const delay = lspRef.current.retryDelay;
         lspRef.current.retryDelay   = Math.min(delay * 2, 30000);

@@ -2,6 +2,8 @@ import React, { useEffect, useState, useMemo, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { projectsAPI } from '../api/client';
 import { useTheme } from '../contexts/ThemeContext';
+import { useAuth } from '../contexts/AuthContext';
+import { getLastProjectId } from '../utils/lastProjectStorage';
 
 // ─── Lightweight Myers diff (line-level) ──────────────────────────────────────
 function computeDiff(aText, bText) {
@@ -251,18 +253,17 @@ export default function History() {
   const { projectId: _urlProjectId } = useParams();
   const nav = useNavigate();
   const { c } = useTheme();
+  const { user } = useAuth();
 
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   // If no projectId in the URL (e.g. navigated from the Navbar before a project
   // was opened), fall back to the last active project stored by the Builder.
+  // Namespaced per-user (L-04 fix) so this doesn't fall back to another
+  // account's last-project id on a shared browser.
   const projectId = (() => {
     if (_urlProjectId && UUID_RE.test(_urlProjectId)) return _urlProjectId;
-    try {
-      const stored = localStorage.getItem('tfgen.lastProjectId');
-      if (stored && UUID_RE.test(stored)) return stored;
-    } catch {}
-    return null;
+    return getLastProjectId(user?.id);
   })();
 
   const [versions, setVersions]     = useState([]);

@@ -21,6 +21,7 @@ const path = require('path');
 const os   = require('os');
 const { v4: uuidv4 } = require('uuid');
 const { SCRATCH_MOUNT, SCRATCH_VOLUME_ARGS, ensureScratchDir } = require('../utils/dockerScratch');
+const { writeEnvFile } = require('../utils/dockerEnvFile');
 
 // ─── Workspace directories ────────────────────────────────────────────────────
 // SECURITY FIX: these used to live under os.tmpdir() (e.g. /tmp/tfgen-...),
@@ -35,6 +36,32 @@ const PLUGIN_CACHE = path.join(SCRATCH_MOUNT, 'terraform-plugin-cache');
 
 // BUG-011 fix: pin the Terraform image by immutable digest so that the binary
 // cannot change silently between server restarts.
+//
+// SECURITY FIX (L-06): this exact digest could not be confirmed against the
+// real hashicorp/terraform registry manifest during the original security
+// review — the review environment's network egress didn't reach Docker
+// Hub's registry API, so an invalid/stale pin here could silently break
+// every Docker-fallback Terraform operation with a pull error. Since Docker
+// fallback is more central than it looks (Checkov/Infracost have NO
+// local-binary alternative at all — see checkov.js/infracost.js — so a bad
+// pin breaks security scanning and cost estimation too, not just
+// `terraform` itself), this is now verified two ways instead of trusted
+// blindly:
+//   1. At server startup — see server.js's verifyTerraformDockerImage(),
+//      which calls utils/dockerAvailable.js's verifyDockerImage() and logs a
+//      loud, actionable warning (not a crash) if the pin doesn't resolve.
+//   2. In CI — scripts/verify-docker-images.sh runs the same check where
+//      network egress to Docker Hub is actually available, and fails the
+//      build on a bad pin instead of only discovering it in production.
+//
+// Process note for whoever next bumps this: always derive a fresh digest
+// from `docker pull hashicorp/terraform:<version>` (not by hand-editing the
+// hex), and record the human-readable tag it came from right here so the
+// next bump doesn't hit this same "unverifiable in isolation" problem:
+//   Pinned from tag: (unknown — not recorded when this digest was
+//   originally introduced; TF_DOCKER_IMAGE_TAG_HINT below is a placeholder
+//   until the next bump re-derives it properly).
+const TF_DOCKER_IMAGE_TAG_HINT = process.env.TF_DOCKER_IMAGE_TAG_HINT || 'unknown — see comment above';
 const TF_DOCKER_IMAGE = process.env.TF_DOCKER_IMAGE ||
   'hashicorp/terraform@sha256:1a8d5d7c0c2e52434f9a11a5bcd7f9cf1a5eab72c67fd9f2cd1be2f2b87ee41e';
 
@@ -113,10 +140,20 @@ function writeProviderOverride(workDir, hcl) {
 
 /**
  * Execute a shell command cross-platform.
+ *
+ * SECURITY/CORRECTNESS FIX (L-11): this used to rely on Node's exec()
+ * default maxBuffer (1 MB). crossExecStreaming() below (used only for
+ * apply) already explicitly sets 20 MB, but every OTHER call in this file —
+ * init, validate, and plan, all of which can emit a large `-json` payload
+ * for a sizable stack — went through this function with no override, so a
+ * verbose plan could fail with ERR_CHILD_PROCESS_STDIO_MAXBUFFER instead of
+ * returning a normal result. Defaulting it here (still overridable via
+ * opts) fixes every current call site in one place instead of needing the
+ * same options object repeated at each one.
  */
 function crossExec(cmd, opts = {}) {
   return new Promise(resolve => {
-    const execOpts = { timeout: opts.timeout || 120000, ...opts };
+    const execOpts = { timeout: opts.timeout || 120000, maxBuffer: 1024 * 1024 * 20, ...opts };
     if (IS_WINDOWS) execOpts.shell = 'cmd.exe';
     exec(cmd, execOpts, (err, stdout, stderr) => {
       resolve({ err, stdout: stdout || '', stderr: stderr || '' });
@@ -239,19 +276,39 @@ function runInDocker(workDir, tfArgs, opts = {}) {
     '-e', 'TF_INPUT=false',
     '-e', 'TF_CLI_ARGS_init=-backend=false',
   ];
-  for (const [k, v] of Object.entries(extraEnv)) {
-    args.push('-e', `${k}=${v}`);
+
+  // SECURITY FIX (M-07): extraEnv carries secrets (AWS_SECRET_ACCESS_KEY,
+  // AWS_SESSION_TOKEN) for real-credential plan/apply runs. These must never
+  // land on `docker`'s own argv (visible via `ps auxww` / `/proc/<pid>/
+  // cmdline` for the whole life of this process) — write them to a 0600
+  // temp file instead and pass it via --env-file, which Docker reads
+  // without ever exposing the values as a process argument.
+  let envFile = null;
+  if (Object.keys(extraEnv).length > 0) {
+    envFile = writeEnvFile(extraEnv);
+    args.push(...envFile.dockerArgs);
   }
+
   args.push('-w', workDir, TF_DOCKER_IMAGE, ...tfArgs);
 
   return new Promise(resolve => {
     let stdout = '', stderr = '';
-    const proc = spawn('docker', args);
+    const finish = (result) => {
+      if (envFile) envFile.cleanup();
+      resolve(result);
+    };
+    let proc;
+    try {
+      proc = spawn('docker', args);
+    } catch (err) {
+      finish({ code: -1, stdout: '', stderr: err.message });
+      return;
+    }
     proc.stdout.on('data', d => { stdout += d; if (logFn) logFn({ stream: 'stdout', line: d.toString() }); });
     proc.stderr.on('data', d => { stderr += d; if (logFn) logFn({ stream: 'stderr', line: d.toString() }); });
-    const timer = setTimeout(() => { proc.kill('SIGKILL'); resolve({ code: -1, stdout, stderr: 'Timeout exceeded' }); }, timeout);
-    proc.on('close', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
-    proc.on('error', err => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: err.message }); });
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); finish({ code: -1, stdout, stderr: 'Timeout exceeded' }); }, timeout);
+    proc.on('close', code => { clearTimeout(timer); finish({ code, stdout, stderr }); });
+    proc.on('error', err => { clearTimeout(timer); finish({ code: -1, stdout, stderr: err.message }); });
   });
 }
 
@@ -708,4 +765,4 @@ async function runApply(hcl, logFn, awsCredentials, mode = 'auto') {
   return { success: false, message: 'Terraform not available locally or via Docker. Install from https://developer.hashicorp.com/terraform/install', offline: true, resource_changes: [], runner: 'none' };
 }
 
-module.exports = { runFmt, runValidate, runPlan, runInit, runApply };
+module.exports = { runFmt, runValidate, runPlan, runInit, runApply, TF_DOCKER_IMAGE, TF_DOCKER_IMAGE_TAG_HINT };

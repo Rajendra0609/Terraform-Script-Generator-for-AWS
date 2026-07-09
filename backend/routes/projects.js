@@ -242,7 +242,7 @@ router.post('/', authMiddleware, requireRole('user'), audit('project.create'), a
 
 // ─── Update project ───────────────────────────────────────────────────────────
 router.put('/:id', authMiddleware, audit('project.update'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   const { name, description, aws_region, environment, backend_config } = req.body;
   // BE-07 fix: validate required fields — mirrors the validation already present on POST /
@@ -301,7 +301,7 @@ router.delete('/:id', authMiddleware, audit('project.delete'), async (req, res) 
 
 // ─── Save resources ───────────────────────────────────────────────────────────
 router.post('/:id/resources', authMiddleware, audit('project.resources.save'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
 
   const { resources, full_hcl } = req.body;
@@ -544,7 +544,7 @@ router.get('/:id/versions', authMiddleware, async (req, res) => {
 
 // ─── Save version snapshot ────────────────────────────────────────────────────
 router.post('/:id/versions', authMiddleware, audit('project.version.save'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   const { full_hcl, resource_count, cost_estimate_usd, checkov_passed, checkov_failed, change_summary } = req.body;
   try {
@@ -625,7 +625,7 @@ router.get('/:id/members', authMiddleware, async (req, res) => {
 });
 
 router.post('/:id/members', authMiddleware, requireRole('user'), audit('project.member.invite'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   if (project.user_id !== req.user.id && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Only the project owner or admin can invite members' });
@@ -677,7 +677,7 @@ router.delete('/:id/members/:userId', authMiddleware, audit('project.member.remo
     } catch (e) { return handleDbError(e, res, 'Failed to remove member'); }
   }
 
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   if (project.user_id !== req.user.id && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Only the project owner or admin can remove members' });

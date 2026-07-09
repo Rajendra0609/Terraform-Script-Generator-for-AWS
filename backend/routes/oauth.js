@@ -47,6 +47,7 @@
 const router   = require('express').Router();
 const https    = require('https');
 const crypto   = require('crypto');
+const Redis    = require('ioredis');
 const db       = require('../db/connection');
 const { setRefreshCookie, issueTokens } = require('./auth');
 
@@ -58,20 +59,76 @@ function generateState() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
-// In-process nonce store (use Redis for multi-instance deployments)
-const _stateStore = new Map();
-const STATE_TTL   = 10 * 60 * 1000; // 10 minutes
+// ── CSRF-state store ──────────────────────────────────────────────────────────
+// SECURITY FIX (M-05): this used to be a plain in-process Map, which breaks
+// under horizontal scaling — a user's /google redirect handled by instance A
+// and /google/callback landing on instance B (no session affinity) would
+// fail with "Invalid or expired OAuth state" every time. Redis is already a
+// hard dependency of this deployment (BullMQ — see services/jobQueue.js), so
+// state is now stored there with a TTL instead of introducing new infra.
+//
+// A single-instance, in-process Map is kept as a fallback for local dev
+// without Redis running. It is NOT sufficient once there is more than one
+// backend replica — if Redis is unreachable in a scaled deployment, OAuth
+// logins will intermittently fail exactly as described in M-05.
+const REDIS_URL         = process.env.REDIS_URL || 'redis://localhost:6379';
+const STATE_TTL_SECONDS = 10 * 60; // 10 minutes
+const STATE_TTL_MS      = STATE_TTL_SECONDS * 1000;
 
-function storeState(state) {
-  _stateStore.set(state, Date.now() + STATE_TTL);
-  // Prune expired states (lazy GC)
+let _redisClient = null;
+function getRedisClient() {
+  if (_redisClient) return _redisClient;
+  _redisClient = new Redis(REDIS_URL, {
+    lazyConnect: true,
+    maxRetriesPerRequest: 1,
+    retryStrategy: (times) => Math.min(times * 200, 2000),
+  });
+  _redisClient.on('error', (err) => {
+    console.warn('[oauth] Redis state-store error (falling back to in-process store):', err.message);
+  });
+  return _redisClient;
+}
+
+async function ensureConnected(client) {
+  if (client.status === 'wait' || client.status === 'end') {
+    await client.connect();
+  }
+}
+
+// In-process fallback store — dev-without-Redis only, see note above.
+const _stateStore = new Map();
+function pruneLocalStore() {
   if (_stateStore.size > 500) {
     const now = Date.now();
     for (const [k, v] of _stateStore) { if (v < now) _stateStore.delete(k); }
   }
 }
 
-function consumeState(state) {
+async function storeState(state) {
+  try {
+    const client = getRedisClient();
+    await ensureConnected(client);
+    await client.set(`oauth:state:${state}`, '1', 'EX', STATE_TTL_SECONDS);
+    return;
+  } catch (err) {
+    console.warn('[oauth] storeState: Redis unavailable, using in-process fallback:', err.message);
+  }
+  _stateStore.set(state, Date.now() + STATE_TTL_MS);
+  pruneLocalStore();
+}
+
+async function consumeState(state) {
+  if (!state) return false;
+  try {
+    const client = getRedisClient();
+    await ensureConnected(client);
+    // GETDEL is atomic (read + delete in one round trip) so the same state
+    // value can never be replayed even under concurrent callback requests.
+    const val = await client.getdel(`oauth:state:${state}`);
+    return val !== null;
+  } catch (err) {
+    console.warn('[oauth] consumeState: Redis unavailable, using in-process fallback:', err.message);
+  }
   const exp = _stateStore.get(state);
   if (!exp) return false;
   _stateStore.delete(state);
@@ -192,7 +249,7 @@ function getGoogleOAuthClient() {
   return _googleOAuthClient;
 }
 
-router.get('/google', (req, res) => {
+router.get('/google', async (req, res) => {
   if (!GOOGLE_CLIENT_ID) {
     return res.status(501).json({
       error: 'Google OAuth not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in backend/.env',
@@ -200,7 +257,7 @@ router.get('/google', (req, res) => {
     });
   }
   const state = generateState();
-  storeState(state);
+  await storeState(state);
 
   const params = new URLSearchParams({
     client_id:     GOOGLE_CLIENT_ID,
@@ -219,7 +276,7 @@ router.get('/google/callback', async (req, res) => {
   const { code, state, error: oauthError } = req.query;
 
   if (oauthError) return issueTokensAndRedirect(res, null, oauthError);
-  if (!consumeState(state)) return issueTokensAndRedirect(res, null, 'Invalid or expired OAuth state');
+  if (!(await consumeState(state))) return issueTokensAndRedirect(res, null, 'Invalid or expired OAuth state');
 
   try {
     // Exchange code for tokens
@@ -275,7 +332,7 @@ const GITHUB_CLIENT_ID     = process.env.GITHUB_CLIENT_ID;
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
 const GITHUB_REDIRECT_URI  = `${OAUTH_REDIRECT_BASE}/api/auth/oauth/github/callback`;
 
-router.get('/github', (req, res) => {
+router.get('/github', async (req, res) => {
   if (!GITHUB_CLIENT_ID) {
     return res.status(501).json({
       error: 'GitHub OAuth not configured. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in backend/.env',
@@ -283,7 +340,7 @@ router.get('/github', (req, res) => {
     });
   }
   const state = generateState();
-  storeState(state);
+  await storeState(state);
 
   const params = new URLSearchParams({
     client_id:    GITHUB_CLIENT_ID,
@@ -299,7 +356,7 @@ router.get('/github/callback', async (req, res) => {
   const { code, state, error: oauthError } = req.query;
 
   if (oauthError) return issueTokensAndRedirect(res, null, oauthError);
-  if (!consumeState(state)) return issueTokensAndRedirect(res, null, 'Invalid or expired OAuth state');
+  if (!(await consumeState(state))) return issueTokensAndRedirect(res, null, 'Invalid or expired OAuth state');
 
   try {
     // Exchange code for access token

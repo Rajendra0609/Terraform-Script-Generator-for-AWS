@@ -25,7 +25,8 @@
     "nodemailer": "^9.0.3",
     "ipaddr.js": "^2.4.0",
     "helmet": "^8.1.0",
-    "google-auth-library": "^10.9.0"
+    "google-auth-library": "^10.9.0",
+    "jsdom": "^25.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

@@ -6,6 +6,16 @@
  * "does this user own/belong to this project, with at least role X"
  * (terraform.js /apply, future policy/admin routes, etc.) uses the exact
  * same logic instead of re-implementing project_members lookups.
+ *
+ * SECURITY FIX (L-02): the default `allowedRoles` list here, and several
+ * call sites that copy-pasted it (routes/terraform.js, routes/projects.js),
+ * used to include a stray 'user' role. project_members.role never actually
+ * takes that value in practice — POST /:id/members (the only endpoint that
+ * ever assigns it) restricts new members to 'viewer' | 'editor' |
+ * 'deployer' — so this was dead code today, but it's the kind of copy-paste
+ * that becomes a real privilege-escalation path the moment that allowlist
+ * is loosened without every one of these call sites being revisited. All
+ * occurrences were audited and cleaned up together.
  */
 const db = require('../db/connection');
 
@@ -23,7 +33,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *   sufficient for this action. The project owner always has access
  *   regardless of this list.
  */
-async function authoriseProject(req, res, allowedRoles = ['viewer', 'editor', 'deployer', 'admin', 'user']) {
+async function authoriseProject(req, res, allowedRoles = ['viewer', 'editor', 'deployer', 'admin']) {
   const { id } = req.params;
   const userId  = req.user?.id;
 
@@ -60,7 +70,7 @@ async function authoriseProject(req, res, allowedRoles = ['viewer', 'editor', 'd
  * the request body instead of the URL params (e.g. POST /api/terraform/apply
  * where the HCL + project_id are both in the body).
  */
-async function authoriseProjectById(req, res, projectId, allowedRoles = ['viewer', 'editor', 'deployer', 'admin', 'user']) {
+async function authoriseProjectById(req, res, projectId, allowedRoles = ['viewer', 'editor', 'deployer', 'admin']) {
   const fakeReq = { ...req, params: { ...req.params, id: projectId } };
   return authoriseProject(fakeReq, res, allowedRoles);
 }

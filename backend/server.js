@@ -52,11 +52,21 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' }, // API is called cross-origin by the frontend
 }));
 
-// CORS: use a strict whitelist. In dev we allow common local origins including
-// localhost:3000 and the host IP used in your environment. Set `CORS_ORIGIN`
-// in `backend/.env` to a comma-separated list of allowed origins in production.
+// CORS: use a strict whitelist. Set `CORS_ORIGIN` in `backend/.env` to a
+// comma-separated list of allowed origins for your environment/deployment
+// (e.g. your dev machine's LAN IP, or your production domain).
+//
+// SECURITY FIX (L-08): the dev fallback used to include a specific
+// internal-looking IP address (10.244.24.67) baked directly into source —
+// environment-specific and meaningless (or actively misleading/wrong) on
+// anyone else's machine, plus the same class of issue as the public IP
+// that used to be hardcoded in docker-compose.yml (see C-05). No
+// environment-specific IPs ship in source defaults now — only localhost,
+// which is the one origin that's actually valid on every machine. Anything
+// else (a LAN IP for testing from another device, a real domain in
+// production) must be set explicitly via CORS_ORIGIN.
 const cors = require('cors');
-const defaultDevOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://10.244.24.67:3000'];
+const defaultDevOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000'];
 const allowedOrigins = (process.env.CORS_ORIGIN || defaultDevOrigins.join(',')).split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
@@ -299,7 +309,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: message });
 });
 
-// Troubleshooting note: "Cannot reach backend at http://10.244.24.67:4000"
+// Troubleshooting note: "Cannot reach backend at http://<your-host-ip>:4000"
 // If the backend process is running but the frontend (browser) still reports
 // that it cannot reach the backend, common causes include:
 // - Frontend still using an old environment/build: Create-react-app reads
@@ -327,7 +337,7 @@ app.use((err, req, res, next) => {
 // the backend may be hosted):
 // From Windows PowerShell / CMD:
 //   curl -v http://localhost:4000/api/health
-//   curl -v http://10.244.24.67:4000/api/health
+//   curl -v http://<your-host-ip>:4000/api/health
 //   netstat -an | findstr :4000
 //   Test-NetConnection -ComputerName localhost -Port 4000
 // From WSL / Linux:
@@ -352,10 +362,10 @@ const PORT = process.env.PORT || 4000;
 const HOST = process.env.HOST || '0.0.0.0';
 
 // NOTE: If `ss -tlnp` / `netstat` shows the server listening on a specific
-// IP (e.g. `10.244.24.67:4000`) rather than `0.0.0.0:4000`, the Node process is
+// IP (e.g. `<your-host-ip>:4000`) rather than `0.0.0.0:4000`, the Node process is
 // bound to a single interface. In that case the browser on the host may not be
 // able to reach that internal/container IP and you'll see the frontend error
-// "Cannot reach backend at http://10.244.24.67:4000" even though the server
+// "Cannot reach backend at http://<your-host-ip>:4000" even though the server
 // process is running. Common causes and quick remedies:
 //  - The server was started before `.env` was changed; restart the backend so
 //    it picks up `HOST=0.0.0.0`.
@@ -577,6 +587,31 @@ server.listen(PORT, HOST, () => {
   if (!process.env.TF_LSP_PATH) {
     logger.warn('TF_LSP_PATH is not set in the loaded environment. Please ensure backend/.env is loaded by this process.');
   }
+
+  // ── Verify the pinned Terraform Docker image digest (L-06 fix) ─────────────
+  // Only meaningful if Docker is actually available — if it isn't, the
+  // 'local' binary path is what's in play and this pin is irrelevant. Never
+  // blocks startup: this is a loud warning, not a crash, since the app is
+  // still fully usable via the local-binary path even if the Docker image
+  // pin is stale. See runner.js's TF_DOCKER_IMAGE comment and
+  // scripts/verify-docker-images.sh for the CI-side half of this fix.
+  (async function verifyTerraformDockerImage() {
+    try {
+      const { isDockerAvailable, verifyDockerImage } = require('./utils/dockerAvailable');
+      if (!(await isDockerAvailable())) return;
+      const { TF_DOCKER_IMAGE, TF_DOCKER_IMAGE_TAG_HINT } = require('./terraform/runner');
+      const result = await verifyDockerImage(TF_DOCKER_IMAGE);
+      if (result.ok) {
+        logger.info(`✅ Terraform Docker image verified: ${TF_DOCKER_IMAGE} (tag: ${TF_DOCKER_IMAGE_TAG_HINT})`);
+      } else {
+        logger.warn(`⚠️  TF_DOCKER_IMAGE does not resolve against its registry: ${TF_DOCKER_IMAGE}`);
+        logger.warn('   Docker-fallback terraform/checkov/infracost operations will fail until this is fixed.');
+        logger.warn(`   Detail: ${result.error}`);
+      }
+    } catch (_) {
+      // Best-effort — never let this check block or crash startup.
+    }
+  })();
 
   // ── Auto-migration: ensure all required tables and columns exist ───────────
   // This runs at startup and silently creates anything missing. Safe to run

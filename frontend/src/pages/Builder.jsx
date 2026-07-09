@@ -33,6 +33,8 @@ import ModuleRegistry from '../components/ModuleRegistry';
 import MultiEnvPanel from '../components/MultiEnvPanel';
 import BackendGenerator from '../components/BackendGenerator';
 import TerragruntPanel from '../components/TerragruntPanel';
+import { useAuth } from '../contexts/AuthContext';
+import { setLastProjectId } from '../utils/lastProjectStorage';
 
 // --- Category colors (light-mode friendly) -----------------------------------
 const CAT_COLOR = {
@@ -351,6 +353,7 @@ export default function Builder() {
     ? _rawProjectId
     : undefined;
   const nav           = useNavigate();
+  const { user }      = useAuth();
   const { toasts, show } = useToast();
   const { c } = useTheme();
   const showRef = useRef(show);
@@ -466,8 +469,10 @@ export default function Builder() {
   // -- Load project -------------------------------------------------------------
   useEffect(() => {
     if (!projectId || !services.length) return;
-    // Persist so the Navbar History link can navigate directly to this project's history.
-    try { localStorage.setItem('tfgen.lastProjectId', projectId); } catch {}
+    // Persist so the Navbar History link can navigate directly to this
+    // project's history. Namespaced per-user (L-04 fix) so this doesn't
+    // leak another account's last-project id on a shared browser.
+    setLastProjectId(user?.id, projectId);
     projectsAPI.get(projectId).then(r => {
       setProject(r.data);
       if (r.data.resources?.length) {
@@ -505,7 +510,7 @@ export default function Builder() {
         setFullHCL(sanitizeHcl(r.data.last_hcl));
       }
     }).catch(() => showRef.current('Project not found', 'error'));
-  }, [projectId, services]);
+  }, [projectId, services, user?.id]);
 
   // -- Rebuild HCL --------------------------------------------------------------
   const rebuildHCL = useCallback((res, vars, outs) => {

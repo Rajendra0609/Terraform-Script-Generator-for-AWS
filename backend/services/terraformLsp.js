@@ -160,7 +160,17 @@ class TerraformLspSession {
       : `Failed to start terraform-ls: ${err.message}`;
     this.logger.error(`[terraform-lsp] ${hint}`);
     this._sendClientError(hint);
-    this.dispose();
+    // BUG FIX: terraform-ls has no Docker fallback (unlike plan/apply/
+    // validate/fmt in terraform/runner.js) — if the binary genuinely isn't
+    // installed, every retry will fail with the exact same ENOENT, so the
+    // frontend's 5x exponential-backoff retry loop (up to ~60s) was pure
+    // wasted time producing a string of "offline (retry N/5...)" messages
+    // before finally landing on the real, actionable message. Closing with
+    // this dedicated code lets the frontend show the actionable message
+    // immediately and skip straight past the retry loop for this
+    // specifically unrecoverable case (see useJobStream-style handling in
+    // Studio.jsx's ws.onclose).
+    this.dispose(err.code === 'ENOENT' ? 4001 : undefined);
   }
 
   _onProcessError(err) {
@@ -171,10 +181,11 @@ class TerraformLspSession {
         `and set TF_LSP_PATH=/full/path/to/terraform-ls in backend/.env`;
       this.logger.error(`[terraform-lsp] ${hint}`);
       this._sendClientError(hint);
-    } else {
-      this.logger.error(`[terraform-lsp] process error: ${err.message}`);
-      this._sendClientError(err.message);
+      this.dispose(4001);
+      return;
     }
+    this.logger.error(`[terraform-lsp] process error: ${err.message}`);
+    this._sendClientError(err.message);
     this.dispose();
   }
 
@@ -322,11 +333,11 @@ class TerraformLspSession {
     }));
   }
 
-  dispose() {
+  dispose(closeCode) {
     if (!this.alive) return;
     this.alive = false;
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    try { this.ws.close(); }                                         catch (_) {}
+    try { closeCode ? this.ws.close(closeCode) : this.ws.close(); } catch (_) {}
     try { if (this.process && !this.process.killed) this.process.kill('SIGKILL'); } catch (_) {}
     cleanupDir(this.workspaceDir);
   }

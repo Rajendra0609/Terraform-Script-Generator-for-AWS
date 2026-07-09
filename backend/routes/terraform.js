@@ -276,7 +276,7 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
         error: 'project_id is required to plan with real AWS credentials.',
       });
     }
-    const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin', 'user']);
+    const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin']);
     if (!project) return; // authoriseProjectById already sent 403/404
     useRealCredentials = true;
   }
@@ -382,7 +382,15 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
   }
 
   // Role check — only deployer / owner may apply
-  const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin', 'user']);
+  // SECURITY FIX (L-02): this list used to include 'user' too, which is
+  // backwards from ROLE_LEVELS (user=1 ranks below editor=2) and contradicts
+  // the comment above ("'editor' can plan but not apply") — editor wasn't
+  // even in the list. Currently dead code (no endpoint ever assigns
+  // project_members.role='user' — POST /:id/members only allows 'viewer',
+  // 'editor', 'deployer'), but removed so it can't become a live
+  // privilege-escalation path if that invite-role allowlist is ever
+  // loosened later without this file being revisited.
+  const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin']);
   if (!project) return; // authoriseProjectById already sent 403/404
 
   // Credential check — must have saved real AWS credentials.

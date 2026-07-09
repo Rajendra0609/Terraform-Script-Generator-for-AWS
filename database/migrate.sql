@@ -93,7 +93,12 @@ CREATE INDEX IF NOT EXISTS idx_project_members_user    ON project_members(user_i
 CREATE TABLE IF NOT EXISTS user_aws_credentials (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id         UUID REFERENCES users(id) ON DELETE CASCADE UNIQUE,
-  aws_region      VARCHAR(50)  NOT NULL DEFAULT 'ap-south-1',
+  -- SECURITY FIX (M-09): no hardcoded region default — a raw SQL file can't
+  -- read a runtime .env, so a literal default silently pointed every row
+  -- bootstrapped from this file at 'ap-south-1' regardless of the deploying
+  -- user's actual region. NOT NULL is kept so a missing region fails loudly
+  -- at INSERT time; backend/routes/aws.js always supplies it explicitly.
+  aws_region      VARCHAR(50)  NOT NULL,
   access_key_id   TEXT         NOT NULL,
   secret_key_enc  TEXT         NOT NULL,
   label           VARCHAR(255) DEFAULT 'My AWS Account',

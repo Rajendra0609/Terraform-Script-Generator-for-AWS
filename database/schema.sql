@@ -28,7 +28,14 @@ CREATE TABLE IF NOT EXISTS projects (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name        VARCHAR(255) NOT NULL,
   description TEXT,
-  aws_region  VARCHAR(50) DEFAULT 'ap-south-1',
+  -- SECURITY FIX (M-09): no hardcoded region default here — a raw SQL file
+  -- can't read a runtime .env, so a literal default silently pointed every
+  -- project bootstrapped straight from this file (bypassing the JS
+  -- autoMigrate() path, which already reads DEFAULT_AWS_REGION) at
+  -- 'ap-south-1' regardless of the deploying user's actual region.
+  -- Application code (backend/routes/projects.js) always supplies
+  -- aws_region explicitly on INSERT.
+  aws_region  VARCHAR(50),
   environment VARCHAR(50) DEFAULT 'dev',
   backend_config JSONB DEFAULT '{}',
   created_at  TIMESTAMP DEFAULT NOW(),
@@ -301,7 +308,11 @@ $$;
 CREATE TABLE IF NOT EXISTS user_aws_credentials (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id         UUID REFERENCES users(id) ON DELETE CASCADE UNIQUE,
-  aws_region      VARCHAR(50)  NOT NULL DEFAULT 'ap-south-1',
+  -- SECURITY FIX (M-09): no hardcoded region default — see the projects
+  -- table comment above. NOT NULL is kept so a missing region fails loudly
+  -- at INSERT time instead of silently defaulting to the wrong region.
+  -- backend/routes/aws.js always supplies aws_region explicitly.
+  aws_region      VARCHAR(50)  NOT NULL,
   access_key_id   TEXT         NOT NULL,  -- stored as-is; encrypt in application layer
   secret_key_enc  TEXT         NOT NULL,  -- AES-256-GCM encrypted secret
   label           VARCHAR(255) DEFAULT 'My AWS Account',

@@ -92,7 +92,16 @@ function signRefreshToken(payload) {
  * the HTTP auth path.
  */
 function verifyAccessToken(token) {
-  const payload = jwt.verify(token, JWT_SECRET);
+  // SECURITY FIX (L-09): explicitly restrict accepted signing algorithms.
+  // jsonwebtoken v9's own defaults are reasonable, but not passing this
+  // explicitly relies on that default holding forever — standard
+  // defense-in-depth against algorithm-confusion attacks (e.g. a token
+  // crafted with alg:"none", or an RS256-signed token where the attacker
+  // supplies the public key as an HMAC secret) is to pin the allow-list
+  // here rather than trust the library default alone. Tokens are always
+  // signed with HS256 (see signAccessToken() above), so that's the only
+  // algorithm ever accepted.
+  const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
   return { id: payload.id, email: payload.email, role: payload.role || 'user' };
 }
 

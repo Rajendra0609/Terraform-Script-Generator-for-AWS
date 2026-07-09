@@ -67,6 +67,16 @@ export function useJobStream(jobId) {
 
     let ws;
     let settled = false;
+    // SECURITY/CORRECTNESS FIX (L-03): `ws.onclose` used to check the
+    // `status` state variable directly, but that closure is created once
+    // when this effect runs (deps: [jobId]) and never sees later
+    // setStatus(...) calls from onmessage — so the check inside onclose was
+    // effectively always comparing against status's pre-connection value,
+    // silently reducing the guard to just `ev.code !== 1000`. A ref is
+    // mutable and read fresh on every access, so onclose always sees
+    // whether onmessage's `done` branch already ran, no closure staleness
+    // possible.
+    const finishedRef = { current: false };
 
     try {
       ws = jobsAPI.connectWs(jobId);
@@ -101,6 +111,7 @@ export function useJobStream(jobId) {
         } else if (msg.type === 'done') {
           const r = msg.result || {};
           const succeeded = r.success !== false && r.valid !== false && !r.blocked;
+          finishedRef.current = true;
           setStatus(succeeded ? 'succeeded' : 'failed');
           if (r.error || r.message) setError(r.error || r.message);
           setResult(r);
@@ -125,8 +136,11 @@ export function useJobStream(jobId) {
     ws.onclose = (ev) => {
       clearTimeout(connectTimeout);
       // Code 1000 = normal close from server after `done`; anything else
-      // that isn't already settled means WS dropped mid-stream.
-      if (ev.code !== 1000 && status !== 'succeeded' && status !== 'failed') {
+      // that isn't already settled means WS dropped mid-stream. Checking
+      // finishedRef (always current) instead of `status` (stale closure)
+      // means a clean close after a `done` event correctly skips the
+      // needless fallback poll.
+      if (ev.code !== 1000 && !finishedRef.current) {
         startPolling(jobId);
       }
     };

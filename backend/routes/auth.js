@@ -11,6 +11,7 @@ const {
 } = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const { sendPasswordReset, sendVerificationEmail } = require('../services/mailer');
+const { validatePassword } = require('../utils/passwordPolicy');
 
 // SECURITY FIX (C-11): arbitrary fixed key for the Postgres advisory lock
 // that serialises the register endpoint's count-check + insert sequence.
@@ -52,6 +53,13 @@ router.post('/register', async (req, res) => {
   if (password.length < PASSWORD_MIN_LENGTH) {
     return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters` });
   }
+  // SECURITY FIX (L-07): length alone let through trivially guessable
+  // passwords ("password1", "12345678", ...). validatePassword() adds a
+  // modest complexity backstop plus an HIBP breached-password check (see
+  // utils/passwordPolicy.js — fails open on network error, never blocks
+  // registration because a third-party API is unreachable).
+  const passwordError = await validatePassword(password);
+  if (passwordError) return res.status(400).json({ error: passwordError });
   try {
     const salt = await bcrypt.genSalt(12);
     const password_hash = await bcrypt.hash(password, salt);
@@ -211,7 +219,10 @@ router.post('/refresh', async (req, res) => {
   const refreshToken = req.cookies?.refreshToken;
   if (!refreshToken) return res.status(400).json({ error: 'Refresh token required' });
   try {
-    const payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+    // SECURITY FIX (L-09): explicit algorithms allow-list — same rationale
+    // as verifyAccessToken() in middleware/auth.js. Refresh tokens are
+    // always signed HS256 (see signRefreshToken()).
+    const payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET, { algorithms: ['HS256'] });
     const tokenHash = hashToken(refreshToken);
     const stored = await db.query(
       `SELECT * FROM refresh_tokens WHERE user_id=$1 AND token_hash=$2 AND revoked=false AND expires_at>NOW()`,
@@ -316,6 +327,10 @@ router.post('/reset-password', async (req, res) => {
   if (password.length < PASSWORD_MIN_LENGTH) {
     return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters` });
   }
+  // SECURITY FIX (L-07): same policy as registration — see the comment
+  // there and utils/passwordPolicy.js.
+  const passwordError = await validatePassword(password);
+  if (passwordError) return res.status(400).json({ error: passwordError });
   try {
     // FIX: compare the hash of the supplied token against the stored hash —
     // never store or compare raw tokens (mirrors the refresh-token pattern).
