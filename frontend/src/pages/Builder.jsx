@@ -9,6 +9,7 @@ import PlanDiffPanel from '../components/PlanDiffPanel';
 import SecurityFindings from '../components/SecurityFindings';
 import CostBadge from '../components/CostBadge';
 import ResourceGraph from '../components/ResourceGraph';
+import ArchitectureDiagram from '../components/ArchitectureDiagram';
 import PresetsPanel from '../components/PresetsPanel';
 import LintPanel from '../components/LintPanel';
 import VariablesEditor from '../components/VariablesEditor';
@@ -1154,6 +1155,7 @@ export default function Builder() {
           <div style={{ display: 'flex', alignItems: 'center', borderBottom: '1px solid #E2E8F0', background: '#F8FAFC', flexShrink: 0 }}>
             <ViewTab id="code"  label="Code"             active={viewMode === 'code'}  onClick={() => setViewMode('code')}  c={c} />
             <ViewTab id="graph" label="Graph"            active={viewMode === 'graph'} onClick={() => setViewMode('graph')} c={c} />
+            <ViewTab id="awsdiagram" label="AWS Diagram"  active={viewMode === 'awsdiagram'} onClick={() => setViewMode('awsdiagram')} c={c} />
             <ViewTab id="vars"  label="Vars & Outputs"   active={viewMode === 'vars'}  onClick={() => setViewMode('vars')}  c={c} />
             <ViewTab id="learn" label={`Learn${activeResource ? ' - ' + (activeResource.label || '').split(' ')[0] : ''}`} active={viewMode === 'learn'} onClick={() => setViewMode('learn')} c={c} badge="✨ AI" />
             <ViewTab id="labs"  label="Labs & Interview" active={viewMode === 'labs'}  onClick={() => setViewMode('labs')}  c={c} />
@@ -1326,6 +1328,13 @@ export default function Builder() {
                   setResources(updated);
                 }}
               />
+            </div>
+          )}
+
+          {/* -- AWS Architecture Diagram view --------------------------------- */}
+          {viewMode === 'awsdiagram' && (
+            <div style={{ flex: 1, overflow: 'hidden', display: 'flex', minHeight: 0 }}>
+              <ArchitectureDiagram c={c} hcl={fullHCL} />
             </div>
           )}
 

@@ -290,6 +290,7 @@ app.use('/api/notifications',   require('./routes/notifications'));   // Phase 4
 app.use('/api/search',          require('./routes/search'));          // Phase 4: global search
 app.use('/api/hcl-explain',     require('./routes/hcl-explain'));     // Phase 4: AI HCL explainer
 app.use('/api/hcl-assist',      require('./routes/hcl-assist'));      // AI HCL writer/editor for Studio
+app.use('/api/diagram',         require('./routes/diagram'));         // AWS architecture diagram generator
 
 // BE-09: return only { status: 'ok' } — no server clock, no fingerprinting surface.
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));

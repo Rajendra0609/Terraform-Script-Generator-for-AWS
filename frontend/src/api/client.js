@@ -263,6 +263,10 @@ export const exportAPI = {
   readme:        (body) => API.post('/api/export/readme', body),
 };
 
+export const diagramAPI = {
+  generate: (body) => API.post('/api/diagram/generate', body),
+};
+
 export const authAPI = {
   login:    (body)  => API.post('/api/auth/login', body),
   register: (body)  => API.post('/api/auth/register', body),
