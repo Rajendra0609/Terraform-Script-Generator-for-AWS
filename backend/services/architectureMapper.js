@@ -18,11 +18,19 @@
  *     subnet-group indirection (RDS/ElastiCache), then a generic deep scan
  *     as a last resort
  *   - connections: explicit reference chains where possible (listener →
- *     target group → attached resource, SG sharing between app/db tiers),
+ *     target group → attached resource; any SG ingress rule that names
+ *     another SG as its source, e.g. bastion → app tier → db tier; each
+ *     public/private subnet's default route to its IGW/NAT Gateway),
  *     falling back to a single labeled "inferred" edge per tier pair when
- *     no explicit reference exists — inferred edges are always marked
- *     style:'dashed' so the diagram is honest about what it actually knows
- *     vs. what it's guessing from tier co-location.
+ *     no explicit reference exists — inferred/implicit edges (including the
+ *     route-table and NAT egress edges) are always marked style:'dashed' so
+ *     the diagram is honest about what it actually knows vs. what it's
+ *     guessing or summarizing from routing/SG configuration.
+ *   - Elastic IPs aren't drawn as their own box (an EIP has no place in the
+ *     VPC tree on its own), but an EIP's association — with a NAT Gateway
+ *     via allocation_id, or an instance via aws_eip.instance /
+ *     aws_eip_association — is surfaced as an "EIP" badge on whichever node
+ *     it's attached to, instead of being silently dropped.
  *
  * Anything the parser can't confidently place lands in `uncategorized`
  * (spec requirement: fallback behavior for unsupported resources).
@@ -589,6 +597,30 @@ function buildArchitectureModel(parsed) {
     }
   });
 
+  // Elastic IPs: not drawn as their own box (a bare EIP has no location in
+  // the VPC tree — it's just an address), but their association is real
+  // topology information, so we badge whichever node they're attached to
+  // (NAT Gateway via allocation_id, or an EC2 instance via aws_eip.instance
+  // / a separate aws_eip_association resource) instead of dropping it.
+  function badgeWithEip(targetKey, eipResource) {
+    const node = nodesById[targetKey];
+    if (node) node.eip = displayNameFor(eipResource);
+  }
+  const eips = resources.filter(r => r.type === 'aws_eip');
+  eips.forEach(eip => {
+    const instRef = firstRef(eip.attrs.instance);
+    if (instRef) badgeWithEip(instRef, eip);
+    natgws.forEach(nat => {
+      if (firstRef(nat.attrs.allocation_id) === eip.key) badgeWithEip(nat.key, eip);
+    });
+  });
+  resources.filter(r => r.type === 'aws_eip_association').forEach(assoc => {
+    const eipRef = firstRef(assoc.attrs.allocation_id);
+    const instRef = firstRef(assoc.attrs.instance_id);
+    const eipRes = eipRef && resourcesByKey[eipRef];
+    if (eipRes && instRef) badgeWithEip(instRef, eipRes);
+  });
+
   // ── Connections ──────────────────────────────────────────────────────────
   const connections = [];
   const seenEdges = new Set();
@@ -675,7 +707,9 @@ function buildArchitectureModel(parsed) {
   // are useless without a listener, so no edge is added (nothing to infer).
   void targetGroups;
 
-  // Private-subnet resources → NAT Gateway (outbound egress)
+  // Private-subnet resources → NAT Gateway (outbound egress via the private
+  // route table's 0.0.0.0/0 → NAT route). Labeled to name the route table
+  // explicitly, since the table itself isn't drawn as its own box.
   Object.values(subnetBuckets).forEach(subnetEntry => {
     if (!subnetEntry.public && subnetEntry.hasNat) {
       const azVpc = Object.values(vpcsByKey).find(v => Object.values(v.azMap).some(az => az.private_subnets.includes(subnetEntry)));
@@ -687,10 +721,65 @@ function buildArchitectureModel(parsed) {
       });
       if (natInSameVpc) {
         const natNode = natInSameVpc[1];
-        subnetEntry.resources.forEach(res => addEdge(res.id, natNode.id, 'Outbound (NAT)', 'dashed'));
+        subnetEntry.resources.forEach(res => addEdge(res.id, natNode.id, 'Private Route Table (0.0.0.0/0 → NAT)', 'dashed'));
       }
       void az;
     }
+  });
+
+  // Public-subnet resources → Internet Gateway (via the public route
+  // table's 0.0.0.0/0 → IGW route). This is the public-side counterpart of
+  // the NAT edge above — without it the IGW was drawn as an orphan box with
+  // no path to anything, which is effectively what prompted this fix.
+  Object.values(vpcsByKey).forEach(vpcEntry => {
+    if (!vpcEntry.igw) return;
+    Object.values(vpcEntry.azMap).forEach(az => {
+      az.public_subnets.forEach(subnetEntry => {
+        subnetEntry.resources.forEach(res => addEdge(res.id, vpcEntry.igw.id, 'Public Route Table (0.0.0.0/0 → IGW)', 'dashed'));
+      });
+    });
+  });
+
+  // Security-group relationship edges — any ingress rule that names another
+  // security group as its source describes an explicit access relationship
+  // between whatever resources attach each SG (bastion SG → app-tier SG for
+  // SSH, app-tier SG → db-tier SG for a DB port, etc). One edge per
+  // (source resource, target resource, rule). This documents what the SGs
+  // actually allow instead of drawing the SG boxes themselves.
+  const sgResourceUsers = {}; // sgKey -> [resourceKey]
+  resources.forEach(r => {
+    for (const field of ['security_groups', 'vpc_security_group_ids', 'security_group_ids']) {
+      if (r.attrs[field]) {
+        extractRefs(r.attrs[field]).forEach(sgRef => {
+          if (!sgResourceUsers[sgRef]) sgResourceUsers[sgRef] = [];
+          sgResourceUsers[sgRef].push(r.key);
+        });
+      }
+    }
+  });
+  function sgRuleLabel(ruleAttrs) {
+    const desc = asString(ruleAttrs.description);
+    const from = asNumber(ruleAttrs.from_port);
+    const to = asNumber(ruleAttrs.to_port);
+    const port = (from !== null && to !== null) ? (from === to ? `${from}` : `${from}-${to}`) : null;
+    if (desc && port) return `${desc} (${port})`;
+    if (desc) return desc;
+    if (port) return `Port ${port}`;
+    return 'Security Group Rule';
+  }
+  securityGroups.forEach(sg => {
+    const targetUsers = (sgResourceUsers[sg.key] || []).filter(k => nodesById[k]);
+    if (!targetUsers.length) return;
+    normalizeBlockList(sg.attrs.ingress).filter(b => b && b.type === 'block').forEach(rule => {
+      const sourceSgRefs = rule.attrs.security_groups ? extractRefs(rule.attrs.security_groups) : [];
+      if (!sourceSgRefs.length) return; // CIDR-based rule, not an SG-to-SG relationship — nothing to draw
+      const label = sgRuleLabel(rule.attrs);
+      sourceSgRefs.forEach(srcSg => {
+        (sgResourceUsers[srcSg] || []).filter(k => nodesById[k]).forEach(srcRes => {
+          targetUsers.forEach(tgtRes => addEdge(srcRes, tgtRes, label));
+        });
+      });
+    });
   });
 
   // Security-group sharing → app tier to database tier
@@ -707,7 +796,7 @@ function buildArchitectureModel(parsed) {
   });
   const dbNodeKeys = Object.entries(nodesById).filter(([, n]) => n.category === 'database').map(([k]) => k);
   const computeNodeKeys = Object.entries(nodesById).filter(([, n]) => n.category === 'compute' && !n.external).map(([k]) => k);
-  let explicitDbEdgeFound = new Set();
+  let explicitDbEdgeFound = new Set(connections.filter(c => dbNodeKeys.includes(c.to)).map(c => c.to));
   dbNodeKeys.forEach(dbKey => {
     const dbResource = resourcesByKey[dbKey];
     const dbSgs = [];

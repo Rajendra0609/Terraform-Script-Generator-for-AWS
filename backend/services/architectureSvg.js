@@ -392,6 +392,12 @@ function renderLeaf(node) {
     out += `<circle cx="${iconX + iconSize + 2}" cy="${iconY - 2}" r="9" fill="#232F3E"/>`;
     out += `<text x="${iconX + iconSize + 2}" y="${iconY + 1.5}" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" fill="#fff">×${r.count}</text>`;
   }
+  if (r.eip) {
+    const bx = iconX + iconSize + 2, by = iconY + iconSize + 4;
+    out += `<title>Elastic IP: ${esc(r.eip)}</title>`;
+    out += `<rect x="${bx - 13}" y="${by - 7}" width="26" height="13" rx="6.5" fill="#0C5A87"/>`;
+    out += `<text x="${bx}" y="${by + 3}" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="8" font-weight="700" fill="#fff">EIP</text>`;
+  }
   const textY = iconY + iconSize + 14;
   lines.forEach((line, idx) => {
     out += `<text x="${node.absX + node.w / 2}" y="${textY + idx * 12}" text-anchor="middle" `
@@ -468,10 +474,17 @@ function renderArchitectureSvg(model) {
 
   resolveAbsolute(cloud, MARGIN, MARGIN + clientLeaf.h + clientGap, absMap);
 
+  // Paint order matters here: SVG elements later in the document sit on
+  // top. Containers (VPC/AZ/subnet boxes) are drawn with opaque fills, so
+  // edges must be painted AFTER them, not before — otherwise every
+  // connection line ends up completely hidden underneath the next
+  // container's background (this was silently swallowing every edge,
+  // including the pre-existing NAT edge, regardless of how many
+  // connections the model computed).
   let body = '';
-  body += renderEdges(model.connections, absMap, absMap.internet);
   body += renderContainer(cloud);
   body += renderLeaf(clientLeaf);
+  body += renderEdges(model.connections, absMap, absMap.internet);
 
   const defs = `<defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">

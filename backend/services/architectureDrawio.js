@@ -86,7 +86,7 @@ function renderArchitectureDrawio(model, categoryColor) {
       const r = node.resource;
       const color = categoryColor[r.category] || '#7D8998';
       cells.push(
-        `<mxCell id="${cellId}" value="${esc(r.name)}${r.count > 1 ? ' (x' + r.count + ')' : ''}" style="${resourceCellStyle(r.kind, color)}" vertex="1" parent="${parentCellId}">`
+        `<mxCell id="${cellId}" value="${esc(r.name)}${r.count > 1 ? ' (x' + r.count + ')' : ''}${r.eip ? ' [EIP: ' + esc(r.eip) + ']' : ''}" style="${resourceCellStyle(r.kind, color)}" vertex="1" parent="${parentCellId}">`
         + `<mxGeometry x="${node.relX.toFixed(1)}" y="${node.relY.toFixed(1)}" width="48" height="48" as="geometry"/></mxCell>`
       );
       resourceCellId[r.id] = cellId;
