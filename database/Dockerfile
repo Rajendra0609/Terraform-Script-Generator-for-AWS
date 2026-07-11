@@ -25,3 +25,9 @@ COPY 010_fix_template_validation.sql /docker-entrypoint-initdb.d/10-fix_template
 COPY 011_phases_2_5_governance_collab_notifications.sql /docker-entrypoint-initdb.d/11-phases_2_5_governance_collab_notifications.sql
 COPY 012_security_hardening_c11_c13.sql /docker-entrypoint-initdb.d/12-security_hardening_c11_c13.sql
 
+# Standalone HEALTHCHECK (docker-compose.yml already defines an equivalent
+# check, which takes precedence there — this makes the image self-checking
+# for anyone running it outside Compose, e.g. `docker run` or Kubernetes).
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=10 \
+  CMD pg_isready -U "${POSTGRES_USER:-tfgen}" -d "${POSTGRES_DB:-terraform_generator}" || exit 1
+

@@ -1,18 +1,102 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Terraform-Script-Generator-for-AWS — CI Pipeline
+//
+// CHANGE LOG (this revision):
+//   • Node/npm/tests now run in a dedicated `node:20-alpine` container that
+//     matches the version pinned in backend/Dockerfile + frontend/Dockerfile,
+//     instead of relying on the Jenkins `tools { nodejs ... }` auto-installer
+//     (removed — it was a second, independently-versioned Node install that
+//     could silently drift from what actually ships in the images).
+//   • Docker images are now built with Kaniko (no Docker daemon / socket
+//     needed on the build agent at all) instead of `docker build && docker
+//     push`, which required a docker.sock the Kubernetes agent pod never
+//     actually had.
+//   • FIXED: 'Backend — tests' ran `npm test` inside source/backend, but
+//     backend/package.json has no "test" script — this stage failed on every
+//     single run. The real test suite lives in source/tests (jest configs +
+//     globalSetup that spawns backend/server.js itself), so tests now run
+//     from there via `npm run test:unit` / `npm run test:api`.
+//   • FIXED: 'Frontend — tests' ran `npm test -- --watchAll=false`, but
+//     frontend/package.json had no "test" script either (fixed alongside
+//     this Jenkinsfile) and there are no *.test.js files under frontend/src
+//     to begin with (they live in source/tests/unit/frontend). Kept as a
+//     harmless forward-compatible placeholder (--passWithNoTests).
+//   • FIXED: 'Database Migrations' ran `npm run migrate` inside
+//     source/database, which has no package.json and no migrate script at
+//     all — always failed. The real migration runner is source/migrate.js
+//     (repo root), which needs `dotenv`/`pg` from backend/node_modules. Also
+//     gated behind an explicit RUN_DB_MIGRATIONS parameter — a prod DB
+//     migration should never fire silently on every CI build.
+//   • FIXED: 'Build Docs' ran `npm run build` inside source/docs, which has
+//     no package.json at all (docs/ is just Markdown + screenshots) —
+//     always failed. Removed; there is nothing to "build" there.
+//   • FIXED: BACKEND_TEST_PORT env var was never read by anything —
+//     tests/setup/globalSetup.js reads TEST_PORT. Renamed to match.
+//   • FIXED: `post { success { ... currentBuild.getBuildCauses()[0].userName
+//     ... } }` had no try/catch, unlike the failure/unstable blocks right
+//     next to it — a build triggered by pollSCM (no `userName` on its
+//     cause) would throw and mask the real success notification.
+//   • FIXED: DOCKER_HUB_CREDENTIALS_ID / GITHUB_CREDENTIALS_ID / GITHUB_REPO
+//     / EMAIL_RECIPIENTS were declared as `parameters` but the `environment`
+//     block hardcoded its own separate literal values instead of reading
+//     them — the parameters were dead. Checkout also hardcoded
+//     credentialsId: 'github' directly, bypassing both. Consolidated to a
+//     single source of truth per value.
+//   • Removed a `stash name: 'source-code'` that was never `unstash`-ed
+//     anywhere (dead step) — everything runs in one pod across containers
+//     that already share the same workspace volume, so it was never needed.
+//   • Added: PUSH_IMAGES flag so this pipeline can do a build-only /
+//     validation run (Kaniko `--no-push`) without touching the registry.
+// ─────────────────────────────────────────────────────────────────────────────
+
 pipeline {
     agent {
         kubernetes {
             label 'kube_m'
+            // Merge with whatever pod template your Jenkins Kubernetes cloud
+            // already has registered under this label (e.g. it may already
+            // provide the jnlp connector image with org-specific tooling —
+            // node_status.sh below assumes it's on PATH in that container).
+            // Remove `inheritFrom` if 'kube_m' does not exist and this should
+            // be a fully self-contained pod instead.
+            inheritFrom 'kube_m'
             defaultContainer 'jnlp'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: node
+      image: node:20-alpine
+      command: ['cat']
+      tty: true
+      resources:
+        requests: { cpu: "500m", memory: "1Gi" }
+        limits:   { cpu: "2",    memory: "4Gi" }
+    - name: gitleaks
+      image: zricethezav/gitleaks:latest
+      command: ['cat']
+      tty: true
+      resources:
+        requests: { cpu: "100m", memory: "256Mi" }
+        limits:   { cpu: "1",    memory: "1Gi" }
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:debug
+      command: ['cat']
+      tty: true
+      resources:
+        requests: { cpu: "500m", memory: "1Gi" }
+        limits:   { cpu: "2",    memory: "4Gi" }
+"""
         }
     }
-    tools {
-        nodejs 'nodejs'
-    }
+
     triggers {
         pollSCM('H/5 * * * *')
     }
+
     options {
-        buildDiscarder(logRotator(numToKeepStr: '1'))
+        buildDiscarder(logRotator(numToKeepStr: '10'))
         disableConcurrentBuilds()
         timeout(time: 1, unit: 'HOURS')
         skipDefaultCheckout()
@@ -24,6 +108,31 @@ pipeline {
         lock(resource: 'prod-deploy')
         checkoutToSubdirectory('source')   // ← entire repo lands at WORKSPACE/source/
     }
+
+    parameters {
+        string(name: 'GIT_BRANCH',                defaultValue: 'docker_test',                                                       description: 'Branch to build')
+        string(name: 'GITHUB_REPO',               defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',                   description: 'GitHub repository (owner/repo)')
+        string(name: 'GIT_CHECKOUT_CREDENTIALS_ID', defaultValue: 'github',                                                          description: 'Credentials ID (username/password or PAT) used to git clone')
+        string(name: 'GITHUB_CREDENTIALS_ID',     defaultValue: 'GITHUB_TOKEN',                                                      description: 'Secret-text credentials ID for GitHub API calls (node status check)')
+
+        string(name: 'DOCKERHUB_NAMESPACE',       defaultValue: 'daggu1997',                                                         description: 'Docker Hub namespace/org images are pushed under')
+        string(name: 'VERSION',                   defaultValue: 'v0.0.1',                                                            description: 'Docker image version tag (matches docker-compose.yml)')
+        string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                                                            description: 'Credentials ID for Docker Hub (username/password)')
+        booleanParam(name: 'PUSH_IMAGES',         defaultValue: true,                                                                description: 'Push built images to Docker Hub. Uncheck for a build-only / PR-validation run (Kaniko --no-push).')
+
+        booleanParam(name: 'RUN_DB_MIGRATIONS',   defaultValue: false,                                                               description: 'Run database/migrate.js against DATABASE_URL. Off by default — this touches a real database; opt in deliberately.')
+
+        string(name: 'EMAIL_RECIPIENTS',          defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated email recipients')
+
+        // Reserved for a downstream deploy job/stage (not implemented in this
+        // Jenkinsfile — this pipeline's job ends at "image pushed to
+        // registry"). Kept so an external deploy trigger can already pass
+        // them in without a parameter-shape change later.
+        string(name: 'TAG',                       defaultValue: 'v0.0.1',                                                            description: '[reserved for downstream deploy] Kubernetes deployment version')
+        string(name: 'K8S_NAMESPACE',             defaultValue: 'default',                                                           description: '[reserved for downstream deploy] Kubernetes namespace')
+        string(name: 'K8S_DEPLOYMENT_NAME',       defaultValue: 'terraform-script-generator',                                        description: '[reserved for downstream deploy] Kubernetes deployment name')
+    }
+
     environment {
         // ── Source folder roots (all relative to WORKSPACE) ───────────────────
         // Repo layout:
@@ -36,30 +145,35 @@ pipeline {
         BACKEND_DIR   = "${WORKSPACE}/source/backend"
         FRONTEND_DIR  = "${WORKSPACE}/source/frontend"
         DATABASE_DIR  = "${WORKSPACE}/source/database"
+        TESTS_DIR     = "${WORKSPACE}/source/tests"
         DOCS_DIR      = "${WORKSPACE}/source/docs"
 
-        // ── Docker / registry ────────────────────────────────────────────────
-        DOCKER_HUB_CREDENTIALS_ID = 'docker'
-        IMAGE_TAG                 = "${params.DOCKERHUBREPO}:${params.VERSION}"
+        // ── Docker / registry — single source of truth is `parameters` above ──
+        DOCKER_HUB_CREDENTIALS_ID = "${params.DOCKER_HUB_CREDENTIALS_ID}"
+        BACKEND_IMAGE             = "${params.DOCKERHUB_NAMESPACE}/tfgen_backend"
+        FRONTEND_IMAGE            = "${params.DOCKERHUB_NAMESPACE}/tfgen_frontend"
+        DATABASE_IMAGE            = "${params.DOCKERHUB_NAMESPACE}/tfgen_postgres"
 
-        // ── GitHub ────────────────────────────────────────────────────────────
-        GITHUB_CREDENTIALS_ID = 'github'
-        GITHUB_REPO           = 'Rajendra0609/Terraform-Script-Generator-for-AWS'
+        // ── GitHub — single source of truth is `parameters` above ─────────────
+        GITHUB_REPO           = "${params.GITHUB_REPO}"
         GITHUB_API_URL        = 'https://api.github.com'
 
         // ── Notifications ─────────────────────────────────────────────────────
-        EMAIL_RECIPIENTS = 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com'
+        EMAIL_RECIPIENTS = "${params.EMAIL_RECIPIENTS}"
 
         // ── Misc ──────────────────────────────────────────────────────────────
         TERM             = 'xterm-256color'
         SCANNER_HOME     = tool 'sonar'
-        BACKEND_TEST_PORT = '4099'
-        FRONTEND_URL      = 'http://localhost:3000'
 
         // ── Node / npm ────────────────────────────────────────────────────────
         NODE_ENV         = 'test'
         CI               = 'true'
         NPM_CONFIG_CACHE = "${WORKSPACE}/.npm-cache"
+
+        // Matches tests/setup/globalSetup.js: `process.env.TEST_PORT || 4099`.
+        // (Previously named BACKEND_TEST_PORT, which nothing ever read.)
+        TEST_PORT    = '4099'
+        FRONTEND_URL = 'http://localhost:3000'
 
         // ── Reports / Playwright ──────────────────────────────────────────────
         REPORT_DIR               = "${WORKSPACE}/tests/reports"
@@ -67,33 +181,18 @@ pipeline {
 
         // ── Test credentials: bound with withCredentials() inside the test   ──
         // ── stage only, NOT here — a missing credential here kills ALL stages ──
-        // ACTION REQUIRED: add these four Secret Text entries in Jenkins before
-        // the Run Tests stage will pass:
-        //   TEST_DATABASE_URL | TEST_REDIS_URL | TFGEN_TEST_JWT_SECRET | TFGEN_TEST_ENCRYPT_KEY
-    }
-    parameters {
-        string(name: 'GIT_BRANCH',                defaultValue: 'docker_test',                                                       description: 'Branch to build')
-        string(name: 'DOCKERHUBREPO',             defaultValue: 'daggu1997/terraform-script-generator',                               description: 'Docker Hub repository')
-        string(name: 'VERSION',                   defaultValue: 'v0.0.1',                                                             description: 'Docker image version tag')
-        string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                                                             description: 'Credentials ID for Docker Hub')
-        string(name: 'GITHUB_CREDENTIALS_ID',    defaultValue: 'GITHUB_TOKEN',                                                              description: 'Credentials ID for GitHub')
-        string(name: 'GITHUB_REPO',              defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',                     description: 'GitHub repository (owner/repo)')
-        string(name: 'TAG',                      defaultValue: 'v0.0.1',                                                              description: 'Kubernetes deployment version')
-        string(name: 'EMAIL_RECIPIENTS',         defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated email recipients')
-        string(name: 'K8S_NAMESPACE',            defaultValue: 'default',                                                             description: 'Kubernetes namespace')
-        string(name: 'K8S_DEPLOYMENT_NAME',      defaultValue: 'terraform-script-generator',                                         description: 'Kubernetes deployment name')
+        // ACTION REQUIRED: add these Secret Text entries in Jenkins before
+        // the Run Tests / Database Migrations stages will pass:
+        //   TEST_DATABASE_URL | TEST_REDIS_URL
+        //   PROD_DATABASE_URL          (only needed if RUN_DB_MIGRATIONS=true)
+        // Note: TFGEN_TEST_JWT_SECRET / TFGEN_TEST_ENCRYPT_KEY are NOT needed —
+        // tests/setup/globalSetup.js hardcodes its own JWT_SECRET/ENCRYPT_KEY
+        // for test isolation regardless of what's in the environment.
     }
 
     stages {
 
         // ── 1. Checkout ───────────────────────────────────────────────────────
-        // After this stage the workspace looks like:
-        //   WORKSPACE/
-        //     source/
-        //       backend/
-        //       database/
-        //       docs/
-        //       frontend/
         stage('Checkout') {
             steps {
                 echo '🔄 Cloning repo into source/'
@@ -102,13 +201,16 @@ pipeline {
                     branches: [[name: "${params.GIT_BRANCH}"]],
                     extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'source']],
                     userRemoteConfigs: [[
-                        url          : 'https://github.com/Rajendra0609/Terraform-Script-Generator-for-AWS.git',
-                        credentialsId: 'github',
+                        url          : "https://github.com/${params.GITHUB_REPO}.git",
+                        credentialsId: "${params.GIT_CHECKOUT_CREDENTIALS_ID}",
                         name         : 'origin'
                     ]]
                 ]
-                dir('source') {
-                    stash name: 'source-code', includes: '**/*'
+                script {
+                    // Short commit SHA for immutable, traceable image tags —
+                    // used alongside the human VERSION tag on every image.
+                    env.GIT_SHA = (env.GIT_COMMIT ?: sh(script: 'cd source && git rev-parse HEAD', returnStdout: true).trim()).take(8)
+                    echo "📌 Building from commit ${env.GIT_SHA}"
                 }
             }
         }
@@ -117,12 +219,14 @@ pipeline {
         stage('Check Node Status') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN'),
-                    usernamePassword(credentialsId: 'docker',
+                    string(credentialsId: "${params.GITHUB_CREDENTIALS_ID}", variable: 'GITHUB_TOKEN'),
+                    usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
                                      usernameVariable: 'DOCKER_USER',
                                      passwordVariable: 'DOCKER_PASS')
                 ]) {
                     script {
+                        // Assumes node_status.sh is baked into the pod's default
+                        // (jnlp) container image, as in the original pipeline.
                         def status = sh(script: 'bash /usr/local/bin/node_status.sh', returnStdout: true).trim()
                         echo "Node Status:\n${status}"
                         if (status.contains("ERROR") || status.contains("DOWN")) {
@@ -135,33 +239,34 @@ pipeline {
 
         // ── 3. Gitleaks Scan ──────────────────────────────────────────────────
         stage('Gitleaks Scan') {
-    steps {
-        dir('source') {
-            echo '🔍 Running Gitleaks secret scan...'
-            script {
-                // Run gitleaks; capture exit code instead of letting Jenkins abort
-                def exitCode = sh(
-                    script: '''
-                        gitleaks detect \
-                            --source . \
-                            --redact \
-                            --report-format=json \
-                            --report-path=../gitleaks-report.json \
-                            --exit-code 1
-                    ''',
-                    returnStatus: true   // ← prevents Jenkins from failing on non-zero
-                )
- 
-                // Print a readable summary from the JSON report
-                def reportFile = new File("${WORKSPACE}/gitleaks-report.json")
-                if (reportFile.exists() && reportFile.text.trim() != 'null') {
-                    def leaks = readJSON file: "${WORKSPACE}/gitleaks-report.json"
-                    if (leaks && leaks.size() > 0) {
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        echo "🚨 Gitleaks found ${leaks.size()} potential secret(s):"
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        leaks.eachWithIndex { leak, i ->
-                            echo """
+            steps {
+                container('gitleaks') {
+                    dir('source') {
+                        echo '🔍 Running Gitleaks secret scan...'
+                        script {
+                            // Run gitleaks; capture exit code instead of letting Jenkins abort
+                            def exitCode = sh(
+                                script: '''
+                                    gitleaks detect \
+                                        --source . \
+                                        --redact \
+                                        --report-format=json \
+                                        --report-path=../gitleaks-report.json \
+                                        --exit-code 1
+                                ''',
+                                returnStatus: true   // ← prevents Jenkins from failing on non-zero
+                            )
+
+                            // Print a readable summary from the JSON report
+                            def reportFile = new File("${WORKSPACE}/gitleaks-report.json")
+                            if (reportFile.exists() && reportFile.text.trim() != 'null') {
+                                def leaks = readJSON file: "${WORKSPACE}/gitleaks-report.json"
+                                if (leaks && leaks.size() > 0) {
+                                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    echo "🚨 Gitleaks found ${leaks.size()} potential secret(s):"
+                                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    leaks.eachWithIndex { leak, i ->
+                                        echo """
 [${i + 1}] Rule      : ${leak.RuleID}
     File      : ${leak.File}
     Line      : ${leak.StartLine}
@@ -169,183 +274,266 @@ pipeline {
     Author    : ${leak.Author}
     Secret    : ${leak.Secret}   ← REDACTED in report (--redact flag is on)
 """
+                                    }
+                                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    echo "ℹ️  False positives? Add them to source/.gitleaksignore"
+                                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                }
+                            }
+
+                            // Fail the build — no secrets allowed to merge. Switch to
+                            // `unstable(...)` here instead if you want a soft warning
+                            // that keeps the pipeline running while the team cleans up.
+                            if (exitCode != 0) {
+                                error("🚨 Gitleaks found secrets in the repo. Fix or allowlist them before merging.")
+                            }
                         }
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        echo "ℹ️  False positives? Add them to source/.gitleaksignore"
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     }
                 }
- 
-                // ── CHOOSE ONE behaviour below ────────────────────────────────
- 
-                // OPTION A (recommended for CI enforcement):
-                // Fail the build — no secrets allowed to merge.
-                if (exitCode != 0) {
-                    error("🚨 Gitleaks found secrets in the repo. Fix or allowlist them before merging.")
-                }
- 
-                // OPTION B (soft warning — build continues, team is alerted):
-                // Uncomment this block and comment out OPTION A above if you
-                // want the pipeline to keep running while you clean up the leaks.
-                // if (exitCode != 0) {
-                //     unstable("⚠️ Gitleaks found ${leaks?.size() ?: 'some'} secret(s). Review gitleaks-report.json.")
-                // }
             }
         }
-    }
-    post {
-        always {
-            // Archive report regardless of pass/fail so it's visible in Jenkins UI
-            archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
-        }
-    }
-}
 
         // ── 4. Install Dependencies ───────────────────────────────────────────
-        // backend and frontend each have their own package.json.
-        // database and docs are included here as examples — remove or adapt
-        // if they don't have a package.json of their own.
+        // backend, frontend, and the root test-suite each have their own
+        // package.json/package-lock.json — install all three up front so the
+        // parallel Run Tests branches below only ever *run* tests, never race
+        // each other re-installing into the same node_modules.
         stage('Install Dependencies') {
-            parallel {
-
-                stage('Backend — npm install') {
-                    steps {
-                        dir('source/backend') {         // → WORKSPACE/source/backend
-                            echo '📦 Installing backend dependencies...'
-                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
+            steps {
+                container('node') {
+                    parallel(
+                        'Backend': {
+                            dir('source/backend') {
+                                echo '📦 Installing backend dependencies...'
+                                sh 'npm ci --cache "${NPM_CONFIG_CACHE}" --no-audit --no-fund'
+                            }
+                        },
+                        'Frontend': {
+                            dir('source/frontend') {
+                                echo '📦 Installing frontend dependencies...'
+                                sh 'npm ci --cache "${NPM_CONFIG_CACHE}" --no-audit --no-fund'
+                            }
+                        },
+                        'Test suite': {
+                            dir('source/tests') {
+                                echo '📦 Installing test-suite dependencies...'
+                                sh 'npm ci --cache "${NPM_CONFIG_CACHE}" --no-audit --no-fund'
+                            }
                         }
-                    }
+                    )
                 }
-
-                stage('Frontend — npm install') {
-                    steps {
-                        dir('source/frontend') {        // → WORKSPACE/source/frontend
-                            echo '📦 Installing frontend dependencies...'
-                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
-                        }
-                    }
-                }
-
-                // Uncomment if database/ has its own package.json or migration runner:
-                // stage('Database — install') {
-                //     steps {
-                //         dir('source/database') {     // → WORKSPACE/source/database
-                //             echo '📦 Installing database tooling...'
-                //             sh 'npm install --cache ${NPM_CONFIG_CACHE}'
-                //         }
-                //     }
-                // }
-
             }
         }
 
         // ── 5. Run Tests ──────────────────────────────────────────────────────
-        // Test credentials are scoped HERE with withCredentials() so that a
-        // missing credential only fails this stage — not the whole pipeline.
+        // FIXED: the real test suite (unit + API) lives in source/tests, not
+        // inside source/backend or source/frontend — those two package.jsons
+        // don't define a working "test" script for it. globalSetup.js spawns
+        // backend/server.js itself, so backend deps must already be installed
+        // (they are, from the previous stage) but backend's own `npm test` is
+        // never invoked directly.
         stage('Run Tests') {
             parallel {
 
-                stage('Backend — tests') {
+                stage('Unit tests (backend + frontend)') {
                     steps {
-                        withCredentials([
-                            string(credentialsId: 'TEST_DATABASE_URL',     variable: 'TEST_DATABASE_URL'),
-                            string(credentialsId: 'TEST_REDIS_URL',        variable: 'TEST_REDIS_URL'),
-                            string(credentialsId: 'TFGEN_TEST_JWT_SECRET', variable: 'JWT_SECRET'),
-                            string(credentialsId: 'TFGEN_TEST_ENCRYPT_KEY', variable: 'ENCRYPT_KEY'),
-                        ]) {
-                            dir('source/backend') {     // → WORKSPACE/source/backend
-                                echo '🧪 Running backend tests...'
-                                sh 'npm test'
+                        container('node') {
+                            dir('source/tests') {
+                                echo '🧪 Running unit tests...'
+                                sh 'npm run test:unit'
                             }
                         }
                     }
                 }
 
-                stage('Frontend — tests') {
+                stage('API tests (backend)') {
                     steps {
-                        dir('source/frontend') {        // → WORKSPACE/source/frontend
-                            echo '🧪 Running frontend tests...'
-                            sh 'npm test -- --watchAll=false'
+                        withCredentials([
+                            string(credentialsId: 'TEST_DATABASE_URL', variable: 'TEST_DATABASE_URL'),
+                            string(credentialsId: 'TEST_REDIS_URL',    variable: 'TEST_REDIS_URL'),
+                        ]) {
+                            container('node') {
+                                dir('source/tests') {
+                                    echo '🧪 Running API tests...'
+                                    sh 'npm run test:api'
+                                }
+                            }
                         }
                     }
                 }
 
+                stage('Frontend — CRA tests') {
+                    steps {
+                        container('node') {
+                            dir('source/frontend') {
+                                echo '🧪 Running frontend tests (placeholder — real frontend unit tests live in source/tests/unit/frontend)...'
+                                sh 'npm test -- --watchAll=false'
+                            }
+                        }
+                    }
+                }
             }
         }
 
         // ── 6. Database Migrations ────────────────────────────────────────────
-        // Example stage showing how to enter source/database independently.
+        // FIXED: this used to `cd source/database && npm run migrate` — that
+        // directory has no package.json at all. The actual migration runner
+        // is source/migrate.js (repo root), which needs `dotenv` + `pg` —
+        // both already installed in backend/node_modules from stage 4, so we
+        // point NODE_PATH there rather than duplicating an install.
+        // Gated behind RUN_DB_MIGRATIONS — never fires silently on a normal
+        // build/test run.
         stage('Database Migrations') {
+            when {
+                expression { return params.RUN_DB_MIGRATIONS }
+            }
+            environment {
+                NODE_PATH = "${env.BACKEND_DIR}/node_modules"
+            }
             steps {
                 withCredentials([
-                    string(credentialsId: 'TEST_DATABASE_URL', variable: 'DATABASE_URL'),
+                    string(credentialsId: 'PROD_DATABASE_URL', variable: 'DATABASE_URL'),
                 ]) {
-                    dir('source/database') {            // → WORKSPACE/source/database
-                        echo '🗄️ Running database migrations...'
-                        sh 'npm run migrate'            // adapt to your migration tool
+                    container('node') {
+                        dir('source') {
+                            echo '🗄️ Running database migrations...'
+                            sh 'node migrate.js'
+                        }
                     }
                 }
             }
         }
 
-        // ── 7. Build Docs ─────────────────────────────────────────────────────
-        stage('Build Docs') {
+        // ── 7. Build & Push Images (Kaniko) ───────────────────────────────────
+        // FIXED/REPLACED: the old stage did `docker login && docker build &&
+        // docker push` on the agent itself, which needs a Docker daemon the
+        // Kubernetes agent pod never had, and it only ever built the backend
+        // image — frontend and database (both also shipped via
+        // docker-compose.yml) were never built or pushed at all. Kaniko
+        // builds all three, from inside its own container, with no
+        // docker.sock / daemon required anywhere.
+        stage('Build & Push Images (Kaniko)') {
             steps {
-                dir('source/docs') {                    // → WORKSPACE/source/docs
-                    echo '📄 Building documentation...'
-                    sh 'npm run build'                  // adapt to your docs tool
-                }
-            }
-        }
+                container('kaniko') {
+                    script {
+                        if (params.PUSH_IMAGES) {
+                            withCredentials([
+                                usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
+                                                 usernameVariable: 'DOCKER_USER',
+                                                 passwordVariable: 'DOCKER_PASS')
+                            ]) {
+                                sh '''
+                                    mkdir -p "${WORKSPACE}/.docker-config"
+                                    AUTH=$(printf '%s:%s' "$DOCKER_USER" "$DOCKER_PASS" | base64 | tr -d '\\n')
+                                    cat > "${WORKSPACE}/.docker-config/config.json" <<EOF
+{"auths":{"https://index.docker.io/v1/":{"auth":"${AUTH}"}}}
+EOF
+                                '''
+                            }
+                        } else {
+                            echo 'ℹ️  PUSH_IMAGES=false — building only (Kaniko --no-push), no registry auth needed.'
+                        }
+                    }
 
-        // ── 8. Docker Build & Push ────────────────────────────────────────────
-        stage('Docker Build & Push') {
-            steps {
-                withCredentials([
-                    usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
-                                     usernameVariable: 'DOCKER_USER',
-                                     passwordVariable: 'DOCKER_PASS')
-                ]) {
-                    dir('source/backend') {             // Dockerfile lives in backend/
-                        echo "🐳 Building image ${env.IMAGE_TAG}..."
-                        sh '''
-                            echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
-                            docker build -t ${IMAGE_TAG} .
-                            docker push ${IMAGE_TAG}
-                        '''
+                    withEnv(["DOCKER_CONFIG=${WORKSPACE}/.docker-config"]) {
+                        script {
+                            def pushFlag = params.PUSH_IMAGES ? '' : '--no-push'
+
+                            parallel(
+                                'backend': {
+                                    echo "🐳 Building ${env.BACKEND_IMAGE}:${params.VERSION}"
+                                    sh """
+                                        /kaniko/executor \
+                                          --context=dir://${env.BACKEND_DIR} \
+                                          --dockerfile=${env.BACKEND_DIR}/Dockerfile \
+                                          --destination=${env.BACKEND_IMAGE}:${params.VERSION} \
+                                          --destination=${env.BACKEND_IMAGE}:${env.GIT_SHA} \
+                                          ${pushFlag} \
+                                          --verbosity=info
+                                    """
+                                },
+                                'frontend': {
+                                    echo "🐳 Building ${env.FRONTEND_IMAGE}:${params.VERSION}"
+                                    sh """
+                                        /kaniko/executor \
+                                          --context=dir://${env.FRONTEND_DIR} \
+                                          --dockerfile=${env.FRONTEND_DIR}/Dockerfile \
+                                          --destination=${env.FRONTEND_IMAGE}:${params.VERSION} \
+                                          --destination=${env.FRONTEND_IMAGE}:${env.GIT_SHA} \
+                                          --build-arg REACT_APP_API_URL= \
+                                          --build-arg REACT_APP_API_URL_LS= \
+                                          ${pushFlag} \
+                                          --verbosity=info
+                                    """
+                                },
+                                'database': {
+                                    echo "🐳 Building ${env.DATABASE_IMAGE}:${params.VERSION}"
+                                    sh """
+                                        /kaniko/executor \
+                                          --context=dir://${env.DATABASE_DIR} \
+                                          --dockerfile=${env.DATABASE_DIR}/Dockerfile \
+                                          --destination=${env.DATABASE_IMAGE}:${params.VERSION} \
+                                          --destination=${env.DATABASE_IMAGE}:${env.GIT_SHA} \
+                                          ${pushFlag} \
+                                          --verbosity=info
+                                    """
+                                }
+                            )
+                        }
                     }
                 }
             }
         }
-
     }
 
     // ── Post Actions ──────────────────────────────────────────────────────────
     post {
-        success {
-            echo '✅ Pipeline completed successfully!'
-            slackSend(
-                channel: '#doc_jen_task_tracker',
-                message: """
-                    ✅ *Pipeline Success*
-                    *Job:* `${env.JOB_NAME}`
-                    *Build #:* `${env.BUILD_NUMBER}`
-                    *Image:* `${env.IMAGE_TAG}`
-                    *Status:* Passed ✅
-                    <${env.BUILD_URL}|View Build Logs>
-                """
-            )
-            mail(
-                to: "${env.EMAIL_RECIPIENTS}",
-                subject: "SUCCESS: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
-                body: """\
-                    The Jenkins Pipeline completed successfully.
+        always {
+            junit allowEmptyResults: true, testResults: 'source/tests/reports/junit-results.xml'
+            archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+            script {
+                try {
+                    cleanWs()
+                    echo '🧹 Workspace cleaned'
+                } catch (Exception e) {
+                    echo "ℹ️ Workspace cleanup skipped: ${e.message}"
+                }
+            }
+        }
 
-                    🐳 Docker Image : ${env.IMAGE_TAG}
-                    🔗 Pipeline URL : ${env.BUILD_URL}
-                    👷 Triggered by : ${currentBuild.getBuildCauses()[0].userName}
-                """
-            )
+        success {
+            script {
+                def culprit = "Unknown"
+                try {
+                    culprit = currentBuild.getBuildCauses()[0].userName
+                } catch (e) {
+                    echo "Could not determine trigger: ${e.message}"
+                }
+                slackSend(
+                    channel: '#doc_jen_task_tracker',
+                    message: """
+                        ✅ *Pipeline Success*
+                        *Job:* `${env.JOB_NAME}`
+                        *Build #:* `${env.BUILD_NUMBER}`
+                        *Images:* `${env.BACKEND_IMAGE}:${params.VERSION}`, `${env.FRONTEND_IMAGE}:${params.VERSION}`, `${env.DATABASE_IMAGE}:${params.VERSION}`
+                        *Status:* Passed ✅
+                        <${env.BUILD_URL}|View Build Logs>
+                    """
+                )
+                mail(
+                    to: "${env.EMAIL_RECIPIENTS}",
+                    subject: "SUCCESS: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
+                    body: """\
+                        The Jenkins Pipeline completed successfully.
+
+                        🐳 Backend  : ${env.BACKEND_IMAGE}:${params.VERSION} (${env.GIT_SHA})
+                        🐳 Frontend : ${env.FRONTEND_IMAGE}:${params.VERSION} (${env.GIT_SHA})
+                        🐳 Database : ${env.DATABASE_IMAGE}:${params.VERSION} (${env.GIT_SHA})
+                        🔗 Pipeline URL : ${env.BUILD_URL}
+                        👷 Triggered by : ${culprit}
+                    """
+                )
+            }
         }
 
         failure {
@@ -431,22 +619,6 @@ pipeline {
                         --------------------------------------------------
                     """
                 )
-            }
-        }
-
-        always {
-            script {
-                try {
-                    sh "docker rmi ${env.IMAGE_TAG} || true"
-                } catch (Exception e) {
-                    echo "ℹ️ Docker image cleanup skipped — no agent context: ${e.message}"
-                }
-                try {
-                    cleanWs()
-                    echo '🧹 Workspace cleaned'
-                } catch (Exception e) {
-                    echo "ℹ️ Workspace cleanup skipped — no agent context: ${e.message}"
-                }
             }
         }
     }

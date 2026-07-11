@@ -5,7 +5,10 @@ WORKDIR /app
 
 # Copy only manifests first so Docker can cache the npm install layer
 COPY package*.json ./
-RUN npm install --verbose
+# PRODUCTION FIX: `npm ci` (not `npm install`) — installs exactly what's
+# pinned in package-lock.json, fails if the lockfile is out of sync with
+# package.json, and is faster/more reproducible in CI than `npm install`.
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # ─── Stage 2: Download Terraform & terraform-ls binaries ──────────────────────
 FROM alpine:3.21 AS tools
@@ -68,7 +71,8 @@ WORKDIR /app
 RUN apk add --no-cache \
       docker-cli \
       ca-certificates \
-      wget
+      wget \
+      tini
 
 # ── Copy Terraform binaries from the tools stage ──────────────────────────────
 COPY --from=tools /usr/local/bin/terraform      /usr/local/bin/terraform
@@ -98,6 +102,15 @@ USER appuser
 
 EXPOSE 4000
 
-# Health-check — pings the /health endpoint (defined in server.js)
+# BUG FIX: this HEALTHCHECK was documented in a comment but never actually
+# written — `docker ps` / orchestrators had no way to detect a hung/crashed
+# Node process short of the container exiting outright. Pings the real
+# /api/health route (see backend/server.js).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -q -O /dev/null --tries=1 http://127.0.0.1:4000/api/health || exit 1
 
+# tini as PID 1 so SIGTERM/SIGINT from `docker stop` / Kubernetes actually
+# reach the Node process (and get forwarded to any children) instead of
+# being swallowed — Node is not a real init system.
+ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "server.js"]

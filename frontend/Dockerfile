@@ -12,7 +12,10 @@ ENV REACT_APP_API_URL_LS=$REACT_APP_API_URL_LS
 
 # Install dependencies first (cached layer)
 COPY package*.json ./
-RUN npm install
+# PRODUCTION FIX: `npm ci` for a reproducible, lockfile-exact install
+# (fails fast if package-lock.json drifts from package.json) instead of
+# `npm install`.
+RUN npm ci --no-audit --no-fund
 
 # Copy source and build
 COPY . .
@@ -43,5 +46,9 @@ USER nginx
 
 EXPOSE 8080
 
+# BUG FIX: no HEALTHCHECK existed at all — orchestrators (Kubernetes,
+# Compose, ECS) had no built-in signal that nginx had actually come up.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://127.0.0.1:8080/index.html || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]
