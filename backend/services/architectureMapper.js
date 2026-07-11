@@ -29,9 +29,12 @@
  */
 
 const { DEFAULT_AWS_REGION } = require('../config/region');
+const { resolveVarLiteral, parseValue } = require('./hclArchParser');
 
 // ── Value helpers (operate on hclArchParser value nodes) ───────────────────
-const AWS_REF_RE = /\baws_[a-zA-Z0-9_]+\.[A-Za-z0-9_-]+/g;
+// Matches `aws_type.name`, plus an optional trailing index/splat/for_each-key
+// suffix (`[0]`, `[*]`, `["key"]`) produced by count/for_each expansion.
+const AWS_REF_RE = /\baws_[a-zA-Z0-9_]+\.[A-Za-z0-9_-]+(?:\[(?:\*|\d+|"[^"]*")\])?/g;
 
 function asString(node) {
   return node && node.type === 'string' ? node.value : null;
@@ -43,8 +46,8 @@ function asNumber(node) {
   return node && node.type === 'number' ? node.value : null;
 }
 
-/** Recursively collects all `aws_type.name` references found anywhere inside a value node. */
-function extractRefs(node) {
+/** Recursively collects all raw `aws_type.name[...]` reference strings found anywhere inside a value node. */
+function extractRawRefs(node) {
   if (!node) return [];
   const out = [];
   const walk = (n) => {
@@ -67,17 +70,12 @@ function extractRefs(node) {
   return [...new Set(out)];
 }
 
-function firstRef(node) {
-  const refs = extractRefs(node);
-  return refs.length ? refs[0] : null;
-}
-
-/** Deep-scans an entire attrs map for references (used as a last-resort placement fallback). */
-function extractRefsDeep(attrs) {
+/** Deep-scans an entire attrs map for raw references (used as a last-resort placement fallback). */
+function extractRawRefsDeep(attrs) {
   const out = [];
   Object.values(attrs || {}).forEach(v => {
-    if (Array.isArray(v)) v.forEach(n => out.push(...extractRefs(n)));
-    else out.push(...extractRefs(v));
+    if (Array.isArray(v)) v.forEach(n => out.push(...extractRawRefs(n)));
+    else out.push(...extractRawRefs(v));
   });
   return [...new Set(out)];
 }
@@ -91,7 +89,8 @@ function getTagName(attrs) {
 }
 
 function displayNameFor(resource) {
-  const { attrs, name, type } = resource;
+  const { attrs, name, index } = resource;
+  const fallback = index !== undefined ? `${name} [${index}]` : name;
   return (
     getTagName(attrs) ||
     asString(attrs.name) ||
@@ -100,7 +99,7 @@ function displayNameFor(resource) {
     asString(attrs.function_name) ||
     asString(attrs.cluster_name) ||
     asString(attrs.service_name) ||
-    name
+    fallback
   );
 }
 
@@ -174,11 +173,46 @@ const SUPPORT_TYPES = new Set([
 
 // ── Public entry point ──────────────────────────────────────────────────────
 function buildArchitectureModel(parsed) {
-  const { resources, providers, parseWarnings } = parsed;
+  const { resources, providers, parseWarnings, variables } = parsed;
   const warnings = [...parseWarnings];
+  const variablesByName = variables || {};
 
   const resourcesByKey = {};
   resources.forEach(r => { resourcesByKey[r.key] = r; });
+
+  // Base-key → [instance keys] index, so a reference to a count/for_each
+  // -expanded resource (`aws_subnet.public[*]`, or even a bare
+  // `aws_subnet.public` written loosely) can be resolved to the concrete
+  // per-instance keys produced during parsing (see hclArchParser's
+  // expandResources).
+  const baseKeyToInstances = {};
+  resources.forEach(r => {
+    const bk = r.baseKey || r.key;
+    (baseKeyToInstances[bk] = baseKeyToInstances[bk] || []).push(r.key);
+  });
+  function resolveRawMatch(raw) {
+    if (resourcesByKey[raw]) return [raw];
+    const splat = raw.match(/^(.*)\[\*\]$/);
+    if (splat && baseKeyToInstances[splat[1]]) return baseKeyToInstances[splat[1]];
+    const bracketed = raw.match(/^(.*)\[[^\]]*\]$/);
+    if (bracketed && baseKeyToInstances[bracketed[1]]) return baseKeyToInstances[bracketed[1]];
+    if (baseKeyToInstances[raw]) return baseKeyToInstances[raw];
+    return [];
+  }
+  function extractRefs(node) {
+    const out = [];
+    extractRawRefs(node).forEach(m => out.push(...resolveRawMatch(m)));
+    return [...new Set(out)];
+  }
+  function firstRef(node) {
+    const refs = extractRefs(node);
+    return refs.length ? refs[0] : null;
+  }
+  function extractRefsDeep(attrs) {
+    const out = [];
+    extractRawRefsDeep(attrs).forEach(m => out.push(...resolveRawMatch(m)));
+    return [...new Set(out)];
+  }
 
   const vpcs = resources.filter(r => r.type === 'aws_vpc');
   const subnets = resources.filter(r => r.type === 'aws_subnet');
@@ -191,6 +225,11 @@ function buildArchitectureModel(parsed) {
 
   const subnetsByKey = {};
   subnets.forEach(s => { subnetsByKey[s.key] = s; });
+
+  const defaultVpcKey = vpcs.length === 1 ? vpcs[0].key : null;
+  function resolveVpcKeyForSubnet(subnet) {
+    return firstRef(subnet.attrs.vpc_id) || defaultVpcKey || '__unknown_vpc__';
+  }
 
   // ── Region resolution ──────────────────────────────────────────────────
   const providerRegions = {};
@@ -230,6 +269,19 @@ function buildArchitectureModel(parsed) {
     return !!(ref && ref.startsWith('aws_nat_gateway.'));
   }
 
+  const albsForInference = resources.filter(r => ['aws_lb', 'aws_alb', 'aws_elb'].includes(r.type));
+  function subnetHostsNat(subnetKey) {
+    return natgws.some(n => firstRef(n.attrs.subnet_id) === subnetKey);
+  }
+  function subnetUsedByPublicAlb(subnetKey) {
+    return albsForInference.some(alb => {
+      if (asBool(alb.attrs.internal) === true) return false; // internal LB doesn't imply a public subnet
+      if (extractRefs(alb.attrs.subnets).includes(subnetKey)) return true;
+      const mappings = normalizeBlockList(alb.attrs.subnet_mapping).filter(b => b && b.type === 'block');
+      return mappings.some(m => firstRef(m.attrs.subnet_id) === subnetKey);
+    });
+  }
+
   const subnetInfo = {}; // key -> { public, hasNat, reason, routeTableKey }
   subnets.forEach(subnet => {
     if (asBool(subnet.attrs.map_public_ip_on_launch) === true) {
@@ -243,35 +295,127 @@ function buildArchitectureModel(parsed) {
     const hasNat = tableRoutes.some(routeTargetsNat);
     if (hasIgw) {
       subnetInfo[subnet.key] = { public: true, hasNat: false, reason: 'route table has a route to an Internet Gateway' };
-    } else if (hasNat) {
-      subnetInfo[subnet.key] = { public: false, hasNat: true, reason: 'route table has a route to a NAT Gateway' };
-    } else if (rt) {
-      subnetInfo[subnet.key] = { public: false, hasNat: false, reason: 'route table has no Internet/NAT Gateway route' };
-    } else {
-      subnetInfo[subnet.key] = { public: false, hasNat: false, reason: 'no route table association found (defaulted to private)' };
+      return;
     }
+    if (hasNat) {
+      subnetInfo[subnet.key] = { public: false, hasNat: true, reason: 'route table has a route to a NAT Gateway' };
+      return;
+    }
+    // No clear routing signal (no route table, or a route table with no
+    // Internet/NAT route) — fall back to resource-context heuristics, per
+    // the spec: infer publicness from "whether it is behind a load
+    // balancer" (generalized here to also cover NAT Gateway placement,
+    // since a NAT Gateway is only ever valid in a public subnet).
+    if (subnetHostsNat(subnet.key)) {
+      subnetInfo[subnet.key] = { public: true, hasNat: false, reason: 'hosts a NAT Gateway (NAT Gateways must sit in a public subnet)' };
+      return;
+    }
+    if (subnetUsedByPublicAlb(subnet.key)) {
+      subnetInfo[subnet.key] = { public: true, hasNat: false, reason: 'used by an internet-facing Load Balancer' };
+      return;
+    }
+    subnetInfo[subnet.key] = {
+      public: false, hasNat: false,
+      reason: rt ? 'route table has no Internet/NAT Gateway route' : 'no route table association found (defaulted to private)',
+    };
   });
 
-  // ── AZ resolution (literal → real name, else synthetic) ─────────────────
-  const azSyntheticCounter = {}; // vpcKey -> next index
+  // ── AZ resolution ─────────────────────────────────────────────────────
+  // Priority, most to least confident:
+  //   1. a literal availability_zone string
+  //   2. an expression we can statically resolve to a literal AZ name —
+  //      element(list, N) / list[N] against an inline list literal or a
+  //      variable's literal default (N is very often already a literal by
+  //      this point, since count.index/each.key get substituted with the
+  //      concrete instance index during parsing — see hclArchParser's
+  //      expandResources)
+  //   3. unresolvable, but a literal trailing index survives in the
+  //      expression — pair every subnet sharing that same index into one
+  //      synthetic AZ bucket. This is what makes a count-based public/
+  //      private subnet pair land in the SAME synthetic AZ instead of two
+  //      unrelated ones, even when the real AZ name can't be determined
+  //      (e.g. it comes from `data.aws_availability_zones`).
+  //   4. no AZ signal at all — last-resort positional pairing: the Nth
+  //      public-role subnet is paired with the Nth private-role subnet in
+  //      declaration order (a labeled best guess, not a claim of fact).
+  function resolveListLiteral(exprText) {
+    const trimmed = exprText.trim();
+    const varMatch = trimmed.match(/^var\.([A-Za-z0-9_-]+)$/);
+    if (varMatch) {
+      const def = resolveVarLiteral(varMatch[1], variablesByName);
+      return def && def.type === 'list' ? def : null;
+    }
+    if (trimmed.startsWith('[')) {
+      try {
+        const v = parseValue(trimmed, 0).value;
+        return v && v.type === 'list' ? v : null;
+      } catch { return null; }
+    }
+    return null;
+  }
+  function resolveAzExpression(raw) {
+    const m = raw.match(/^element\(\s*([\s\S]+?)\s*,\s*(\d+)\s*\)$/) || raw.match(/^([\s\S]+?)\[\s*(\d+)\s*\]$/);
+    if (!m) return null;
+    const list = resolveListLiteral(m[1]);
+    if (!list || !list.items || !list.items.length) return null;
+    const item = list.items[parseInt(m[2], 10) % list.items.length];
+    return item && item.type === 'string' ? item.value : null;
+  }
+  function trailingLiteralIndex(raw) {
+    const m = raw.match(/,\s*(\d+)\s*\)$/) || raw.match(/\[\s*(\d+)\s*\]$/);
+    return m ? parseInt(m[1], 10) : null;
+  }
+
   const subnetAz = {}; // subnetKey -> { name, synthetic }
+  const indexPairedName = {}; // `${vpcKey}::${index}` -> bucket name, so sibling subnets sharing an index share a bucket
+  const unresolvedSubnets = []; // subnets with zero AZ signal at all — handled after the main pass (needs public/private + declaration order)
+
   subnets.forEach(subnet => {
+    const vpcKey = resolveVpcKeyForSubnet(subnet);
     const literal = asString(subnet.attrs.availability_zone);
-    const vpcKey = firstRef(subnet.attrs.vpc_id) || '__default_vpc__';
     if (literal) {
       subnetAz[subnet.key] = { name: literal, synthetic: false };
-    } else {
-      azSyntheticCounter[vpcKey] = (azSyntheticCounter[vpcKey] || 0) + 1;
-      subnetAz[subnet.key] = { name: `AZ-${azSyntheticCounter[vpcKey]} (inferred)`, synthetic: true };
-      warnings.push(`Subnet "${subnet.name}" has no literal availability_zone — grouped into a synthetic AZ bucket.`);
+      return;
     }
+    const azNode = subnet.attrs.availability_zone;
+    if (azNode && azNode.type === 'expr') {
+      const resolved = resolveAzExpression(azNode.raw.trim());
+      if (resolved) {
+        subnetAz[subnet.key] = { name: resolved, synthetic: false };
+        return;
+      }
+      const idx = trailingLiteralIndex(azNode.raw.trim());
+      if (idx !== null) {
+        const bucketKey = `${vpcKey}::${idx}`;
+        if (!indexPairedName[bucketKey]) indexPairedName[bucketKey] = `AZ-${Object.keys(indexPairedName).filter(k => k.startsWith(`${vpcKey}::`)).length + 1} (inferred)`;
+        subnetAz[subnet.key] = { name: indexPairedName[bucketKey], synthetic: true };
+        warnings.push(`Subnet "${subnet.name}" has a non-literal availability_zone, but its index (${idx}) was used to group it with other subnets sharing that index.`);
+        return;
+      }
+    }
+    // Zero AZ signal whatsoever — resolved in a second pass below, once
+    // every subnet's public/private role is known.
+    unresolvedSubnets.push(subnet);
+    warnings.push(`Subnet "${subnet.name}" has no availability_zone information — grouped using a best-guess positional pairing.`);
   });
 
-  // ── VPC index ────────────────────────────────────────────────────────────
-  const defaultVpcKey = vpcs.length === 1 ? vpcs[0].key : null;
-  function resolveVpcKeyForSubnet(subnet) {
-    return firstRef(subnet.attrs.vpc_id) || defaultVpcKey || '__unknown_vpc__';
-  }
+  // Positional pairing, per VPC: 1st public-role unresolved subnet pairs
+  // with the 1st private-role unresolved subnet, 2nd with 2nd, etc. If one
+  // side runs out, remaining subnets each get their own bucket.
+  const positionalCounters = {}; // `${vpcKey}::public`/`::private` -> next position
+  unresolvedSubnets.forEach(subnet => {
+    const vpcKey = resolveVpcKeyForSubnet(subnet);
+    const role = subnetInfo[subnet.key].public ? 'public' : 'private';
+    const counterKey = `${vpcKey}::${role}`;
+    const position = positionalCounters[counterKey] || 0;
+    positionalCounters[counterKey] = position + 1;
+    const bucketKey = `${vpcKey}::pos${position}`;
+    if (!indexPairedName[bucketKey]) {
+      const ordinal = Object.keys(indexPairedName).filter(k => k.startsWith(`${vpcKey}::`)).length + 1;
+      indexPairedName[bucketKey] = `AZ-${ordinal} (inferred by position)`;
+    }
+    subnetAz[subnet.key] = { name: indexPairedName[bucketKey], synthetic: true };
+  });
 
   // ── Resource → subnet placement ─────────────────────────────────────────
   const index = { subnetsByKey, resourcesByKey };
@@ -634,4 +778,4 @@ function buildArchitectureModel(parsed) {
   };
 }
 
-module.exports = { buildArchitectureModel, _internal: { extractRefs, firstRef, displayNameFor, RESOURCE_MAP } };
+module.exports = { buildArchitectureModel, _internal: { extractRawRefs, displayNameFor, RESOURCE_MAP } };

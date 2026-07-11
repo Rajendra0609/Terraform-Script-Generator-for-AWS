@@ -248,7 +248,15 @@ function parseValue(body, i) {
 
   // Bare expression: read until newline at depth 0 (paren/bracket/brace-aware),
   // OR a top-level comma (list-context — callers pre-split on commas so this
-  // mainly matters for object/list nesting safety).
+  // mainly matters for object/list nesting safety), OR the start of a new
+  // `identifier = ` assignment at depth 0. That last case shouldn't occur in
+  // strictly valid HCL (each attribute belongs on its own line) but we stay
+  // defensive about it: several attributes crammed onto one line without a
+  // newline between them (e.g. hand-compacted or minified HCL) would
+  // otherwise silently swallow every attribute after the first into one
+  // garbled expression, corrupting fields the mapper depends on (subnets,
+  // internal, etc.) even though nothing looked wrong at parse time.
+  const NEW_ASSIGNMENT_RE = /^[ \t]+[A-Za-z_][A-Za-z0-9_.\-]*[ \t]*=(?!=)/;
   let j = i;
   let depth = 0;
   let inStr = false, strCh = null;
@@ -270,6 +278,7 @@ function parseValue(body, i) {
     }
     if (c === '\n' && depth === 0) break;
     if (c === ',' && depth === 0) break;
+    if (depth === 0 && (c === ' ' || c === '\t') && NEW_ASSIGNMENT_RE.test(body.slice(j, j + 60))) break;
     j++;
   }
   const raw = body.slice(i, j).trim();
@@ -311,7 +320,167 @@ function splitTopLevel(s, sep) {
   return parts;
 }
 
-// ── 5. Public API ───────────────────────────────────────────────────────────
+// ── 5. Resource expansion (count / for_each) ────────────────────────────────
+// Terraform's `count = N` / `for_each = <set|map>` turn ONE resource block
+// into N actual infrastructure resources — a `count`-based pair of public/
+// private subnets is extremely common in real Terraform and, unexpanded,
+// looks like a single subnet to everything downstream (wrong resource
+// count, and no way to tell which public/private instances share an AZ).
+// This expands each block into per-instance clones with `count.index` /
+// `each.key` / `each.value` substituted into any expression or string that
+// references them, so the rest of the pipeline sees the same shape it
+// would from N separately-written resource blocks.
+const TOKEN_RE = {
+  countIndex: /\bcount\.index\b/g,
+  eachKey: /\beach\.key\b/g,
+  eachValue: /\beach\.value\b/g,
+};
+
+function substituteInNode(node, subst) {
+  if (!node) return node;
+  if (node.type === 'expr') {
+    let raw = node.raw;
+    if (subst.countIndex) raw = raw.replace(TOKEN_RE.countIndex, subst.countIndex.expr);
+    if (subst.eachKey) raw = raw.replace(TOKEN_RE.eachKey, subst.eachKey.expr);
+    if (subst.eachValue) raw = raw.replace(TOKEN_RE.eachValue, subst.eachValue.expr);
+    if (raw === node.raw) return node;
+    // If substitution reduced the whole expression to a pure literal (very
+    // common: `availability_zone = each.value` becomes `"us-east-1a"`),
+    // re-classify it so downstream literal checks (asString/asNumber/
+    // asBool) recognize it instead of treating it as an opaque expression.
+    const trimmed = raw.trim();
+    const strMatch = trimmed.match(/^"([^"]*)"$/);
+    if (strMatch) return { type: 'string', value: strMatch[1] };
+    if (/^-?\d+(\.\d+)?$/.test(trimmed)) return { type: 'number', value: parseFloat(trimmed) };
+    if (/^(true|false)$/i.test(trimmed)) return { type: 'bool', value: /^true$/i.test(trimmed) };
+    return { type: 'expr', raw };
+  }
+  if (node.type === 'string') {
+    let value = node.value;
+    if (subst.countIndex) value = value.replace(TOKEN_RE.countIndex, subst.countIndex.str);
+    if (subst.eachKey) value = value.replace(TOKEN_RE.eachKey, subst.eachKey.str);
+    if (subst.eachValue) value = value.replace(TOKEN_RE.eachValue, subst.eachValue.str);
+    // Collapse trivial `${<literal>}` wrappers left behind by the token
+    // substitution above (e.g. "public-${count.index}" → "public-${0}" →
+    // "public-0", or "web-${each.key}" → "web-${a}" → "web-a") so display
+    // names read naturally instead of showing stray interpolation syntax.
+    value = value.replace(/\$\{\s*"?([A-Za-z0-9_.\-]*)"?\s*\}/g, '$1');
+    return value === node.value ? node : { type: 'string', value };
+  }
+  if (node.type === 'list') {
+    return { type: 'list', items: node.items.map(i => substituteInNode(i, subst)) };
+  }
+  if (node.type === 'object' || node.type === 'block') {
+    const attrs = {};
+    for (const [k, v] of Object.entries(node.attrs)) {
+      attrs[k] = Array.isArray(v) ? v.map(x => substituteInNode(x, subst)) : substituteInNode(v, subst);
+    }
+    return node.type === 'block' ? { type: 'block', labels: node.labels, attrs } : { type: 'object', attrs };
+  }
+  return node; // number / bool — no tokens possible
+}
+
+function substituteInAttrs(attrs, subst) {
+  const out = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    out[k] = Array.isArray(v) ? v.map(x => substituteInNode(x, subst)) : substituteInNode(v, subst);
+  }
+  return out;
+}
+
+/** Resolves `var.<name>` to its literal default, one level deep (no recursive var chains). */
+function resolveVarLiteral(varName, variablesByName) {
+  const v = variablesByName[varName];
+  if (!v || !v.default) return null;
+  return v.default;
+}
+
+/** Best-effort resolution of a `count`/`for_each` value node to a literal (number, list, or object). */
+function resolveLiteralNode(node, variablesByName) {
+  if (!node) return null;
+  if (['number', 'string', 'bool', 'list', 'object'].includes(node.type)) return node;
+  if (node.type === 'expr') {
+    const varMatch = node.raw.trim().match(/^var\.([A-Za-z0-9_-]+)$/);
+    if (varMatch) return resolveVarLiteral(varMatch[1], variablesByName);
+    const tosetMatch = node.raw.trim().match(/^toset\(\s*(\[[\s\S]*\])\s*\)$/);
+    if (tosetMatch) {
+      try { return parseValue(tosetMatch[1], 0).value; } catch { return null; }
+    }
+  }
+  return null;
+}
+
+/** Turns a resolved for_each collection (list or object) into [{keyExpr,keyStr,valueExpr,valueStr}]. */
+function forEachEntries(collection) {
+  if (!collection) return null;
+  if (collection.type === 'list') {
+    return collection.items
+      .filter(i => i && i.type === 'string')
+      .map(i => ({ keyExpr: JSON.stringify(i.value), keyStr: i.value, valueExpr: JSON.stringify(i.value), valueStr: i.value }));
+  }
+  if (collection.type === 'object') {
+    return Object.entries(collection.attrs)
+      .map(([k, v]) => {
+        const valNode = Array.isArray(v) ? v[0] : v;
+        const valStr = valNode && valNode.type === 'string' ? valNode.value : k;
+        return { keyExpr: JSON.stringify(k), keyStr: k, valueExpr: JSON.stringify(valStr), valueStr: valStr };
+      });
+  }
+  return null;
+}
+
+const MAX_EXPANSION = 300; // sanity bound — no runaway expansion on a bad literal
+
+function expandResources(resources, variablesByName, parseWarnings) {
+  const out = [];
+  for (const r of resources) {
+    const countNode = r.attrs.count;
+    const forEachNode = r.attrs.for_each;
+
+    if (countNode) {
+      const literal = resolveLiteralNode(countNode, variablesByName);
+      if (literal && literal.type === 'number' && Number.isInteger(literal.value) && literal.value >= 0 && literal.value <= MAX_EXPANSION) {
+        for (let i = 0; i < literal.value; i++) {
+          const attrs = substituteInAttrs(r.attrs, { countIndex: { expr: String(i), str: String(i) } });
+          delete attrs.count;
+          out.push({ ...r, key: `${r.type}.${r.name}[${i}]`, attrs, index: i, baseKey: r.key });
+        }
+      } else {
+        parseWarnings.push(`Resource "${r.key}" has a "count" that couldn't be resolved to a literal number — showing one representative instance instead of expanding it.`);
+        const attrs = { ...r.attrs };
+        delete attrs.count;
+        out.push({ ...r, attrs });
+      }
+      continue;
+    }
+
+    if (forEachNode) {
+      const literal = resolveLiteralNode(forEachNode, variablesByName);
+      const entries = literal ? forEachEntries(literal) : null;
+      if (entries && entries.length && entries.length <= MAX_EXPANSION) {
+        entries.forEach(({ keyExpr, keyStr, valueExpr, valueStr }) => {
+          const attrs = substituteInAttrs(r.attrs, {
+            eachKey: { expr: keyExpr, str: keyStr },
+            eachValue: { expr: valueExpr, str: valueStr },
+          });
+          delete attrs.for_each;
+          out.push({ ...r, key: `${r.type}.${r.name}["${keyStr}"]`, attrs, index: keyStr, baseKey: r.key });
+        });
+      } else {
+        parseWarnings.push(`Resource "${r.key}" has a "for_each" that couldn't be resolved to a literal set/map — showing one representative instance instead of expanding it.`);
+        const attrs = { ...r.attrs };
+        delete attrs.for_each;
+        out.push({ ...r, attrs });
+      }
+      continue;
+    }
+
+    out.push(r);
+  }
+  return out;
+}
+
+// ── 6. Public API ───────────────────────────────────────────────────────────
 /**
  * Parses one or more concatenated Terraform source files into a flat model:
  *   { resources: [{type,name,key,attrs}], providers: [...], modules: [...],
@@ -323,6 +492,7 @@ function parseHclSources(sources) {
   const providers = [];
   const modules = [];
   const dataSources = [];
+  const variables = [];
   const parseWarnings = [];
 
   for (const src of sources) {
@@ -375,17 +545,28 @@ function parseHclSources(sources) {
         let attrs = {};
         try { attrs = parseBody(body); } catch {}
         dataSources.push({ type: labels[0], name: labels[1], key: `data.${labels[0]}.${labels[1]}`, attrs });
+      } else if (blockType === 'variable' && labels.length >= 1) {
+        let attrs = {};
+        try { attrs = parseBody(body); } catch {}
+        variables.push({ name: labels[0], default: attrs.default || null });
       }
-      // variable / output / locals / terraform blocks: intentionally not
-      // needed for architecture inference — skipped.
+      // output / locals / terraform blocks: intentionally not needed for
+      // architecture inference — skipped.
     }
   }
 
-  return { resources, providers, modules, dataSources, parseWarnings };
+  const variablesByName = {};
+  variables.forEach(v => { variablesByName[v.name] = v; });
+
+  const expandedResources = expandResources(resources, variablesByName, parseWarnings);
+
+  return { resources: expandedResources, providers, modules, dataSources, variables: variablesByName, parseWarnings };
 }
 
 module.exports = {
   parseHclSources,
+  resolveVarLiteral,
+  parseValue,
   // exported for unit testing
-  _internal: { stripComments, findBlocks, parseHeader, parseBody, parseValue, splitTopLevel },
+  _internal: { stripComments, findBlocks, parseHeader, parseBody, splitTopLevel, expandResources },
 };
