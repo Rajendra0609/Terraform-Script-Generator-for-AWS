@@ -215,7 +215,14 @@ async function upsertOAuthUser({ email, displayName, avatarUrl, provider, subjec
 
 async function issueTokensAndRedirect(res, user, errorMsg) {
   if (errorMsg) {
-    return res.redirect(`${FRONTEND_URL}/login?oauth_error=${encodeURIComponent(errorMsg)}`);
+    // BUG FIX: this used to redirect to /login?oauth_error=... — but Login.jsx
+    // never reads that query param, and the component that DOES know how to
+    // parse and display oauth_error (OAuthCallback.jsx) only mounts on
+    // /oauth-callback. Every failure was landing on a blank /login with the
+    // error silently dropped. /oauth-callback itself falls back to /login
+    // after showing the message (see its 3-4s setTimeout), so this preserves
+    // the same end state — it just makes the reason visible first.
+    return res.redirect(`${FRONTEND_URL}/oauth-callback?oauth_error=${encodeURIComponent(errorMsg)}`);
   }
   // SECURITY FIX (H-05): previously duplicated (with a drifted, wrong
   // cookie path + sameSite: 'lax') instead of reusing routes/auth.js's
