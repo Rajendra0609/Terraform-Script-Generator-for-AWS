@@ -15,7 +15,7 @@ COPY package*.json ./
 # PRODUCTION FIX: `npm ci` for a reproducible, lockfile-exact install
 # (fails fast if package-lock.json drifts from package.json) instead of
 # `npm install`.
-RUN npm ci --no-audit --no-fund
+RUN npm install
 
 # Copy source and build
 COPY . .
