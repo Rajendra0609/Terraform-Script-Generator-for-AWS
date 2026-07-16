@@ -82,8 +82,31 @@ COPY --from=tools /usr/local/bin/terraform-ls   /usr/local/bin/terraform-ls
 # appuser runs the Node process. It is NOT a member of any docker-socket
 # group — DOCKER_HOST points the `docker` CLI at the docker-socket-proxy
 # service over TCP, so no local socket permissions are needed at all.
-RUN addgroup -S appgroup \
- && adduser  -S appuser -G appgroup
+#
+# KUBERNETES FIX: this used to be `adduser -S appuser -G appgroup` with no
+# explicit uid/gid. That's fine for plain `docker run`/Compose (nothing
+# there needs to know the number), but it breaks under Kubernetes'
+# `runAsNonRoot: true` pod security context in two ways:
+#   1. Immediately: kubelet validates that check by reading the image's
+#      numeric USER. A *named* user with no pinned uid can't be resolved
+#      that way, so the pod is rejected outright — "cannot verify user is
+#      non-root" (the exact same failure class hit on the frontend image's
+#      unpinned `USER nginx`).
+#   2. Even after working around that in the k8s manifest by forcing a
+#      specific runAsUser number: Alpine's `adduser -S` with no `-u` assigns
+#      the next free system uid at BUILD time, which depends on exactly
+#      which system accounts already exist in that image layer at that
+#      point — not something you can reliably determine by reading this
+#      Dockerfile alone, only by inspecting the actual built image. Guessing
+#      wrong doesn't just fail to schedule (which would be an obvious,
+#      loud failure); it schedules fine and then hits confusing EACCES
+#      errors reading /app or writing /tfgen-scratch, because those were
+#      chowned at build time to whatever number actually got assigned.
+# Pinning explicit uid/gid here removes that ambiguity for good. 1001 is
+# used (not 1000) specifically to avoid colliding with the `node` user that
+# node:20-alpine already ships at uid/gid 1000.
+RUN addgroup -g 1001 -S appgroup \
+ && adduser  -u 1001 -S appuser -G appgroup
 
 # ── Application files ─────────────────────────────────────────────────────────
 COPY --from=deps /app/node_modules ./node_modules
