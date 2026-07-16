@@ -6,6 +6,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { awsAPI, projectsAPI } from '../api/client';
 import AwsCredentialsModal from './AwsCredentialsModal';
 import { getLastProjectId } from '../utils/lastProjectStorage';
+import { APP_VERSION } from '../version';
 
 export default function Navbar() {
   const { user, logout } = useAuth();
@@ -139,7 +140,7 @@ export default function Navbar() {
       </Link>
 
       <span style={{ padding: '2px 8px', background: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 99, fontSize: 9, fontWeight: 700, color: '#059669', letterSpacing: '0.06em', textTransform: 'uppercase', marginRight: 20, flexShrink: 0 }}>
-        {process.env.REACT_APP_APP_VERSION || '0.0.1'}
+        {APP_VERSION}
       </span>
 
       {user && (
