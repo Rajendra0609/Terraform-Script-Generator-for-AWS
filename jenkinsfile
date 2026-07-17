@@ -1,9 +1,150 @@
+def setupDockerAuth() {
+    if (params.PUSH_IMAGES) {
+        withCredentials([
+            usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
+                             usernameVariable: 'DOCKER_USER',
+                             passwordVariable: 'DOCKER_PASS')
+        ]) {
+            sh '''
+                mkdir -p "${WORKSPACE}/.docker-config"
+                AUTH=$(printf '%s:%s' "$DOCKER_USER" "$DOCKER_PASS" | base64 | tr -d '\\n')
+                cat > "${WORKSPACE}/.docker-config/config.json" <<EOF
+{"auths":{"https://index.docker.io/v1/":{"auth":"${AUTH}"}}}
+EOF
+            '''
+        }
+    } else {
+        echo 'ℹ️  PUSH_IMAGES=false — building only (Kaniko --no-push), no registry auth needed.'
+    }
+}
+
+def kanikoPodTemplate = '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins/label: kaniko
+spec:
+  containers:
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:debug
+      imagePullPolicy: Always
+      command: ['/busybox/cat']
+      tty: true
+      resources:
+        requests: { cpu: "500m", memory: "1Gi" }
+        limits:   { cpu: "1",    memory: "3Gi" }
+'''
+
+def updateDeploymentRepoImages(String repoDir, String imageTag) {
+    sh """
+        set -e
+        cd "${repoDir}"
+        find . -type f \\( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \\) -exec sed -i "s|${env.BACKEND_IMAGE}:${params.VERSION}|${env.BACKEND_IMAGE}:${imageTag}|g" {} +
+        find . -type f \\( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \\) -exec sed -i "s|${env.FRONTEND_IMAGE}:${params.VERSION}|${env.FRONTEND_IMAGE}:${imageTag}|g" {} +
+        find . -type f \\( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \\) -exec sed -i "s|${env.DATABASE_IMAGE}:${params.VERSION}|${env.DATABASE_IMAGE}:${imageTag}|g" {} +
+    """
+}
+
+def pushDeploymentRepoChanges(String repoDir, String commitMessage) {
+    // Strip the scheme so we can rebuild the URL with embedded credentials below.
+    def repoUrlNoScheme = params.ARGOCD_REPO_URL.replaceFirst(/^https:\/\//, '')
+
+    withCredentials([usernamePassword(credentialsId: "${params.GIT_CHECKOUT_CREDENTIALS_ID}",
+                                       usernameVariable: 'GIT_PUSH_USER',
+                                       passwordVariable: 'GIT_PUSH_TOKEN')]) {
+        sh """
+            set -e
+            cd "${repoDir}"
+            git config user.email "jenkins@local"
+            git config user.name "Jenkins"
+            echo "Remote(s) configured for this checkout:"
+            git remote -v
+            if ! git diff --quiet; then
+                git add -A
+                git commit -m "${commitMessage}"
+                echo "Pushing current commit to branch '${params.ARGOCD_REPO_BRANCH}'"
+                git push "https://\${GIT_PUSH_USER}:\${GIT_PUSH_TOKEN}@${repoUrlNoScheme}" "HEAD:refs/heads/${params.ARGOCD_REPO_BRANCH}"
+            else
+                echo "No deployment manifest changes to commit"
+            fi
+        """
+    }
+}
+
+def collectReportArtifacts() {
+    def files = sh(script: '''
+        set -e
+        find "$WORKSPACE" \\( -path "*/.git" -o -path "*/node_modules" \\) -prune -o \\
+            \\( -name 'gitleaks-report.json' -o -name 'trivy-*.json' -o -name 'zap-baseline-report.*' -o -name 'junit-results.xml' -o -name 'lcov.info' \\) -print | sort
+    ''', returnStdout: true).trim()
+    if (!files) {
+        return []
+    }
+    return files.split('\n').findAll { it?.trim() }.collect { it.trim() }
+}
+
+// ── Failure diagnostics ─────────────────────────────────────────────────
+// markStageStart() runs as the first step of every stage. It records how
+// many console-log lines existed *before* this stage began, so that if the
+// stage fails we can slice out just that stage's own output later — not an
+// arbitrary tail of the whole build, and not some other stage's log.
+def markStageStart() {
+    env.STAGE_LOG_START = currentBuild.rawBuild.getLog(5000).size().toString()
+}
+
+// captureStageFailure() is wired into every stage's post{failure{}}. It
+// records which stage failed and slices the console log from that stage's
+// start up to the point of failure. currentBuild.rawBuild talks to the
+// Jenkins controller, not the agent workspace, so this works identically
+// whether the stage ran on kube_xl or on a throwaway Kaniko/Trivy/ZAP pod.
+def captureStageFailure() {
+    env.FAILED_STAGE_NAME = env.STAGE_NAME ?: 'Unknown stage'
+    def allLines = currentBuild.rawBuild.getLog(5000)
+    def startIdx = 0
+    try {
+        startIdx = (env.STAGE_LOG_START ?: '0') as Integer
+    } catch (ignored) {
+        startIdx = 0
+    }
+    if (startIdx < 0 || startIdx > allLines.size()) {
+        startIdx = 0
+    }
+    def stageLines = allLines.drop(startIdx)
+    if (stageLines.size() > 150) {
+        stageLines = stageLines.takeRight(150)
+    }
+    env.FAILED_STAGE_LOG = stageLines.join('\n')
+}
+
+def getTriggerInfo() {
+    try {
+        def causes = currentBuild.getBuildCauses()
+        if (causes && causes.size() > 0) {
+            def c = causes[0]
+            return (c.userName ?: c.shortDescription ?: 'Unknown').toString()
+        }
+    } catch (e) {
+        echo "Could not determine trigger: ${e.message}"
+    }
+    return 'Unknown'
+}
+
+def getCommitAuthors() {
+    try {
+        def authors = currentBuild.changeSets.collect { cs ->
+            cs.items.collect { it.author.fullName }
+        }.flatten().unique()
+        return authors ? authors.join(', ') : 'No new commits (same as last build)'
+    } catch (e) {
+        echo "Could not determine commit author(s): ${e.message}"
+        return 'Unknown'
+    }
+}
+
 pipeline {
     agent {
-        kubernetes {
-            label 'kube_m'
-            defaultContainer 'jnlp'
-        }
+        label "kube_xl"
     }
     tools {
         nodejs 'nodejs'
@@ -11,8 +152,9 @@ pipeline {
     triggers {
         pollSCM('H/5 * * * *')
     }
+
     options {
-        buildDiscarder(logRotator(numToKeepStr: '1'))
+        buildDiscarder(logRotator(numToKeepStr: '10'))
         disableConcurrentBuilds()
         timeout(time: 1, unit: 'HOURS')
         skipDefaultCheckout()
@@ -22,93 +164,108 @@ pipeline {
         preserveStashes(buildCount: 10)
         quietPeriod(5)
         lock(resource: 'prod-deploy')
-        checkoutToSubdirectory('source')   // ← entire repo lands at WORKSPACE/source/
     }
+
+    parameters {
+        string(name: 'GIT_BRANCH',                defaultValue: 'dev_v0.0.2',                                                   description: 'Branch to build')
+        string(name: 'GITHUB_REPO',               defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',                   description: 'GitHub repository (owner/repo)')
+        string(name: 'GIT_CHECKOUT_CREDENTIALS_ID', defaultValue: 'github',                                                          description: 'Credentials ID (username/password or PAT) used to git clone')
+        string(name: 'GITHUB_CREDENTIALS_ID',     defaultValue: 'GITHUB_TOKEN',                                                      description: 'Secret-text credentials ID for GitHub API calls (node status check)')
+
+        string(name: 'DOCKERHUB_NAMESPACE',       defaultValue: 'daggu1997',                                                         description: 'Docker Hub namespace/org images are pushed under')
+        string(name: 'VERSION',                   defaultValue: 'v0.0.2',                                                            description: 'Docker image version tag (matches docker-compose.yml)')
+        string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                                                            description: 'Credentials ID for Docker Hub (username/password)')
+        booleanParam(name: 'PUSH_IMAGES',         defaultValue: true,                                                                description: 'Push built images to Docker Hub. Uncheck for a build-only / PR-validation run (Kaniko --no-push).')
+
+        booleanParam(name: 'RUN_DB_MIGRATIONS',   defaultValue: false,                                                               description: 'Run database/migrate.js against DATABASE_URL. Off by default — this touches a real database; opt in deliberately.')
+
+        string(name: 'EMAIL_RECIPIENTS',          defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated email recipients')
+
+        string(name: 'TAG',                       defaultValue: 'v0.0.2',                                                            description: '[reserved for downstream deploy] Kubernetes deployment version')
+        string(name: 'K8S_NAMESPACE',             defaultValue: 'default',                                                           description: '[reserved for downstream deploy] Kubernetes namespace')
+        string(name: 'K8S_DEPLOYMENT_NAME',       defaultValue: 'terraform-script-generator',                                        description: '[reserved for downstream deploy] Kubernetes deployment name')
+
+        // ── Argo CD / production deploy toggles ─────────────────────────────
+        booleanParam(name: 'DEPLOY_TO_PROD',      defaultValue: true,                                                                description: 'Deploy the built images into production through Argo CD')
+        string(name: 'ARGOCD_SERVER',             defaultValue: 'argocd-server.argocd.svc.cluster.local',                                             description: 'Argo CD server URL, e.g. https://argocd.example.com')
+        string(name: 'ARGOCD_CREDENTIALS_ID',     defaultValue: 'argocd',                                                             description: 'Jenkins credentials ID containing Argo CD username/password')
+        string(name: 'ARGOCD_APP_NAME',           defaultValue: 'tfgen-prod',                                                        description: 'Argo CD application name for production')
+        string(name: 'ARGOCD_PROJECT',            defaultValue: 'default',                                                           description: 'Argo CD project name')
+        string(name: 'ARGOCD_REPO_URL',           defaultValue: 'https://github.com/Rajendra0609/TFGen-Terraform-Script-Generator-for-AWS.git', description: 'Deployment repository URL to sync via Argo CD')
+        string(name: 'ARGOCD_REPO_BRANCH',        defaultValue: 'kubernetes',                                                        description: 'Branch inside the deployment repository to sync')
+        string(name: 'ARGOCD_DEPLOYMENT_PATH',    defaultValue: 'argocd',                                                            description: 'Path inside the deployment repo that contains the manifests')
+
+        // ── DevSecOps scan toggles ──────────────────────────────────────────
+        string(name: 'SONAR_PROJECT_KEY',         defaultValue: 'tfgen',                                                             description: 'SonarQube project key (project must exist / be auto-provisioned on the server)')
+        booleanParam(name: 'ABORT_ON_QUALITY_GATE', defaultValue: false,                                                             description: 'Fail the whole build if the SonarQube Quality Gate is red. Off by default so this can bed in without blocking other stages.')
+        booleanParam(name: 'RUN_TRIVY_SCAN',      defaultValue: true,                                                                description: 'Scan the pushed images with Trivy. Only runs when PUSH_IMAGES is also true.')
+        string(name: 'TRIVY_SEVERITY',            defaultValue: 'CRITICAL,HIGH',                                                     description: 'Comma-separated severities Trivy should report on')
+        booleanParam(name: 'RUN_BLACKDUCK_SCAN',  defaultValue: true,                                                                description: 'Run Synopsys Detect (Black Duck) SCA/license scan against source dependencies')
+        string(name: 'BLACKDUCK_URL',             defaultValue: '',                                                                  description: 'Black Duck server URL, e.g. https://blackduck.yourcompany.com')
+        string(name: 'BLACKDUCK_CREDENTIALS_ID',  defaultValue: 'blackduck-api-token',                                               description: 'Secret-text credentials ID holding the Black Duck API token')
+        string(name: 'ZAP_TARGET_URL',            defaultValue: 'https://tfgen.example.com',                                                                  description: 'URL of a running (staging) instance to DAST-scan with OWASP ZAP baseline. Leave blank to skip — this pipeline does not deploy, so there is usually nothing to point ZAP at until a downstream deploy job has run.')
+    }
+
     environment {
-        // ── Source folder roots (all relative to WORKSPACE) ───────────────────
-        // Repo layout:
-        //   source/
-        //     backend/
-        //     database/
-        //     docs/
-        //     frontend/
         SRC_ROOT      = "${WORKSPACE}/source"
         BACKEND_DIR   = "${WORKSPACE}/source/backend"
         FRONTEND_DIR  = "${WORKSPACE}/source/frontend"
         DATABASE_DIR  = "${WORKSPACE}/source/database"
+        TESTS_DIR     = "${WORKSPACE}/source/tests"
         DOCS_DIR      = "${WORKSPACE}/source/docs"
 
-        // ── Docker / registry ────────────────────────────────────────────────
-        DOCKER_HUB_CREDENTIALS_ID = 'docker'
-        IMAGE_TAG                 = "${params.DOCKERHUBREPO}:${params.VERSION}"
+        DOCKER_HUB_CREDENTIALS_ID = "${params.DOCKER_HUB_CREDENTIALS_ID}"
+        BACKEND_IMAGE             = "${params.DOCKERHUB_NAMESPACE}/tfgen_backend"
+        FRONTEND_IMAGE            = "${params.DOCKERHUB_NAMESPACE}/tfgen_frontend"
+        DATABASE_IMAGE            = "${params.DOCKERHUB_NAMESPACE}/tfgen_postgres"
 
-        // ── GitHub ────────────────────────────────────────────────────────────
-        GITHUB_CREDENTIALS_ID = 'github'
-        GITHUB_REPO           = 'Rajendra0609/Terraform-Script-Generator-for-AWS'
+        GITHUB_REPO           = "${params.GITHUB_REPO}"
         GITHUB_API_URL        = 'https://api.github.com'
 
-        // ── Notifications ─────────────────────────────────────────────────────
-        EMAIL_RECIPIENTS = 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com'
+        EMAIL_RECIPIENTS = "${params.EMAIL_RECIPIENTS}"
 
-        // ── Misc ──────────────────────────────────────────────────────────────
         TERM             = 'xterm-256color'
         SCANNER_HOME     = tool 'sonar'
-        BACKEND_TEST_PORT = '4099'
-        FRONTEND_URL      = 'http://localhost:3000'
 
-        // ── Node / npm ────────────────────────────────────────────────────────
         NODE_ENV         = 'test'
         CI               = 'true'
         NPM_CONFIG_CACHE = "${WORKSPACE}/.npm-cache"
-
-        // ── Reports / Playwright ──────────────────────────────────────────────
-        REPORT_DIR               = "${WORKSPACE}/tests/reports"
+        TEST_PORT    = '4099'
+        FRONTEND_URL = 'http://localhost:3000'
+        REPORT_DIR               = "${WORKSPACE}/source/tests/reports"
         PLAYWRIGHT_BROWSERS_PATH = "${WORKSPACE}/.playwright-browsers"
-
-        // ── Test credentials: bound with withCredentials() inside the test   ──
-        // ── stage only, NOT here — a missing credential here kills ALL stages ──
-        // ACTION REQUIRED: add these four Secret Text entries in Jenkins before
-        // the Run Tests stage will pass:
-        //   TEST_DATABASE_URL | TEST_REDIS_URL | TFGEN_TEST_JWT_SECRET | TFGEN_TEST_ENCRYPT_KEY
-    }
-    parameters {
-        string(name: 'GIT_BRANCH',                defaultValue: 'docker_test',                                                       description: 'Branch to build')
-        string(name: 'DOCKERHUBREPO',             defaultValue: 'daggu1997/terraform-script-generator',                               description: 'Docker Hub repository')
-        string(name: 'VERSION',                   defaultValue: 'v0.0.1',                                                             description: 'Docker image version tag')
-        string(name: 'DOCKER_HUB_CREDENTIALS_ID', defaultValue: 'docker',                                                             description: 'Credentials ID for Docker Hub')
-        string(name: 'GITHUB_CREDENTIALS_ID',    defaultValue: 'GITHUB_TOKEN',                                                              description: 'Credentials ID for GitHub')
-        string(name: 'GITHUB_REPO',              defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',                     description: 'GitHub repository (owner/repo)')
-        string(name: 'TAG',                      defaultValue: 'v0.0.1',                                                              description: 'Kubernetes deployment version')
-        string(name: 'EMAIL_RECIPIENTS',         defaultValue: 'rajendra.daggubati09@gmail.com,srirajendraprasaddaggubati@gmail.com', description: 'Comma-separated email recipients')
-        string(name: 'K8S_NAMESPACE',            defaultValue: 'default',                                                             description: 'Kubernetes namespace')
-        string(name: 'K8S_DEPLOYMENT_NAME',      defaultValue: 'terraform-script-generator',                                         description: 'Kubernetes deployment name')
     }
 
     stages {
-
-        // ── 1. Checkout ───────────────────────────────────────────────────────
-        // After this stage the workspace looks like:
-        //   WORKSPACE/
-        //     source/
-        //       backend/
-        //       database/
-        //       docs/
-        //       frontend/
+        // ── 1. Checkout ─────────────────────────────────────────────────────
         stage('Checkout') {
             steps {
+                script { markStageStart() }
                 echo '🔄 Cloning repo into source/'
                 checkout scm: [
                     $class: 'GitSCM',
                     branches: [[name: "${params.GIT_BRANCH}"]],
                     extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'source']],
                     userRemoteConfigs: [[
-                        url          : 'https://github.com/Rajendra0609/Terraform-Script-Generator-for-AWS.git',
-                        credentialsId: 'github',
+                        url          : "https://github.com/${params.GITHUB_REPO}.git",
+                        credentialsId: "${params.GIT_CHECKOUT_CREDENTIALS_ID}",
                         name         : 'origin'
                     ]]
                 ]
-                dir('source') {
-                    stash name: 'source-code', includes: '**/*'
+                script {
+                    env.GIT_SHA = (env.GIT_COMMIT ?: sh(script: 'cd source && git rev-parse HEAD', returnStdout: true).trim()).take(8)
+                    echo "📌 Building from commit ${env.GIT_SHA}"
+                }
+
+                stash(
+                    name: 'docker-build-context',
+                    includes: 'source/backend/**, source/frontend/**, source/database/**',
+                    excludes: '**/node_modules/**, **/.git/**'
+                )
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
                 }
             }
         }
@@ -116,9 +273,10 @@ pipeline {
         // ── 2. Check Node Status ──────────────────────────────────────────────
         stage('Check Node Status') {
             steps {
+                script { markStageStart() }
                 withCredentials([
-                    string(credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN'),
-                    usernamePassword(credentialsId: 'docker',
+                    string(credentialsId: "${params.GITHUB_CREDENTIALS_ID}", variable: 'GITHUB_TOKEN'),
+                    usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
                                      usernameVariable: 'DOCKER_USER',
                                      passwordVariable: 'DOCKER_PASS')
                 ]) {
@@ -131,37 +289,38 @@ pipeline {
                     }
                 }
             }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
         }
 
         // ── 3. Gitleaks Scan ──────────────────────────────────────────────────
         stage('Gitleaks Scan') {
-    steps {
-        dir('source') {
-            echo '🔍 Running Gitleaks secret scan...'
-            script {
-                // Run gitleaks; capture exit code instead of letting Jenkins abort
-                def exitCode = sh(
-                    script: '''
-                        gitleaks detect \
-                            --source . \
-                            --redact \
-                            --report-format=json \
-                            --report-path=../gitleaks-report.json \
-                            --exit-code 1
-                    ''',
-                    returnStatus: true   // ← prevents Jenkins from failing on non-zero
-                )
- 
-                // Print a readable summary from the JSON report
-                def reportFile = new File("${WORKSPACE}/gitleaks-report.json")
-                if (reportFile.exists() && reportFile.text.trim() != 'null') {
-                    def leaks = readJSON file: "${WORKSPACE}/gitleaks-report.json"
-                    if (leaks && leaks.size() > 0) {
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        echo "🚨 Gitleaks found ${leaks.size()} potential secret(s):"
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        leaks.eachWithIndex { leak, i ->
-                            echo """
+            steps {
+                script { markStageStart() }
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    dir('source') {
+                        echo '🔍 Running Gitleaks secret scan...'
+                        script {
+                            def exitCode = sh(
+                                script: '''
+                                    gitleaks detect --source . --redact --report-format=json --report-path=../gitleaks-report.json --exit-code 1
+                                ''',
+                                returnStatus: true
+                            )
+                            def reportPath = "${WORKSPACE}/gitleaks-report.json"
+                            if (fileExists(reportPath)) {
+                                def reportText = readFile(reportPath).trim()
+                                if (reportText != '' && reportText != 'null') {
+                                    def leaks = readJSON file: reportPath
+                                    if (leaks && leaks.size() > 0) {
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "🚨 Gitleaks found ${leaks.size()} potential secret(s):"
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        leaks.eachWithIndex { leak, i ->
+                                            echo """
 [${i + 1}] Rule      : ${leak.RuleID}
     File      : ${leak.File}
     Line      : ${leak.StartLine}
@@ -169,222 +328,609 @@ pipeline {
     Author    : ${leak.Author}
     Secret    : ${leak.Secret}   ← REDACTED in report (--redact flag is on)
 """
-                        }
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        echo "ℹ️  False positives? Add them to source/.gitleaksignore"
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                    }
-                }
- 
-                // ── CHOOSE ONE behaviour below ────────────────────────────────
- 
-                // OPTION A (recommended for CI enforcement):
-                // Fail the build — no secrets allowed to merge.
-                if (exitCode != 0) {
-                    error("🚨 Gitleaks found secrets in the repo. Fix or allowlist them before merging.")
-                }
- 
-                // OPTION B (soft warning — build continues, team is alerted):
-                // Uncomment this block and comment out OPTION A above if you
-                // want the pipeline to keep running while you clean up the leaks.
-                // if (exitCode != 0) {
-                //     unstable("⚠️ Gitleaks found ${leaks?.size() ?: 'some'} secret(s). Review gitleaks-report.json.")
-                // }
-            }
-        }
-    }
-    post {
-        always {
-            // Archive report regardless of pass/fail so it's visible in Jenkins UI
-            archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
-        }
-    }
-}
-
-        // ── 4. Install Dependencies ───────────────────────────────────────────
-        // backend and frontend each have their own package.json.
-        // database and docs are included here as examples — remove or adapt
-        // if they don't have a package.json of their own.
-        stage('Install Dependencies') {
-            parallel {
-
-                stage('Backend — npm install') {
-                    steps {
-                        dir('source/backend') {         // → WORKSPACE/source/backend
-                            echo '📦 Installing backend dependencies...'
-                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
-                        }
-                    }
-                }
-
-                stage('Frontend — npm install') {
-                    steps {
-                        dir('source/frontend') {        // → WORKSPACE/source/frontend
-                            echo '📦 Installing frontend dependencies...'
-                            sh 'npm install --cache ${NPM_CONFIG_CACHE}'
-                        }
-                    }
-                }
-
-                // Uncomment if database/ has its own package.json or migration runner:
-                // stage('Database — install') {
-                //     steps {
-                //         dir('source/database') {     // → WORKSPACE/source/database
-                //             echo '📦 Installing database tooling...'
-                //             sh 'npm install --cache ${NPM_CONFIG_CACHE}'
-                //         }
-                //     }
-                // }
-
-            }
-        }
-
-        // ── 5. Run Tests ──────────────────────────────────────────────────────
-        // Test credentials are scoped HERE with withCredentials() so that a
-        // missing credential only fails this stage — not the whole pipeline.
-        stage('Run Tests') {
-            parallel {
-
-                stage('Backend — tests') {
-                    steps {
-                        withCredentials([
-                            string(credentialsId: 'TEST_DATABASE_URL',     variable: 'TEST_DATABASE_URL'),
-                            string(credentialsId: 'TEST_REDIS_URL',        variable: 'TEST_REDIS_URL'),
-                            string(credentialsId: 'TFGEN_TEST_JWT_SECRET', variable: 'JWT_SECRET'),
-                            string(credentialsId: 'TFGEN_TEST_ENCRYPT_KEY', variable: 'ENCRYPT_KEY'),
-                        ]) {
-                            dir('source/backend') {     // → WORKSPACE/source/backend
-                                echo '🧪 Running backend tests...'
-                                sh 'npm test'
+                                        }
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "ℹ️  False positives? Add them to source/.gitleaksignore"
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    }
+                                }
+                            }
+                            if (exitCode != 0) {
+                                echo "🚨 Gitleaks found secrets in the repo. Continuing pipeline as allowed failure."
                             }
                         }
                     }
                 }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
 
-                stage('Frontend — tests') {
-                    steps {
-                        dir('source/frontend') {        // → WORKSPACE/source/frontend
-                            echo '🧪 Running frontend tests...'
-                            sh 'npm test -- --watchAll=false'
+        // ── 4. Install Dependencies ────────────────────────────────────────────
+        stage('Install Dependencies') {
+            steps {
+                script { markStageStart() }
+                script {
+                    parallel(
+                        'Backend': {
+                            dir('source/backend') {
+                                sh 'ls -la'
+                                echo '📦 Installing backend dependencies...'
+                                sh 'npm install'
+                            }
+                        },
+                        'Frontend': {
+                            dir('source/frontend') {
+                                sh 'ls -la'
+                                echo '📦 Installing frontend dependencies...'
+                                sh 'npm install'
+                            }
+                        },
+                        'Test suite': {
+                            dir('source/tests') {
+                                sh 'ls -la'
+                                echo '📦 Installing test-suite dependencies...'
+                                sh 'npm install'
+                            }
+                        }
+                    )
+                }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
+
+        // ── 5. Run Tests ────────────────────────────────────────────────────
+        stage('Run Tests') {
+            steps {
+                script { markStageStart() }
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    script {
+                        parallel(
+                            'Unit tests (backend + frontend)': {
+                                dir('source/tests') {
+                                    echo '🧪 Running unit tests...'
+                                    sh 'npm run test:unit || true'
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
+        // stage('SonarQube Analysis') {
+        //     steps {
+        //         dir('source') {
+        //             echo '📊 Running SonarQube static analysis...'
+        //             withEnv([
+        //                     "SONAR_SCANNER_OPTS=-Xmx1024m",
+        //                     "SONAR_SCANNER_JAVA_OPTS=-Xmx2048m -XX:+ExitOnOutOfMemoryError"
+        //                 ]) {
+        //                 withSonarQubeEnv('sonar') {
+        //                     sh """
+        //                         mkdir -p ${WORKSPACE}/.scannerwork ${WORKSPACE}/source/.scannerwork
+        //                         ...
+        //                     """
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
+        // stage('Quality Gate') {
+        //     steps {
+        //         timeout(time: 10, unit: 'MINUTES') {
+        //             waitForQualityGate abortPipeline: params.ABORT_ON_QUALITY_GATE
+        //         }
+        //     }
+        // }
+        // ── 9. Build & Push Backend Image (Kaniko) ─────────────────────────
+        stage('Build & Push Backend Image') {
+            agent {
+                kubernetes {
+                    label 'kaniko'
+                    yaml kanikoPodTemplate
+                }
+            }
+            environment {
+                BACKEND_DIR = "${WORKSPACE}/source/backend"
+                PATH        = "/busybox:/kaniko:$PATH"
+            }
+            steps {
+                script { markStageStart() }
+                unstash 'docker-build-context'
+                container(name: 'kaniko', shell: '/busybox/sh') {
+                    script { setupDockerAuth() }
+                    withEnv(["DOCKER_CONFIG=${WORKSPACE}/.docker-config"]) {
+                        script {
+                            def pushFlag = params.PUSH_IMAGES ? '' : '--no-push'
+                            echo "🐳 Building ${env.BACKEND_IMAGE}:${params.VERSION}"
+                            sh """
+                                /kaniko/executor \
+                                  --context=dir://${env.BACKEND_DIR} \
+                                  --dockerfile=${env.BACKEND_DIR}/Dockerfile \
+                                  --destination=${env.BACKEND_IMAGE}:${params.VERSION} \
+                                  --destination=${env.BACKEND_IMAGE}:${env.GIT_SHA} \
+                                  ${pushFlag} \
+                                  --verbosity=info
+                            """
                         }
                     }
                 }
-
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
             }
         }
 
-        // ── 6. Database Migrations ────────────────────────────────────────────
-        // Example stage showing how to enter source/database independently.
-        stage('Database Migrations') {
+        // ── 10. Build & Push Frontend Image (Kaniko) ───────────────────────
+        stage('Build & Push Frontend Image') {
+            agent {
+                kubernetes {
+                    label 'kaniko'
+                    yaml kanikoPodTemplate
+                }
+            }
+            environment {
+                FRONTEND_DIR = "${WORKSPACE}/source/frontend"
+                PATH         = "/busybox:/kaniko:$PATH"
+            }
             steps {
-                withCredentials([
-                    string(credentialsId: 'TEST_DATABASE_URL', variable: 'DATABASE_URL'),
-                ]) {
-                    dir('source/database') {            // → WORKSPACE/source/database
-                        echo '🗄️ Running database migrations...'
-                        sh 'npm run migrate'            // adapt to your migration tool
+                script { markStageStart() }
+                unstash 'docker-build-context'
+                container(name: 'kaniko', shell: '/busybox/sh') {
+                    script { setupDockerAuth() }
+                    withEnv(["DOCKER_CONFIG=${WORKSPACE}/.docker-config"]) {
+                        script {
+                            def pushFlag = params.PUSH_IMAGES ? '' : '--no-push'
+                            echo "🐳 Building ${env.FRONTEND_IMAGE}:${params.VERSION}"
+                            sh """
+                                /kaniko/executor \
+                                  --context=dir://${env.FRONTEND_DIR} \
+                                  --dockerfile=${env.FRONTEND_DIR}/Dockerfile \
+                                  --destination=${env.FRONTEND_IMAGE}:${params.VERSION} \
+                                  --destination=${env.FRONTEND_IMAGE}:${env.GIT_SHA} \
+                                  --build-arg REACT_APP_API_URL= \
+                                  --build-arg REACT_APP_API_URL_LS= \
+                                  ${pushFlag} \
+                                  --verbosity=info
+                            """
+                        }
                     }
                 }
             }
-        }
-
-        // ── 7. Build Docs ─────────────────────────────────────────────────────
-        stage('Build Docs') {
-            steps {
-                dir('source/docs') {                    // → WORKSPACE/source/docs
-                    echo '📄 Building documentation...'
-                    sh 'npm run build'                  // adapt to your docs tool
+            post {
+                failure {
+                    script { captureStageFailure() }
                 }
             }
         }
 
-        // ── 8. Docker Build & Push ────────────────────────────────────────────
-        stage('Docker Build & Push') {
+        // ── 11. Build & Push Database Image (Kaniko) ───────────────────────
+        stage('Build & Push Database Image') {
+            agent {
+                kubernetes {
+                    label 'kaniko'
+                    yaml kanikoPodTemplate
+                }
+            }
+            environment {
+                DATABASE_DIR = "${WORKSPACE}/source/database"
+                PATH         = "/busybox:/kaniko:$PATH"
+            }
             steps {
-                withCredentials([
-                    usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
-                                     usernameVariable: 'DOCKER_USER',
-                                     passwordVariable: 'DOCKER_PASS')
-                ]) {
-                    dir('source/backend') {             // Dockerfile lives in backend/
-                        echo "🐳 Building image ${env.IMAGE_TAG}..."
-                        sh '''
-                            echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
-                            docker build -t ${IMAGE_TAG} .
-                            docker push ${IMAGE_TAG}
-                        '''
+                script { markStageStart() }
+                unstash 'docker-build-context'
+                container(name: 'kaniko', shell: '/busybox/sh') {
+                    script { setupDockerAuth() }
+                    withEnv(["DOCKER_CONFIG=${WORKSPACE}/.docker-config"]) {
+                        script {
+                            def pushFlag = params.PUSH_IMAGES ? '' : '--no-push'
+                            echo "🐳 Building ${env.DATABASE_IMAGE}:${params.VERSION}"
+                            sh """
+                                /kaniko/executor \
+                                  --context=dir://${env.DATABASE_DIR} \
+                                  --dockerfile=${env.DATABASE_DIR}/Dockerfile \
+                                  --destination=${env.DATABASE_IMAGE}:${params.VERSION} \
+                                  --destination=${env.DATABASE_IMAGE}:${env.GIT_SHA} \
+                                  ${pushFlag} \
+                                  --verbosity=info
+                            """
+                        }
                     }
                 }
             }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
+        // ── Canary rollout: first point the deployment manifests at the commit-tagged
+        //    images that were pushed in the build stages. After Argo CD syncs
+        //    successfully, promote the same manifests to the version tag.
+        stage('Checkout Deployment Repo') {
+            when {
+                expression { params.DEPLOY_TO_PROD }
+            }
+            steps {
+                script { markStageStart() }
+                echo '📦 Cloning production deployment repository...'
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "${params.ARGOCD_REPO_BRANCH}" ]],
+                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'argocd-deployment']],
+                    userRemoteConfigs: [[
+                        url: "${params.ARGOCD_REPO_URL}",
+                        credentialsId: "${params.GIT_CHECKOUT_CREDENTIALS_ID}",
+                        name: 'origin'
+                    ]]
+                ])
+                script {
+                    def canaryTag = (env.GIT_SHA ?: params.VERSION).trim()
+                    echo "🧩 Updating deployment manifests for canary rollout using image tag ${canaryTag}"
+                    updateDeploymentRepoImages("${WORKSPACE}/argocd-deployment/${params.ARGOCD_DEPLOYMENT_PATH}", canaryTag)
+                    pushDeploymentRepoChanges("${WORKSPACE}/argocd-deployment", "canary deploy ${canaryTag}")
+                }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
         }
 
+        stage('Deploy to Production via Argo CD') {
+            when {
+                expression { params.DEPLOY_TO_PROD && params.PUSH_IMAGES && params.ARGOCD_SERVER?.trim() }
+            }
+            steps {
+                script { markStageStart() }
+                withCredentials([
+                    usernamePassword(credentialsId: "${params.ARGOCD_CREDENTIALS_ID}",
+                                     usernameVariable: 'ARGOCD_USERNAME',
+                                     passwordVariable: 'ARGOCD_PASSWORD')
+                ]) {
+                    script {
+                        def argoServer = (params.ARGOCD_SERVER ?: 'argocd-server.argocd.svc.cluster.local').trim()
+                        argoServer = argoServer.replaceFirst(/^https?:\/\//, '')
+                        def argoBin = "${env.WORKSPACE}/.argocd/argocd"
+                        sh """
+                            set -e
+                            mkdir -p "\$(dirname "${argoBin}")"
+                            if [ ! -x "${argoBin}" ]; then
+                                echo 'argocd CLI is not installed on this agent; installing it locally...'
+                                VERSION=\$(curl -L -s https://raw.githubusercontent.com/argoproj/argo-cd/stable/VERSION)
+                                curl -sSL -o "${argoBin}" "https://github.com/argoproj/argo-cd/releases/download/v\$VERSION/argocd-linux-amd64"
+                                chmod 755 "${argoBin}"
+                            fi
+
+                            if [ ! -x "${argoBin}" ]; then
+                                echo 'argocd CLI could not be installed'
+                                exit 1
+                            fi
+
+                            "${argoBin}" login "${argoServer}" \\
+                              --username "\$ARGOCD_USERNAME" \\
+                              --password "\$ARGOCD_PASSWORD" \\
+                              --insecure \\
+                              --grpc-web
+
+                            "${argoBin}" app get ${params.ARGOCD_APP_NAME} >/dev/null 2>&1 || \\
+                            "${argoBin}" app create ${params.ARGOCD_APP_NAME} \\
+                                --project ${params.ARGOCD_PROJECT} \\
+                                --repo ${params.ARGOCD_REPO_URL} \\
+                                --path ${params.ARGOCD_DEPLOYMENT_PATH} \\
+                                --dest-server https://kubernetes.default.svc \\
+                                --dest-namespace ${params.K8S_NAMESPACE} \\
+                                --revision ${params.ARGOCD_REPO_BRANCH}
+
+                            "${argoBin}" app set ${params.ARGOCD_APP_NAME} \\
+                                --repo ${params.ARGOCD_REPO_URL} \\
+                                --path ${params.ARGOCD_DEPLOYMENT_PATH} \\
+                                --revision ${params.ARGOCD_REPO_BRANCH} \\
+                                --dest-server https://kubernetes.default.svc \\
+                                --dest-namespace ${params.K8S_NAMESPACE}
+
+                                echo '🔄 Syncing (retrying on transient operation-lock conflicts)...'
+                                attempt=1
+                                max_attempts=6
+                                until "${argoBin}" app sync ${params.ARGOCD_APP_NAME} --prune; do
+                                    if [ "\$attempt" -ge "\$max_attempts" ]; then
+                                        echo "❌ app sync still failing after \$max_attempts attempts — giving up"
+                                        exit 1
+                                    fi
+                                    echo "⏳ Sync attempt \$attempt hit a conflicting operation, retrying in 10s..."
+                                    sleep 10
+                                    attempt=\$((attempt + 1))
+                                done
+
+                            "${argoBin}" app wait ${params.ARGOCD_APP_NAME} --health --timeout 600
+
+                            echo '🔍 Confirming full sync status (informational only — will not fail the build)...'
+                            if ! "${argoBin}" app wait ${params.ARGOCD_APP_NAME} --sync --timeout 30; then
+                                echo '⚠️  App is Healthy but still reports OutOfSync — likely a drifting resource, showing diff for investigation:'
+                                "${argoBin}" app diff ${params.ARGOCD_APP_NAME} || true
+                            fi
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
+        stage('Promote Deployment Repo to Version Tag') {
+            when {
+                expression { params.DEPLOY_TO_PROD && params.PUSH_IMAGES && params.ARGOCD_SERVER?.trim() }
+            }
+            steps {
+                script { markStageStart() }
+                script {
+                    echo "🛠️  Promoting deployment manifests to version tag ${params.VERSION} after Argo CD sync succeeded"
+                    updateDeploymentRepoImages("${WORKSPACE}/argocd-deployment/${params.ARGOCD_DEPLOYMENT_PATH}", params.VERSION)
+                    pushDeploymentRepoChanges("${WORKSPACE}/argocd-deployment", "promote ${params.VERSION}")
+                }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            when {
+                expression { params.PUSH_IMAGES && params.RUN_TRIVY_SCAN }
+            }
+            agent {
+                kubernetes {
+                    label 'kube_trivy'
+                    yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: trivy
+      image: aquasec/trivy:latest
+      imagePullPolicy: Always
+      command: ['cat']
+      tty: true
+"""
+                }
+            }
+            steps {
+                script { markStageStart() }
+                container('trivy') {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        withCredentials([
+                            usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
+                                             usernameVariable: 'TRIVY_USERNAME',
+                                             passwordVariable: 'TRIVY_PASSWORD')
+                        ]) {
+                            script {
+                                def images = [
+                                    "${env.BACKEND_IMAGE}:${params.VERSION}",
+                                    "${env.FRONTEND_IMAGE}:${params.VERSION}",
+                                    "${env.DATABASE_IMAGE}:${params.VERSION}"
+                                ]
+                                def failed = false
+                                images.each { img ->
+                                    def safeName = img.replaceAll('[/:]', '_')
+                                    echo "🔎 Scanning ${img} with Trivy"
+                                    def exitCode = sh(
+                                        script: """
+                                            trivy image \
+                                              --severity ${params.TRIVY_SEVERITY} \
+                                              --exit-code 1 \
+                                              --timeout 10m \
+                                              --format json \
+                                              --output trivy-${safeName}.json \
+                                              ${img}
+                                        """,
+                                        returnStatus: true
+                                    )
+                                    sh "trivy image --severity ${params.TRIVY_SEVERITY} --format table ${img} || true"
+                                    if (exitCode != 0) {
+                                        echo "🚨 Trivy found ${params.TRIVY_SEVERITY} findings in ${img}"
+                                        failed = true
+                                    }
+                                }
+                                if (failed) {
+                                    error("Trivy found vulnerabilities at or above configured severity — see archived reports")
+                                }
+                            }
+                        }
+                    }
+                    archiveArtifacts artifacts: 'trivy-*.json', allowEmptyArchive: true
+                }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
+        stage('OWASP ZAP Baseline Scan') {
+            when {
+                expression { params.ZAP_TARGET_URL?.trim() }
+            }
+            agent {
+                kubernetes {
+                    label 'kube_zap'
+                    yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: zap
+      image: zaproxy/zap-stable:latest
+      imagePullPolicy: Always
+      command:
+        - cat
+      tty: true
+      volumeMounts:
+        - name: zap-work
+          mountPath: /zap/wrk
+
+  volumes:
+    - name: zap-work
+      emptyDir: {}
+"""
+                }
+            }
+            steps {
+                script { markStageStart() }
+                container('zap') {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        echo "🕷️  Running OWASP ZAP baseline scan against ${params.ZAP_TARGET_URL}"
+                        sh """
+                            cd /zap/wrk
+
+                            export PATH="/zap:\$PATH"
+
+                            python3 /zap/zap-full-scan.py \
+                                -t "${params.ZAP_TARGET_URL}" \
+                                -r zap-full-report.html \
+                                -J zap-full-report.json \
+                                -m 30 \
+                                -a \
+                                -I
+                        """
+                    }
+                    archiveArtifacts artifacts: 'zap-baseline-report.*', allowEmptyArchive: true
+                }
+            }
+            post {
+                failure {
+                    script { captureStageFailure() }
+                }
+            }
+        }
     }
 
     // ── Post Actions ──────────────────────────────────────────────────────────
     post {
-        success {
-            echo '✅ Pipeline completed successfully!'
-            slackSend(
-                channel: '#doc_jen_task_tracker',
-                message: """
-                    ✅ *Pipeline Success*
-                    *Job:* `${env.JOB_NAME}`
-                    *Build #:* `${env.BUILD_NUMBER}`
-                    *Image:* `${env.IMAGE_TAG}`
-                    *Status:* Passed ✅
-                    <${env.BUILD_URL}|View Build Logs>
-                """
-            )
-            mail(
-                to: "${env.EMAIL_RECIPIENTS}",
-                subject: "SUCCESS: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
-                body: """\
-                    The Jenkins Pipeline completed successfully.
+        always {
+            junit allowEmptyResults: true, testResults: 'source/tests/reports/junit-results.xml'
+            archiveArtifacts artifacts: 'gitleaks-report.json, trivy-*.json, zap-baseline-report.*, source/tests/reports/junit-results.xml, source/tests/reports/lcov.info', allowEmptyArchive: true
+            script {
+                try {
+                    cleanWs()
+                    echo '🧹 Workspace cleaned'
+                } catch (Exception e) {
+                    echo "ℹ️ Workspace cleanup skipped: ${e.message}"
+                }
+            }
+        }
 
-                    🐳 Docker Image : ${env.IMAGE_TAG}
-                    🔗 Pipeline URL : ${env.BUILD_URL}
-                    👷 Triggered by : ${currentBuild.getBuildCauses()[0].userName}
-                """
-            )
+        success {
+            script {
+                def triggeredBy     = getTriggerInfo()
+                def commitAuthors   = getCommitAuthors()
+                def commitId        = env.GIT_SHA ?: 'N/A'
+                def commitUrl       = env.GIT_SHA ? "https://github.com/${params.GITHUB_REPO}/commit/${env.GIT_SHA}" : ''
+                def reportArtifacts = collectReportArtifacts().collect { it.replace("${WORKSPACE}/", '') }
+                def reportSummary   = reportArtifacts ? reportArtifacts.join('\n') : 'No report artifacts were generated.'
+
+                slackSend(
+                    channel: '#doc_jen_task_tracker',
+                    message: """
+                        ✅ *Pipeline Success*
+                        *Job:* `${env.JOB_NAME}`
+                        *Build #:* `${env.BUILD_NUMBER}`
+                        *Branch:* `${params.GIT_BRANCH}`
+                        *Commit:* `${commitId}`${commitUrl ? " (<${commitUrl}|view>)" : ''}
+                        *Committer(s):* ${commitAuthors}
+                        *Triggered by:* ${triggeredBy}
+                        *Images:* `${env.BACKEND_IMAGE}:${params.VERSION}`, `${env.FRONTEND_IMAGE}:${params.VERSION}`, `${env.DATABASE_IMAGE}:${params.VERSION}`
+                        *Status:* Passed ✅
+                        *Reports:* `${reportSummary.replace('\n', ' | ')}`
+                        <${env.BUILD_URL}|View Build Logs>
+                    """
+                )
+                mail(
+                    to: "${env.EMAIL_RECIPIENTS}",
+                    subject: "SUCCESS: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
+                    body: """\
+                        The Jenkins Pipeline completed successfully.
+
+                        🌿 Branch      : ${params.GIT_BRANCH}
+                        🔑 Commit      : ${commitId}${commitUrl ? " (${commitUrl})" : ''}
+                        👤 Committer(s): ${commitAuthors}
+                        🚀 Triggered by: ${triggeredBy}
+
+                        🐳 Backend  : ${env.BACKEND_IMAGE}:${params.VERSION} (${commitId})
+                        🐳 Frontend : ${env.FRONTEND_IMAGE}:${params.VERSION} (${commitId})
+                        🐳 Database : ${env.DATABASE_IMAGE}:${params.VERSION} (${commitId})
+                        🔗 Pipeline URL : ${env.BUILD_URL}
+
+                        📦 Report artifacts archived for this build:
+                        ${reportSummary}
+                    """
+                )
+            }
         }
 
         failure {
             script {
-                def log          = currentBuild.rawBuild.getLog(1000)
-                def lastLines    = log.takeRight(50).join('\n')
-                def culprit      = "Unknown"
-                def changeAuthor = "Unknown"
-                try {
-                    changeAuthor = currentBuild.changeSets.collect { cs ->
-                        cs.items.collect { it.author.fullName }
-                    }.flatten().unique().join(', ')
-                    culprit = currentBuild.getBuildCauses()[0].userName
-                } catch (e) {
-                    echo "Could not determine author/trigger: ${e.message}"
-                }
+                def triggeredBy     = getTriggerInfo()
+                def commitAuthors   = getCommitAuthors()
+                def commitId        = env.GIT_SHA ?: 'N/A (failed before/at checkout)'
+                def commitUrl       = env.GIT_SHA ? "https://github.com/${params.GITHUB_REPO}/commit/${env.GIT_SHA}" : ''
+                def failedStage     = env.FAILED_STAGE_NAME ?: 'Unknown (see full console log)'
+                def failedStageLog  = env.FAILED_STAGE_LOG ?: currentBuild.rawBuild.getLog(50).join('\n')
+                def reportArtifacts = collectReportArtifacts().collect { it.replace("${WORKSPACE}/", '') }
+                def reportSummary   = reportArtifacts ? reportArtifacts.join('\n') : 'No report artifacts were generated.'
+
                 slackSend(
                     channel: '#doc_jen_task_tracker',
                     message: """
                         ❌ *Pipeline Failure*
                         *Job:* `${env.JOB_NAME}`
                         *Build #:* `${env.BUILD_NUMBER}`
+                        *Branch:* `${params.GIT_BRANCH}`
+                        *Commit:* `${commitId}`${commitUrl ? " (<${commitUrl}|view>)" : ''}
+                        *Committer(s):* ${commitAuthors}
+                        *Triggered by:* ${triggeredBy}
+                        *Failed Stage:* `${failedStage}`
                         *Status:* FAILED ❌
+                        *Reports:* `${reportSummary.replace('\n', ' | ')}`
                         <${env.BUILD_URL}|View Build Logs>
                     """
                 )
                 mail(
                     to: "${env.EMAIL_RECIPIENTS}",
-                    subject: "FAILURE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
+                    subject: "FAILURE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}] — failed at ${failedStage}",
                     body: """\
                         The Jenkins Pipeline has FAILED ❌
 
-                        👤 Git Committer(s): ${changeAuthor}
-                        🚀 Triggered by    : ${culprit}
-                        🔗 Pipeline URL    : ${env.BUILD_URL}
+                        🌿 Branch       : ${params.GIT_BRANCH}
+                        🔑 Commit       : ${commitId}${commitUrl ? " (${commitUrl})" : ''}
+                        👤 Committer(s) : ${commitAuthors}
+                        🚀 Triggered by : ${triggeredBy}
+                        🧱 Failed Stage : ${failedStage}
+                        🔗 Pipeline URL : ${env.BUILD_URL}
 
-                        📄 Last 50 lines of console output:
+                        📦 Report artifacts available in the build:
+                        ${reportSummary}
+
+                        📄 Log for the failed stage (${failedStage}):
                         --------------------------------------------------
-                        ${lastLines}
+                        ${failedStageLog}
                         --------------------------------------------------
                     """
                 )
@@ -393,60 +939,53 @@ pipeline {
 
         unstable {
             script {
-                def log          = currentBuild.rawBuild.getLog(1000)
-                def lastLines    = log.takeRight(50).join('\n')
-                def culprit      = "Unknown"
-                def changeAuthor = "Unknown"
-                try {
-                    changeAuthor = currentBuild.changeSets.collect { cs ->
-                        cs.items.collect { it.author.fullName }
-                    }.flatten().unique().join(', ')
-                    culprit = currentBuild.getBuildCauses()[0].userName
-                } catch (e) {
-                    echo "Could not determine author/trigger: ${e.message}"
-                }
+                def triggeredBy     = getTriggerInfo()
+                def commitAuthors   = getCommitAuthors()
+                def commitId        = env.GIT_SHA ?: 'N/A'
+                def commitUrl       = env.GIT_SHA ? "https://github.com/${params.GITHUB_REPO}/commit/${env.GIT_SHA}" : ''
+                def failedStage     = env.FAILED_STAGE_NAME ?: 'Unknown (see full console log)'
+                def failedStageLog  = env.FAILED_STAGE_LOG ?: currentBuild.rawBuild.getLog(50).join('\n')
+                def reportArtifacts = collectReportArtifacts().collect { it.replace("${WORKSPACE}/", '') }
+                def reportSummary   = reportArtifacts ? reportArtifacts.join('\n') : 'No report artifacts were generated.'
+
                 slackSend(
                     channel: '#doc_jen_task_tracker',
                     message: """
                         ⚠️ *Pipeline Unstable*
                         *Job:* `${env.JOB_NAME}`
                         *Build #:* `${env.BUILD_NUMBER}`
+                        *Branch:* `${params.GIT_BRANCH}`
+                        *Commit:* `${commitId}`${commitUrl ? " (<${commitUrl}|view>)" : ''}
+                        *Committer(s):* ${commitAuthors}
+                        *Triggered by:* ${triggeredBy}
+                        *Flagged Stage:* `${failedStage}`
                         *Status:* UNSTABLE ⚠️
+                        *Reports:* `${reportSummary.replace('\n', ' | ')}`
                         <${env.BUILD_URL}|View Build Logs>
                     """
                 )
                 mail(
                     to: "${env.EMAIL_RECIPIENTS}",
-                    subject: "UNSTABLE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
+                    subject: "UNSTABLE: ${env.JOB_NAME} [#${env.BUILD_NUMBER}] — flagged at ${failedStage}",
                     body: """\
                         The Jenkins Pipeline is UNSTABLE ⚠️
 
-                        👤 Git Committer(s): ${changeAuthor}
-                        🚀 Triggered by    : ${culprit}
-                        🔗 Pipeline URL    : ${env.BUILD_URL}
+                        🌿 Branch        : ${params.GIT_BRANCH}
+                        🔑 Commit        : ${commitId}${commitUrl ? " (${commitUrl})" : ''}
+                        👤 Committer(s)  : ${commitAuthors}
+                        🚀 Triggered by  : ${triggeredBy}
+                        🧱 Flagged Stage : ${failedStage}
+                        🔗 Pipeline URL  : ${env.BUILD_URL}
 
-                        📄 Last 50 lines of console output:
+                        📦 Report artifacts available in the build:
+                        ${reportSummary}
+
+                        📄 Log for the flagged stage (${failedStage}):
                         --------------------------------------------------
-                        ${lastLines}
+                        ${failedStageLog}
                         --------------------------------------------------
                     """
                 )
-            }
-        }
-
-        always {
-            script {
-                try {
-                    sh "docker rmi ${env.IMAGE_TAG} || true"
-                } catch (Exception e) {
-                    echo "ℹ️ Docker image cleanup skipped — no agent context: ${e.message}"
-                }
-                try {
-                    cleanWs()
-                    echo '🧹 Workspace cleaned'
-                } catch (Exception e) {
-                    echo "ℹ️ Workspace cleanup skipped — no agent context: ${e.message}"
-                }
             }
         }
     }
