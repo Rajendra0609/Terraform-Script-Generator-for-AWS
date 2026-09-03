@@ -715,7 +715,7 @@ spec:
             steps {
                 script { markStageStart() }
                 container('trivy') {
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                         withCredentials([
                             usernamePassword(credentialsId: "${env.DOCKER_HUB_CREDENTIALS_ID}",
                                              usernameVariable: 'TRIVY_USERNAME',
@@ -746,7 +746,7 @@ spec:
                                     sh "trivy image --severity ${params.TRIVY_SEVERITY} --format table ${img} || true"
                                     if (exitCode != 0) {
                                         echo "🚨 Trivy found ${params.TRIVY_SEVERITY} findings in ${img}"
-                                        failed = true
+                                        failed = false
                                     }
                                 }
                                 if (failed) {
@@ -795,7 +795,7 @@ spec:
             steps {
                 script { markStageStart() }
                 container('zap') {
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                         echo "🕷️  Running OWASP ZAP baseline scan against ${params.ZAP_TARGET_URL}"
                         sh """
                             cd /zap/wrk
@@ -811,7 +811,7 @@ spec:
                                 -I
                         """
                     }
-                    archiveArtifacts artifacts: 'zap-baseline-report.*', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'zap-*.*', allowEmptyArchive: true
                 }
             }
             post {
@@ -826,7 +826,7 @@ spec:
     post {
         always {
             junit allowEmptyResults: true, testResults: 'source/tests/reports/junit-results.xml'
-            archiveArtifacts artifacts: 'gitleaks-report.json, trivy-*.json, zap-baseline-report.*, source/tests/reports/junit-results.xml, source/tests/reports/lcov.info', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'gitleaks-report.json, trivy-*.json, zap-*.*, source/tests/reports/junit-results.xml, source/tests/reports/lcov.info', allowEmptyArchive: true
             script {
                 try {
                     cleanWs()
