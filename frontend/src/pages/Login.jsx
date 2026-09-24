@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import API from '../api/client';
+import { APP_VERSION } from '../version';
 
 const FEATURES = [
   { icon: '🕸️', label: 'Visual graph builder',   sub: '44+ AWS services, drag & connect' },
@@ -436,7 +437,7 @@ export default function Login({ initialMode = 'login' }) {
         <div style={{ marginTop: 48, display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#00A87C', boxShadow: '0 0 6px rgba(0,168,124,0.5)' }} />
           <span style={{ fontSize: 12, color: '#6B7280', fontWeight: 600 }}>
-            {process.env.REACT_APP_APP_VERSION || '0.0.1'} — {process.env.REACT_APP_APP_ENV || 'development'} ready
+            {APP_VERSION} — {process.env.REACT_APP_APP_ENV || 'development'} ready
           </span>
         </div>
       </div>

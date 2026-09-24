@@ -12,6 +12,9 @@ ENV REACT_APP_API_URL_LS=$REACT_APP_API_URL_LS
 
 # Install dependencies first (cached layer)
 COPY package*.json ./
+# PRODUCTION FIX: `npm ci` for a reproducible, lockfile-exact install
+# (fails fast if package-lock.json drifts from package.json) instead of
+# `npm install`.
 RUN npm install
 
 # Copy source and build

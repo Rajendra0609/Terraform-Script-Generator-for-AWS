@@ -17,8 +17,9 @@
  */
 const router = require('express').Router();
 const db = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { authMiddleware, requireRole } = require('../middleware/auth');
-const { audit } = require('../middleware/audit');
+const { audit, attachAuditResponseHook } = require('../middleware/audit');
 const { BUILT_IN_TEMPLATES, evaluateAllPolicies, evalJsSubset } = require('../services/opaEval');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -46,6 +47,10 @@ ensurePolicyTable();
 
 // ─── All policy routes require authentication ─────────────────────────────────
 router.use(authMiddleware);
+// SECURITY FIX (H-01): audit() calls below were a silent no-op without this —
+// the entire /api/policies CRUD surface (create/update/delete/toggle a
+// governance rule) had no audit trail at all.
+router.use(attachAuditResponseHook);
 
 // ─── GET /api/policies ────────────────────────────────────────────────────────
 router.get('/', requireRole('user'), async (req, res) => {
@@ -60,7 +65,7 @@ router.get('/', requireRole('user'), async (req, res) => {
     `);
     res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch policies');
   }
 });
 
@@ -75,7 +80,7 @@ router.get('/:id', requireRole('user'), async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Policy not found' });
     res.json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch policy');
   }
 });
 
@@ -99,7 +104,7 @@ router.post('/', requireRole('admin'), audit('policy.create'), async (req, res) 
 
     res.status(201).json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to create policy');
   }
 });
 
@@ -138,7 +143,7 @@ router.put('/:id', requireRole('admin'), audit('policy.update'), async (req, res
     if (!rows.length) return res.status(404).json({ error: 'Policy not found' });
     res.json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to update policy');
   }
 });
 
@@ -150,7 +155,7 @@ router.delete('/:id', requireRole('admin'), audit('policy.delete'), async (req, 
     if (!rowCount) return res.status(404).json({ error: 'Policy not found' });
     res.json({ deleted: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to delete policy');
   }
 });
 
@@ -165,7 +170,7 @@ router.post('/:id/toggle', requireRole('admin'), audit('policy.toggle'), async (
     if (!rows.length) return res.status(404).json({ error: 'Policy not found' });
     res.json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to toggle policy');
   }
 });
 
@@ -191,7 +196,7 @@ router.post('/seed-templates', requireRole('admin'), audit('policy.seed'), async
 
     res.json({ seeded: true, created, skipped, total: BUILT_IN_TEMPLATES.length });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to seed policy templates');
   }
 });
 
@@ -224,7 +229,7 @@ router.post('/evaluate', requireRole('deployer'), async (req, res) => {
       engine:     'js-subset',
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to evaluate policy');
   }
 });
 
@@ -244,7 +249,7 @@ router.get('/summary', requireRole('user'), async (req, res) => {
     `);
     res.json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch policy summary');
   }
 });
 

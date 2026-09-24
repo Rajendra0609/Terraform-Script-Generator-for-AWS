@@ -279,4 +279,43 @@ async function sendChangeRequestSubmitted(toEmail, opts) {
   });
 }
 
-module.exports = { sendPasswordReset, sendCheckovCriticalAlert, sendChangeRequestSubmitted };
+/**
+ * Email a newly-registered user a link to confirm ownership of their email
+ * address before it becomes eligible for OAuth auto-linking (see C-12 in
+ * CHANGELOG_SECURITY_AUDIT_FIXES_ROUND3.md and backend/routes/auth.js /
+ * backend/routes/oauth.js).
+ *
+ * @param {string} toEmail
+ * @param {string} rawToken  the plain-text verification token (NOT the hash)
+ */
+async function sendVerificationEmail(toEmail, rawToken) {
+  const link = `${frontendUrl()}/verify-email?token=${rawToken}`;
+  const transport = getTransport();
+  await transport.sendMail({
+    from: fromAddress(),
+    to: toEmail,
+    subject: 'Confirm your TFGen account',
+    text: [
+      'Hi,',
+      '',
+      'Thanks for signing up for TFGen. Confirm your email address by clicking',
+      'the link below (valid for 24 hours):',
+      '',
+      link,
+      '',
+      "If you didn't create this account, you can safely ignore this email.",
+      '',
+      '— The TFGen Team',
+    ].join('\n'),
+    html: renderEmailShell({
+      heading: 'Confirm your email address',
+      introHtml: `Thanks for signing up for TFGen with <strong>${toEmail}</strong>.
+        Click the button below to confirm your address. This link expires in <strong>24 hours</strong>.`,
+      ctaLabel: 'Confirm email',
+      ctaLink: link,
+      footnoteHtml: "If you didn't create this account, you can safely ignore this email.",
+    }),
+  });
+}
+
+module.exports = { sendPasswordReset, sendCheckovCriticalAlert, sendChangeRequestSubmitted, sendVerificationEmail };

@@ -35,6 +35,100 @@ export function detectSecretsInHcl(hcl) {
   return SECRET_PATTERNS.some(re => re.test(hcl));
 }
 
+// --- HCL-safe interpolation ---------------------------------------------------
+/**
+ * SECURITY FIX (critical — "HCL/Terraform template injection via unescaped
+ * frontend field interpolation", multi-tenant collaboration): generateHCL()
+ * used to substitute `String(val)` directly into the template with NO
+ * escaping or validation at all. Any user-controlled config field (resource
+ * name, bucket name, a security-group rule's free-text description —
+ * anything typed into a Builder form) containing a literal `"` could close
+ * the surrounding string literal early and inject arbitrary new HCL blocks
+ * (additional resources, data sources, outputs, IAM grants) into the
+ * generated .tf file. In a shared/collaborative project, a lower-privileged
+ * member could plant this in a field, and it would silently take effect the
+ * next time a higher-privileged teammate generated/planned/applied the
+ * project — a stored-injection privilege escalation across the
+ * collaboration trust boundary.
+ *
+ * Escapes backslash / double-quote / control chars / Terraform's own `${`
+ * interpolation marker (otherwise a value containing `${...}` would be
+ * evaluated by Terraform as a live expression once the .tf file is parsed).
+ */
+export function escapeHclString(value) {
+  return String(value)
+    .replace(/\\/g, () => '\\\\')
+    .replace(/"/g, () => '\\"')
+    .replace(/\$\{/g, () => '$${')
+    .replace(/\r\n/g, () => '\\n')
+    .replace(/\n/g, () => '\\n')
+    .replace(/\r/g, () => '\\n')
+    .replace(/\t/g, () => '\\t');
+}
+
+// Strict Terraform identifier: letters/digits/underscore/dash, must start
+// with a letter or underscore — matches Terraform's own naming rules for
+// resource/data/module labels. Auto-sanitising (rather than rejecting) a bad
+// identifier is also just good UX: users naturally type "My Bucket" and
+// expect a valid resource label out the other end.
+const HCL_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+
+export function sanitizeHclIdentifier(value, fallback = 'resource') {
+  const str = String(value ?? '').trim();
+  if (HCL_IDENTIFIER_RE.test(str)) return str;
+  const cleaned = str.replace(/[^A-Za-z0-9_-]/g, '_').replace(/^[^A-Za-z_]+/, '');
+  return cleaned || fallback;
+}
+
+// Allow-list for values substituted into a BARE (unquoted) template
+// position — e.g. `size = {{size}}`, `enabled = {{enabled}}`. There is no
+// escaping mechanism available in this position (no surrounding quotes to
+// escape into), so the value is instead strictly validated: a number,
+// true|false, or a simple dotted reference/identifier (e.g.
+// `aws_s3_bucket.this.id`, `var.foo`). Anything else is rejected — the
+// template gets `null` instead of an attacker-controlled raw HCL fragment.
+const BARE_VALUE_RE = /^(true|false|-?\d+(\.\d+)?|[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_-]*)*)$/;
+
+function isInsideQuotedString(line, matchIndex) {
+  // Quote-parity up to the match, on this line, in the STATIC template text
+  // (not the substituted value) — an odd count means we're currently inside
+  // an open "..." string in the template itself.
+  let count = 0;
+  for (let i = 0; i < matchIndex; i++) {
+    if (line[i] === '"' && line[i - 1] !== '\\') count++;
+  }
+  return count % 2 === 1;
+}
+
+// Keys that are always used as raw Terraform identifiers in these templates
+// (both as a resource block's own label AND referenced bare elsewhere, e.g.
+// `aws_s3_bucket.{{name}}.id`) — always identifier-sanitized regardless of
+// quoted/bare position, rather than string-escaped or allow-list-checked.
+const IDENTIFIER_KEYS = new Set(['name']);
+
+function interpolateLine(line, fullConfig) {
+  return line.replace(/\{\{(\w+)\}\}/g, (match, key, offset) => {
+    const val = fullConfig[key];
+    if (val === undefined || val === null || val === '') return '';
+
+    if (IDENTIFIER_KEYS.has(key)) {
+      return sanitizeHclIdentifier(val);
+    }
+
+    if (isInsideQuotedString(line, offset)) {
+      return escapeHclString(val);
+    }
+
+    const str = String(val).trim();
+    if (!BARE_VALUE_RE.test(str)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[templateEngine] Rejected unsafe bare value for {{${key}}} — substituting null.`);
+      return 'null';
+    }
+    return str;
+  });
+}
+
 // --- Template interpolation ----------------------------------------------------
 export function generateHCL(templateBody, config, environment = 'dev') {
   // Convert escaped newlines ("\\n") stored in DB into real newlines
@@ -47,11 +141,13 @@ export function generateHCL(templateBody, config, environment = 'dev') {
   // {{placeholder}} token. A literal {{placeholder}} in HCL is invalid syntax
   // and causes `terraform validate` to fail with a parse error.
   // Returning '' lets the empty-assignment remover below strip the whole line.
-  body = body.replace(/\{\{(\w+)\}\}/g, (match, key) => {
-    const val = fullConfig[key];
-    if (val === undefined || val === null || val === '') return '';
-    return String(val);
-  });
+  //
+  // SECURITY FIX: processed line-by-line (not one global regex over the
+  // whole body) so each placeholder's substitution can be checked against
+  // ITS OWN line's quote structure — see interpolateLine() above for why
+  // quoted-string vs. bare-token position need different treatment, and the
+  // module-level comment for the vulnerability this closes.
+  body = body.split('\n').map(line => interpolateLine(line, fullConfig)).join('\n');
 
   // Remove empty assignment lines (common for optional fields)
   body = body.replace(/^\s*\w+\s*=\s*["']?\s*["']?\s*$/gm, (line) => {
@@ -396,9 +492,19 @@ export function generateReadme(resources = [], region = DEFAULT_AWS_REGION, envi
     .join('\n');
 
   // terraform-docs style: Modules section
+  // BUG FIX: this previously read `r.source`/`r.version`, but no resource
+  // object in the app ever sets those bare field names — every module
+  // resource (both the schema-driven "toggle to module" feature and the
+  // Registry-imported modules) stores it as `module_source`, sometimes as
+  // "namespace/name/provider@version". As a result this table has always
+  // rendered empty. Read the field that's actually populated, and split
+  // out an embedded version suffix if present.
   const moduleRows = resources
-    .filter(r => r.is_module && r.source)
-    .map(r => `| \`${r.resource_name || r.label}\` | \`${r.source}\` | \`${r.version || '*'}\` |`)
+    .filter(r => r.is_module && r.module_source)
+    .map(r => {
+      const [src, ver] = String(r.module_source).split('@');
+      return `| \`${r.resource_name || r.label}\` | \`${src}\` | \`${ver || '*'}\` |`;
+    })
     .join('\n');
 
   // terraform-docs style: Inputs (from resource configs, best-effort)

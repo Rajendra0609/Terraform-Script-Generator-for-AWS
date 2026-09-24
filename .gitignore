@@ -1,0 +1,43 @@
+# ── Secrets — never commit these ────────────────────────────────────────────
+# SECURITY: a previous version of this repo hardcoded a real Gmail App
+# Password + host IP directly into docker-compose.yml (now fixed — see
+# CHANGELOG_AUDIT_FIXES.md). If you ever find real secrets in git history,
+# rotate them AND scrub history (git filter-repo / BFG) — removing the .env
+# file alone does not undo a past commit.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!frontend/src/**/*.key.js
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+.npm/
+
+# ── Build output ─────────────────────────────────────────────────────────────
+frontend/build/
+frontend/dist/
+backend/dist/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+logs/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ── Terraform ─────────────────────────────────────────────────────────────────
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# ── Coverage / test artifacts ──────────────────────────────────────────────────
+coverage/
+.nyc_output/

@@ -184,6 +184,17 @@ function getWsBase() {
   return `${proto}://${window.location.host}`;
 }
 
+// SECURITY FIX (backend/server.js now requires auth on WS upgrade — see
+// CHANGELOG_SECURITY_AUDIT_FIXES.md #4): browsers can't set custom headers
+// during a WebSocket handshake, so the current in-memory access token is
+// passed as a `?token=` query param instead. Read from the same axios
+// default header that AuthContext/refresh-flow already keep up to date, so
+// this can never drift out of sync with "am I currently logged in".
+function getAccessToken() {
+  const header = API.defaults.headers.common['Authorization'];
+  return header ? String(header).replace(/^Bearer\s+/i, '') : '';
+}
+
 export const projectsAPI = {
   list:          (params = {})     => API.get('/api/projects', { params }),
   get:           (id)              => assertProjectId(id) ?? API.get(`/api/projects/${id}`),
@@ -229,7 +240,7 @@ export const terraformAPI = {
 /** WebSocket job stream — returns a WebSocket instance. */
 export const jobsAPI = {
   connectWs(jobId) {
-    return new WebSocket(`${getWsBase()}/ws/jobs?id=${encodeURIComponent(jobId)}`);
+    return new WebSocket(`${getWsBase()}/ws/jobs?id=${encodeURIComponent(jobId)}&token=${encodeURIComponent(getAccessToken())}`);
   },
   // Polling fallback (for environments where WebSocket isn't available, or
   // when the frontend has reconnected and wants the final status of an
@@ -242,7 +253,7 @@ export const jobsAPI = {
 export const terraformLspAPI = {
   connect() {
     // Use window.location so the WS goes through nginx (/ws/ proxy block).
-    return new WebSocket(`${getWsBase()}/ws/terraform-lsp`);
+    return new WebSocket(`${getWsBase()}/ws/terraform-lsp?token=${encodeURIComponent(getAccessToken())}`);
   },
 };
 
@@ -250,6 +261,10 @@ export const exportAPI = {
   githubActions: (body) => API.post('/api/export/pipeline/github-actions', body),
   gitlabCi:      (body) => API.post('/api/export/pipeline/gitlab-ci', body),
   readme:        (body) => API.post('/api/export/readme', body),
+};
+
+export const diagramAPI = {
+  generate: (body) => API.post('/api/diagram/generate', body),
 };
 
 export const authAPI = {

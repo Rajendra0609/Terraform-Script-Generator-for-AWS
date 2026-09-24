@@ -93,7 +93,12 @@ CREATE INDEX IF NOT EXISTS idx_project_members_user    ON project_members(user_i
 CREATE TABLE IF NOT EXISTS user_aws_credentials (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id         UUID REFERENCES users(id) ON DELETE CASCADE UNIQUE,
-  aws_region      VARCHAR(50)  NOT NULL DEFAULT 'ap-south-1',
+  -- SECURITY FIX (M-09): no hardcoded region default — a raw SQL file can't
+  -- read a runtime .env, so a literal default silently pointed every row
+  -- bootstrapped from this file at 'ap-south-1' regardless of the deploying
+  -- user's actual region. NOT NULL is kept so a missing region fails loudly
+  -- at INSERT time; backend/routes/aws.js always supplies it explicitly.
+  aws_region      VARCHAR(50)  NOT NULL,
   access_key_id   TEXT         NOT NULL,
   secret_key_enc  TEXT         NOT NULL,
   label           VARCHAR(255) DEFAULT 'My AWS Account',
@@ -152,10 +157,21 @@ CREATE INDEX IF NOT EXISTS idx_exec_jobs_status  ON execution_jobs(status);
 -- on project_versions as a DB-level duplicate-version safety net (BUG-007 fix). migrate.sql
 -- previously omitted this, so databases migrated from an older schema had no constraint and
 -- were vulnerable to race-condition duplicate version_numbers under high concurrency.
+--
+-- FIX (found during Round-3 audit verification, no ID assigned in the source report — flagged
+-- here as it blocks C-13's fix from ever running on a fresh deployment): schema.sql runs before
+-- this file on every fresh deployment and already creates this exact constraint via a DO block
+-- that catches BOTH `duplicate_table OR duplicate_object`. This block only caught
+-- `duplicate_object` — but re-adding a UNIQUE constraint whose name collides with an existing
+-- one raises `duplicate_table` (42P07, the implicit backing index's name collides), NOT
+-- `duplicate_object` (42710). Verified live: this uncaught exception aborted psql with
+-- ON_ERROR_STOP=1, which (per docker-entrypoint.sh's `set -Eeo pipefail`) aborts the ENTIRE
+-- docker-entrypoint-initdb.d sequence — every fresh `docker-compose up` from a clean volume
+-- would fail database initialization entirely, silently skipping every script after this one.
 DO $$ BEGIN
   ALTER TABLE project_versions
     ADD CONSTRAINT uq_project_version UNIQUE (project_id, version_number);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL; END $$;
 
 -- FIX: password-reset columns (Phase-5).  Without these, the UPDATE in
 -- POST /api/auth/forgot-password executes as a silent zero-row no-op and

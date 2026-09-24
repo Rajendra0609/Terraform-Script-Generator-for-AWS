@@ -8,13 +8,18 @@
  *   POST   /api/notifications/:id/read mark as read
  *   POST   /api/notifications/read-all mark all as read
  *   DELETE /api/notifications/:id      delete
- *   POST   /api/notifications/webhook-test  test a webhook URL (admin)
+ *   POST   /api/notifications/webhook-test  test MY OWN webhook_url preference
+ *          (any authenticated user — this is a "test my settings" action, not
+ *          an admin action; see the SECURITY note above route registration)
  */
 const router = require('express').Router();
 const db     = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { authMiddleware, requireRole } = require('../middleware/auth');
 const https  = require('https');
 const http   = require('http');
+const rateLimit = require('express-rate-limit');
+const { resolveSafeAddress, SsrfBlockedError } = require('../utils/ssrfGuard');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -76,7 +81,7 @@ router.get('/', async (req, res) => {
     `, params);
     res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch notifications');
   }
 });
 
@@ -89,7 +94,7 @@ router.get('/unread-count', async (req, res) => {
     );
     res.json({ count: parseInt(rows[0].count, 10) });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch unread count');
   }
 });
 
@@ -103,7 +108,7 @@ router.post('/:id/read', async (req, res) => {
     );
     res.json({ marked: rowCount > 0 });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to mark notification as read');
   }
 });
 
@@ -116,7 +121,7 @@ router.post('/read-all', async (req, res) => {
     );
     res.json({ marked: rowCount });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to mark notifications as read');
   }
 });
 
@@ -127,7 +132,7 @@ router.delete('/:id', async (req, res) => {
     await db.query('DELETE FROM notifications WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
     res.json({ deleted: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to delete notification');
   }
 });
 
@@ -156,7 +161,7 @@ router.get('/preferences', async (req, res) => {
     delete pref.webhook_secret;
     res.json(pref);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch notification preferences');
   }
 });
 
@@ -196,12 +201,41 @@ router.put('/preferences', async (req, res) => {
     delete pref.webhook_secret;
     res.json(pref);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to update notification preferences');
   }
 });
 
 // ─── POST /api/notifications/webhook-test ────────────────────────────────────
-router.post('/webhook-test', async (req, res) => {
+// SECURITY: dedicated tight rate limiter (audit finding — this endpoint has
+// no legitimate high-frequency use case: it's a "test my webhook" button a
+// user clicks a handful of times while configuring notification settings,
+// not something a normal UI flow calls repeatedly). Keyed by user id since
+// this route always runs after authMiddleware.
+const webhookTestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id || req.ip || 'unknown',
+  handler: (req, res) => {
+    res.set('Retry-After', String(15 * 60));
+    res.status(429).json({ error: 'Too many webhook test requests — slow down', retryAfter: 15 * 60 });
+  },
+});
+
+// Response bodies from arbitrary third-party endpoints are never trusted or
+// parsed — cap what we'll even read before giving up on the connection.
+const MAX_WEBHOOK_RESPONSE_BYTES = 64 * 1024;
+
+// NOTE on the audit's suggested `requireRole('admin')`: this endpoint tests
+// the CALLER'S OWN `webhook_url` preference (a per-user setting in
+// `user_preferences`, set via PUT /preferences above) — gating it to admins
+// would break the actual feature for every non-admin user. The audit's fix
+// was phrased as admin-gating "and/or" tight rate-limiting; the SSRF guard
+// above plus the 5-req/15-min per-user limiter below fully close the
+// original vulnerability (metadata-endpoint credential theft, internal
+// port-scanning) without breaking the feature, so that's the path taken.
+router.post('/webhook-test', webhookTestLimiter, async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
 
@@ -214,6 +248,21 @@ router.post('/webhook-test', async (req, res) => {
     return res.status(400).json({ error: 'Invalid URL — must be http or https' });
   }
 
+  // SECURITY FIX (critical): resolve the hostname ourselves and reject
+  // loopback/private/link-local(cloud-metadata)/reserved targets BEFORE
+  // making any outbound connection. See utils/ssrfGuard.js for the full
+  // writeup of what this closes (metadata-credential theft, internal
+  // network port-scanning via a low-privilege authenticated endpoint).
+  let safeTarget;
+  try {
+    safeTarget = await resolveSafeAddress(parsed.hostname);
+  } catch (e) {
+    if (e instanceof SsrfBlockedError) {
+      return res.status(400).json({ error: 'Webhook URL is not allowed: ' + e.message });
+    }
+    return res.status(400).json({ error: 'Could not validate webhook URL.' });
+  }
+
   const payload = JSON.stringify({
     event: 'webhook.test',
     timestamp: new Date().toISOString(),
@@ -223,27 +272,65 @@ router.post('/webhook-test', async (req, res) => {
 
   const lib = parsed.protocol === 'https:' ? https : http;
   const options = {
-    hostname: parsed.hostname,
-    port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-    path:     parsed.pathname + parsed.search,
-    method:   'POST',
-    headers:  {
+    // SECURITY FIX: pin the connection to the exact IP we just validated,
+    // instead of the hostname (which the HTTP client would otherwise
+    // re-resolve at connect time — a classic DNS-rebinding TOCTOU gap
+    // between "checked safe" and "actually connected to"). The original
+    // hostname is preserved via the Host header (virtual hosting) and, for
+    // TLS, via `servername` (SNI + certificate hostname verification).
+    host:   safeTarget.address,
+    family: safeTarget.family,
+    port:   parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+    path:   parsed.pathname + parsed.search,
+    method: 'POST',
+    headers: {
       'Content-Type':   'application/json',
       'Content-Length': Buffer.byteLength(payload),
       'X-TFGen-Event':  'webhook.test',
+      'Host':           parsed.host,
     },
     timeout: 5000,
+    ...(parsed.protocol === 'https:' ? { servername: parsed.hostname } : {}),
+  };
+
+  let responded = false;
+  const finish = (status, body) => {
+    if (responded) return;
+    responded = true;
+    res.status(status).json(body);
   };
 
   const reqOut = lib.request(options, (response) => {
-    res.json({ success: true, status: response.statusCode });
+    // Drain the body ourselves with a hard cap — we don't care about the
+    // content, but we must not let an untrusted endpoint hold the socket
+    // open indefinitely or stream unbounded data into memory. Respond
+    // immediately once the cap is hit rather than waiting on 'end'/'error'
+    // — destroy() doesn't reliably emit either of those, so waiting on them
+    // here would leave the request hanging.
+    let received = 0;
+    response.on('data', (chunk) => {
+      received += chunk.length;
+      if (received > MAX_WEBHOOK_RESPONSE_BYTES) {
+        response.destroy();
+        finish(200, { success: true, status: response.statusCode, truncated: true });
+      }
+    });
+    response.on('end',   () => finish(200, { success: true, status: response.statusCode }));
+    response.on('error', () => finish(200, { success: true, status: response.statusCode }));
+    response.on('close', () => finish(200, { success: true, status: response.statusCode }));
   });
+  // NOTE (H-04 scope): unlike every other e.message occurrence fixed in this
+  // pass, this one is intentionally left as-is. err here is a Node
+  // http/https client connection error (ECONNREFUSED, ETIMEDOUT, etc.) about
+  // a URL the caller themselves configured as their own webhook target — it
+  // is diagnostic feedback about their own external endpoint, not internal
+  // TFGen/DB detail, so surfacing it is the whole point of this test button.
   reqOut.on('error', (err) => {
-    res.status(400).json({ success: false, error: err.message });
+    finish(400, { success: false, error: err.message });
   });
   reqOut.on('timeout', () => {
     reqOut.destroy();
-    res.status(408).json({ success: false, error: 'Webhook request timed out' });
+    finish(408, { success: false, error: 'Webhook request timed out' });
   });
   reqOut.write(payload);
   reqOut.end();

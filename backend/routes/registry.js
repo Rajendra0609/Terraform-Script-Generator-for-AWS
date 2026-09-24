@@ -16,6 +16,21 @@ const { DEFAULT_AWS_REGION } = require('../config/region');
 const REGISTRY_BASE = 'https://registry.terraform.io/v1';
 const TIMEOUT_MS    = 8000;
 
+// SECURITY FIX (L-10): namespace/name/provider come straight from
+// req.params with no validation. The registry host itself is fixed
+// (registry.terraform.io), so this was never cross-host SSRF, but an
+// unescaped/malformed segment could still produce a malformed or
+// unexpected upstream request. Terraform's own registry naming rules only
+// allow alphanumeric characters, hyphens, and underscores for these
+// segments — validated here (400 on anything else) AND encodeURIComponent
+// is applied before interpolating into the URL, as defense-in-depth on top
+// of the allow-list rather than instead of it.
+const REGISTRY_SEGMENT_RE = /^[A-Za-z0-9_-]+$/;
+
+function isValidRegistrySegment(s) {
+  return typeof s === 'string' && s.length > 0 && s.length <= 64 && REGISTRY_SEGMENT_RE.test(s);
+}
+
 // ─── Curated fallback when live registry is unreachable ─────────────────────
 const CURATED = [
   { namespace:'terraform-aws-modules', name:'vpc',          provider:'aws', latest:'5.8.1',  verified:true,  downloads:78000000, description:'Terraform module to create AWS VPC resources with public, private, and database subnets across multiple AZs.' },
@@ -194,11 +209,14 @@ router.get('/search', optionalAuth, async (req, res) => {
 
 router.get('/module/:ns/:name/:provider', optionalAuth, async (req, res) => {
   const { ns, name, provider } = req.params;
+  if (![ns, name, provider].every(isValidRegistrySegment)) {
+    return res.status(400).json({ error: 'Invalid module namespace, name, or provider' });
+  }
   const key = `${ns}/${name}/${provider}`;
   const inputs = getDefaultInputs(ns, name, provider);
 
   try {
-    const url = `${REGISTRY_BASE}/modules/${ns}/${name}/${provider}`;
+    const url = `${REGISTRY_BASE}/modules/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/${encodeURIComponent(provider)}`;
     const data = await fetchJson(url);
     const root = data.root || {};
     const liveInputs = (root.inputs || []).map(i => ({
@@ -232,8 +250,11 @@ router.get('/module/:ns/:name/:provider', optionalAuth, async (req, res) => {
 
 router.get('/module/:ns/:name/:provider/versions', optionalAuth, async (req, res) => {
   const { ns, name, provider } = req.params;
+  if (![ns, name, provider].every(isValidRegistrySegment)) {
+    return res.status(400).json({ error: 'Invalid module namespace, name, or provider' });
+  }
   try {
-    const url = `${REGISTRY_BASE}/modules/${ns}/${name}/${provider}/versions`;
+    const url = `${REGISTRY_BASE}/modules/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/${encodeURIComponent(provider)}/versions`;
     const data = await fetchJson(url);
     res.json(data);
   } catch (e) {

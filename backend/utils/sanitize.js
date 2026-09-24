@@ -1,5 +1,25 @@
 'use strict';
 
+// SECURITY FIX (M-06): stripHtml() previously relied on a hand-rolled regex
+// blacklist (tag matching + a hardcoded list of CSS property names), which is
+// a known-fragile pattern — the exact class of bug the frontend's own
+// sanitizeHcl.js was fixed to move away from (see its BUG-007 comment) in
+// favor of DOMParser. jsdom provides a real, spec-compliant DOMParser in
+// Node, so the backend now mirrors the frontend's approach instead of
+// re-implementing tag-stripping with regexes: parse the input as inert HTML
+// (no scripts run, no resources fetched, no event handlers fire), read back
+// only `textContent`, then strip any tags that entity-decoding revealed.
+// This is not reachable via `dangerouslySetInnerHTML` anywhere today (see
+// M-06 write-up) — this is a defense-in-depth fix for the stated invariant
+// ("no HTML/style fragments persist"), in case a consuming sink is ever
+// added later.
+const { JSDOM } = require('jsdom');
+
+// Constructing a JSDOM window is the expensive part; the DOMParser it
+// exposes is cheap to instantiate per call, so build the window once at
+// module load and reuse it for every stripHtml() call.
+const _domParserWindow = new JSDOM('<!DOCTYPE html><body></body>').window;
+
 // ─── Secret patterns (AWS, GitHub, generic passwords) ─────────────────────────
 // Source: OWASP credential detection + AWS key format spec
 const SECRET_PATTERNS = [
@@ -92,49 +112,129 @@ function lintNetworkRules(hcl) {
   return [...new Set(warnings)]; // deduplicate
 }
 
-// ─── HTML/CSS tag stripper (unchanged, defensive) ─────────────────────────────
+// ─── Dangerous Terraform execution primitives ─────────────────────────────────
+// SECURITY FIX (critical): guardHcl() previously only screened for literal
+// secrets and HTML markup — it never blocked Terraform's own code-execution
+// primitives. Any authenticated user could submit HCL containing a
+// `provisioner "local-exec"` / `"remote-exec"` block or a `data "external"`
+// block and have it executed for real by `terraform plan`/`init`/`apply`
+// (data "external" runs during plan/refresh, not just apply). Combined with
+// `use_real_credentials`, this allowed a single "read-only" plan request to
+// exfiltrate a victim's live AWS credentials or pivot into the network.
+//
+// These patterns are deliberately conservative (they match the construct
+// regardless of surrounding whitespace/formatting) and are applied to every
+// HCL entry point via guardHcl(), so fmt/validate/suggest/plan/cost/scan/
+// init/apply are all covered by the same check.
+const DANGEROUS_CONSTRUCTS = [
+  {
+    name: 'local-exec provisioner',
+    re: /provisioner\s+"local-exec"/i,
+    hint: 'provisioner "local-exec" runs arbitrary shell commands on the machine executing Terraform and is not permitted here.',
+  },
+  {
+    name: 'remote-exec provisioner',
+    re: /provisioner\s+"remote-exec"/i,
+    hint: 'provisioner "remote-exec" runs arbitrary shell commands on provisioned infrastructure and is not permitted here.',
+  },
+  {
+    name: 'external data source',
+    re: /data\s+"external"/i,
+    hint: 'data "external" executes an arbitrary local program during plan/refresh (not just apply) and is not permitted here.',
+  },
+];
+
+/**
+ * Scan HCL for Terraform constructs that cause arbitrary code execution
+ * on the machine running `terraform` (host or sandbox container) — as
+ * opposed to detectSecrets(), which only looks for literal credential
+ * material. Returns [] if none found.
+ */
+function detectDangerousConstructs(input) {
+  if (!input) return [];
+  const text = String(input);
+  const findings = [];
+  for (const { name, re, hint } of DANGEROUS_CONSTRUCTS) {
+    if (re.test(text)) findings.push({ name, hint });
+  }
+  return findings;
+}
+
+// ─── HTML/CSS tag stripper (jsdom DOMParser-based, see M-06 above) ────────────
 const htmlTagRe = /<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^>]*?)?>/;
 const htmlTagGlobalRe = /<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^>]*?)?>/g;
 const htmlEntityRe = /&(?:lt|gt|amp|quot|#39);/i;
+// Same property list the frontend's sanitizeHcl.js strips, kept in sync so
+// both layers agree on what counts as "leaked styling" (M-06).
+const CSS_PROPS_RE = /\b(?:color|font-weight|font-style|display|user-select|text-align|width|padding[a-z-]*|flex[a-z-]*)\s*:/i;
+
+function looksSuspicious(text) {
+  return htmlTagRe.test(text)
+    || htmlEntityRe.test(text)
+    || CSS_PROPS_RE.test(text)
+    || /\bstyle\s*=\s*["'][^"']*["']/i.test(text)
+    || /\bclass\s*=\s*["'][^"']*["']/i.test(text);
+}
+
+function stripCssFragments(t) {
+  t = t.replace(/(?:["']?)?color:\s*#?[A-Fa-f0-9]{3,8}\s*;?/gi, '');
+  t = t.replace(/(?:["']?)?color:\s*[a-z]+\s*;?/gi, '');
+  t = t.replace(/(?:["']?)?font-weight:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?font-style:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?display:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?user-select:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?text-align:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?width:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?padding[a-z-]*:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?flex[a-z-]*:\s*[^;"'<>\n]+;?/gi, '');
+  t = t.replace(/(?:["']?)?inline-block\s*;?/gi, '');
+  t = t.replace(/style=\s*["'][^"']*["']/gi, '');
+  t = t.replace(/\bclass=["'][^"']*["']/gi, '');
+  return t;
+}
 
 function stripHtml(input) {
   if (!input) return '';
-  let t = String(input);
+  const original = String(input);
+
+  // Fast path: skip parsing entirely if nothing suspicious is present —
+  // this is also what keeps stripHtml() cheap enough to call on every save.
+  if (!looksSuspicious(original)) return original;
+
   try {
-    // Only perform heavy work if suspicious characters present
-    if (htmlTagRe.test(t) || htmlEntityRe.test(t) || /\b(?:color|font-weight|font-style|display|user-select)\s*:/i.test(t) || /\bstyle\s*=\s*["'][^"']*["']/i.test(t) || /\bclass\s*=\s*["'][^"']*["']/i.test(t)) {
-      t = t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-      // Remove HTML tags only; preserve HCL placeholders and operators.
-      t = t.replace(htmlTagGlobalRe, '');
-      // Remove inline CSS fragments left as plain text
-      t = t.replace(/(?:["']?)?color:\s*[^;"'<>]+;?/gi, '');
-      t = t.replace(/(?:["']?)?font-weight:\s*[^;"'<>]+;?/gi, '');
-      t = t.replace(/(?:["']?)?font-style:\s*[^;"'<>]+;?/gi, '');
-      t = t.replace(/(?:["']?)?display:\s*[^;"'<>]+;?/gi, '');
-      t = t.replace(/(?:["']?)?user-select:\s*[^;"'<>]+;?/gi, '');
-      t = t.replace(/style=\s*["'][^"']*["']/gi, '');
-      t = t.replace(/\bclass=["'][^"']*["']/gi, '');
-      // Keep legitimate quotes intact — avoid stripping characters that
-      // are significant in HCL (e.g. opening quotes). Previously we
-      // removed stray quote-like fragments which broke valid strings
-      // (left only trailing quotes). Do not remove quotes here.
-      // Collapse excessive blank lines
-      t = t.replace(/\n{3,}/g, '\n\n').trim();
-    }
+    // Real parser instead of a regex tag-blacklist (M-06): parseFromString
+    // builds an inert document — no scripts execute, no resources load, no
+    // event handlers fire — mirroring frontend/src/utils/sanitizeHcl.js's
+    // DOMParser approach exactly, so both layers behave consistently.
+    const parser = new _domParserWindow.DOMParser();
+    const doc = parser.parseFromString(original, 'text/html');
+    let t = doc.body ? (doc.body.textContent || '') : '';
+
+    // textContent already yields decoded entities, which can reveal tags
+    // that were double-encoded (e.g. &lt;script&gt;). Strip those too.
+    t = t.replace(htmlTagGlobalRe, '');
+
+    // Remove inline CSS fragments left behind as plain text (e.g. pasted
+    // from a rich-text editor without real <style>/style= wrappers).
+    t = stripCssFragments(t);
+
+    // Collapse excessive blank lines
+    t = t.replace(/\n{3,}/g, '\n\n').trim();
     return t;
   } catch (e) {
-    return String(input).replace(htmlTagGlobalRe, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\n{3,}/g, '\n\n').trim();
+    // Parser failure fallback — should be unreachable in practice (jsdom's
+    // DOMParser doesn't throw on malformed input), but fail safe rather than
+    // returning unsanitized content.
+    let t = original.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    t = t.replace(htmlTagGlobalRe, '');
+    t = stripCssFragments(t);
+    return t.replace(/\n{3,}/g, '\n\n').trim();
   }
 }
 
 function hasMarkup(input) {
   if (!input) return false;
-  const text = String(input);
-  return htmlTagRe.test(text)
-    || htmlEntityRe.test(text)
-    || /\b(?:color|font-weight|font-style|display|user-select)\s*:/i.test(text)
-    || /\bstyle\s*=\s*["'][^"']*["']/i.test(text)
-    || /\bclass\s*=\s*["'][^"']*["']/i.test(text);
+  return looksSuspicious(String(input));
 }
 
-module.exports = { stripHtml, detectSecrets, lintNetworkRules, hasMarkup };
+module.exports = { stripHtml, detectSecrets, detectDangerousConstructs, lintNetworkRules, hasMarkup };

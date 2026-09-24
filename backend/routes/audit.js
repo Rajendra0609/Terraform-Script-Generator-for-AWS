@@ -5,6 +5,7 @@
  */
 const router = require('express').Router();
 const db = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { authMiddleware, requireRole } = require('../middleware/auth');
 
 router.use(authMiddleware, requireRole('admin'));
@@ -41,7 +42,7 @@ router.get('/', async (req, res) => {
       params
     );
     res.json(result.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to fetch audit logs'); }
 });
 
 module.exports = router;

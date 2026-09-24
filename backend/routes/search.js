@@ -9,6 +9,7 @@
  */
 const router = require('express').Router();
 const db     = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { authMiddleware } = require('../middleware/auth');
 
 router.use(authMiddleware);
@@ -168,7 +169,7 @@ router.get('/', async (req, res) => {
       results: results.slice(0, limit),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Search failed');
   }
 });
 

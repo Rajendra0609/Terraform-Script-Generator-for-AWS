@@ -17,14 +17,19 @@
  */
 const router   = require('express').Router();
 const db       = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { stripHtml } = require('../utils/sanitize');
 const { authMiddleware, requireRole, ROLE_LEVELS } = require('../middleware/auth');
-const { audit } = require('../middleware/audit');
+const { audit, attachAuditResponseHook } = require('../middleware/audit');
 
 const UUID_RE    = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const VALID_ROLES = Object.keys(ROLE_LEVELS);
 
 router.use(authMiddleware, requireRole('admin'));
+// SECURITY FIX (H-01): audit() on this router's mutating routes (role
+// promotion, user deletion, etc.) was a silent no-op without this hook —
+// see backend/middleware/audit.js for how the two pieces fit together.
+router.use(attachAuditResponseHook);
 
 // ─── GET /api/admin/metrics ───────────────────────────────────────────────────
 router.get('/metrics', async (req, res) => {
@@ -102,7 +107,7 @@ router.get('/metrics', async (req, res) => {
       generated_at:  new Date().toISOString(),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch metrics');
   }
 });
 
@@ -149,7 +154,7 @@ router.get('/users', async (req, res) => {
       users: rows,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch users');
   }
 });
 
@@ -170,7 +175,7 @@ router.get('/users/:id', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch user');
   }
 });
 
@@ -189,14 +194,46 @@ router.put('/users/:id/role', audit('admin.user.role_change'), async (req, res) 
   }
 
   try {
-    const { rows } = await db.query(
-      'UPDATE users SET role=$1 WHERE id=$2 RETURNING id, email, role',
-      [role, req.params.id]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json(rows[0]);
+    // SECURITY FIX (M-08): the self-demotion check above only stops an
+    // admin from touching their OWN account — nothing previously stopped
+    // Admin A from demoting Admin B when B was the only other admin,
+    // leaving the system with zero admins and no supported recovery path.
+    // The target row is locked (`FOR UPDATE`) and the admin count re-checked
+    // inside the same transaction as the UPDATE, so two concurrent demote
+    // requests targeting two different admins can't both read "count > 1"
+    // and race past each other (the same TOCTOU pattern withTransaction()
+    // was introduced for — see its doc comment / the C-11 fix).
+    const updated = await db.withTransaction(async (client) => {
+      const { rows: targetRows } = await client.query(
+        'SELECT id, role FROM users WHERE id=$1 FOR UPDATE',
+        [req.params.id]
+      );
+      if (!targetRows.length) return null;
+      const target = targetRows[0];
+
+      if (target.role === 'admin' && role !== 'admin') {
+        const { rows: countRows } = await client.query(
+          `SELECT COUNT(*) AS admins FROM users WHERE role='admin'`
+        );
+        if (parseInt(countRows[0].admins, 10) <= 1) {
+          const err = new Error('Cannot remove the last remaining admin. Promote another user to admin first.');
+          err.statusCode = 409;
+          throw err;
+        }
+      }
+
+      const { rows } = await client.query(
+        'UPDATE users SET role=$1 WHERE id=$2 RETURNING id, email, role',
+        [role, req.params.id]
+      );
+      return rows[0] || null;
+    });
+
+    if (!updated) return res.status(404).json({ error: 'User not found' });
+    res.json(updated);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (e.statusCode === 409) return res.status(409).json({ error: e.message });
+    handleDbError(e, res, 'Failed to update user role');
   }
 });
 
@@ -209,11 +246,37 @@ router.delete('/users/:id', audit('admin.user.delete'), async (req, res) => {
   }
 
   try {
-    const { rowCount } = await db.query('DELETE FROM users WHERE id=$1', [req.params.id]);
-    if (!rowCount) return res.status(404).json({ error: 'User not found' });
+    // SECURITY FIX (M-08): same last-admin protection as the role-change
+    // route above, applied to deletion — deleting the only other admin is
+    // just as capable of zeroing out the admin population as demoting them.
+    const deleted = await db.withTransaction(async (client) => {
+      const { rows: targetRows } = await client.query(
+        'SELECT id, role FROM users WHERE id=$1 FOR UPDATE',
+        [req.params.id]
+      );
+      if (!targetRows.length) return false;
+      const target = targetRows[0];
+
+      if (target.role === 'admin') {
+        const { rows: countRows } = await client.query(
+          `SELECT COUNT(*) AS admins FROM users WHERE role='admin'`
+        );
+        if (parseInt(countRows[0].admins, 10) <= 1) {
+          const err = new Error('Cannot delete the last remaining admin. Promote another user to admin first.');
+          err.statusCode = 409;
+          throw err;
+        }
+      }
+
+      const { rowCount } = await client.query('DELETE FROM users WHERE id=$1', [req.params.id]);
+      return rowCount > 0;
+    });
+
+    if (!deleted) return res.status(404).json({ error: 'User not found' });
     res.json({ deleted: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (e.statusCode === 409) return res.status(409).json({ error: e.message });
+    handleDbError(e, res, 'Failed to delete user');
   }
 });
 
@@ -248,7 +311,7 @@ router.get('/projects', async (req, res) => {
     `, params);
     res.json(rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch projects');
   }
 });
 
@@ -261,7 +324,16 @@ router.get('/system', async (req, res) => {
     await db.query('SELECT 1');
     checks.database = { status: 'ok' };
   } catch (e) {
-    checks.database = { status: 'error', error: e.message };
+    // SECURITY FIX (H-04): even on an admin-only endpoint, raw driver text
+    // is unnecessary reconnaissance detail for a caller who only needs to
+    // know whether the DB is reachable. Full detail still goes to the
+    // server log; NODE_ENV-aware detail mirrors the global handler in
+    // server.js and every other route's handleDbError() call.
+    console.error('[admin] /system database check failed:', e.message);
+    checks.database = {
+      status: 'error',
+      error: process.env.NODE_ENV !== 'production' ? e.message : 'Database unreachable',
+    };
   }
 
   // Redis
@@ -324,7 +396,7 @@ router.post('/sanitize-hcl', async (req, res) => {
 
     res.json({ success: true, sanitized: results });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    handleDbError(e, res, 'HCL sanitization pass failed', 500);
   }
 });
 

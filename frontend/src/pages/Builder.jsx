@@ -9,6 +9,7 @@ import PlanDiffPanel from '../components/PlanDiffPanel';
 import SecurityFindings from '../components/SecurityFindings';
 import CostBadge from '../components/CostBadge';
 import ResourceGraph from '../components/ResourceGraph';
+import ArchitectureDiagram from '../components/ArchitectureDiagram';
 import PresetsPanel from '../components/PresetsPanel';
 import LintPanel from '../components/LintPanel';
 import VariablesEditor from '../components/VariablesEditor';
@@ -33,6 +34,8 @@ import ModuleRegistry from '../components/ModuleRegistry';
 import MultiEnvPanel from '../components/MultiEnvPanel';
 import BackendGenerator from '../components/BackendGenerator';
 import TerragruntPanel from '../components/TerragruntPanel';
+import { useAuth } from '../contexts/AuthContext';
+import { setLastProjectId } from '../utils/lastProjectStorage';
 
 // --- Category colors (light-mode friendly) -----------------------------------
 const CAT_COLOR = {
@@ -351,6 +354,7 @@ export default function Builder() {
     ? _rawProjectId
     : undefined;
   const nav           = useNavigate();
+  const { user }      = useAuth();
   const { toasts, show } = useToast();
   const { c } = useTheme();
   const showRef = useRef(show);
@@ -466,8 +470,10 @@ export default function Builder() {
   // -- Load project -------------------------------------------------------------
   useEffect(() => {
     if (!projectId || !services.length) return;
-    // Persist so the Navbar History link can navigate directly to this project's history.
-    try { localStorage.setItem('tfgen.lastProjectId', projectId); } catch {}
+    // Persist so the Navbar History link can navigate directly to this
+    // project's history. Namespaced per-user (L-04 fix) so this doesn't
+    // leak another account's last-project id on a shared browser.
+    setLastProjectId(user?.id, projectId);
     projectsAPI.get(projectId).then(r => {
       setProject(r.data);
       if (r.data.resources?.length) {
@@ -505,7 +511,7 @@ export default function Builder() {
         setFullHCL(sanitizeHcl(r.data.last_hcl));
       }
     }).catch(() => showRef.current('Project not found', 'error'));
-  }, [projectId, services]);
+  }, [projectId, services, user?.id]);
 
   // -- Rebuild HCL --------------------------------------------------------------
   const rebuildHCL = useCallback((res, vars, outs) => {
@@ -620,6 +626,65 @@ export default function Builder() {
     // Visual sync: briefly flash the right panel to confirm code updated
     setCodeFlash(true);
     setTimeout(() => setCodeFlash(false), 500);
+  };
+
+  // BUG FIX: Module Registry "Import to Builder" previously appended the
+  // generated HCL directly onto `fullHCL` as a raw string. `fullHCL` is a
+  // *derived* value — the rebuildHCL effect above regenerates it from
+  // `resources`/`variables`/`outputs` on every change — so the very next
+  // time any resource, variable, or output changed, the manually-appended
+  // module text was silently overwritten and the import appeared to have
+  // "done nothing." Fix: turn the import into a real resource entry (like
+  // every other block in the builder) so it flows through the normal
+  // rebuild/save/undo/graph pipeline and survives future edits.
+  const handleImportModule = ({ hcl, name, source, version }) => {
+    if (!hcl) { show('Nothing to import', 'warning'); return; }
+    let cleanHcl = sanitizeHcl(hcl);
+    const base = (name || 'imported_module').replace(/[^a-z0-9_]/gi, '_').replace(/^(\d)/, '_$1') || 'imported_module';
+    const existingNames = new Set(resources.map(r => (r.resource_name || r.label || '').toLowerCase()));
+    let uniqueName = base;
+    let n = 1;
+    while (existingNames.has(uniqueName.toLowerCase())) { uniqueName = `${base}_${++n}`; }
+    // If we had to rename to avoid a collision, keep the terraform block
+    // identifier inside the generated HCL in sync with the new resource
+    // label/name — otherwise the sidebar would show "vpc_2" while the code
+    // still declares `module "vpc" { ... }`.
+    if (uniqueName !== base) {
+      cleanHcl = cleanHcl.replace(new RegExp(`module\\s+"${base}"\\s*{`), `module "${uniqueName}" {`);
+    }
+
+    // NOTE: the backend `resources` table has an `is_module` boolean and a
+    // `module_source` varchar column — but no separate `version` column.
+    // A bare `version` field on the resource object would round-trip fine
+    // in memory but silently vanish the moment the project is saved and
+    // reloaded. Fold it into `module_source` (e.g. "hashicorp/vpc/aws@5.1.0")
+    // so it actually persists through the existing schema.
+    const fullSource = source ? (version ? `${source}@${version}` : source) : '';
+
+    const newResource = {
+      _id: Math.random().toString(36).slice(2),
+      service_type: `module:${source || uniqueName}`,
+      label: uniqueName,
+      resource_name: uniqueName,
+      category: 'Registry Module',
+      config: {},
+      is_module: true,
+      hcl_output: cleanHcl,
+      module_source: fullSource,
+      wiredFrom: {},
+      icon: '📦',
+      position_x: 0,
+      position_y: 0,
+      annotations: '',
+    };
+
+    setResources([...resources, newResource]);
+    setActiveIdx(resources.length); // select the newly added module
+    setShowModuleRegistry(false);
+    setViewMode('code');
+    setCodeFlash(true);
+    setTimeout(() => setCodeFlash(false), 700);
+    show(`Module "${uniqueName}" imported — added to resources & visible in Code view`, 'success');
   };
 
   const handleToggleModule = () => {
@@ -1090,6 +1155,7 @@ export default function Builder() {
           <div style={{ display: 'flex', alignItems: 'center', borderBottom: '1px solid #E2E8F0', background: '#F8FAFC', flexShrink: 0 }}>
             <ViewTab id="code"  label="Code"             active={viewMode === 'code'}  onClick={() => setViewMode('code')}  c={c} />
             <ViewTab id="graph" label="Graph"            active={viewMode === 'graph'} onClick={() => setViewMode('graph')} c={c} />
+            <ViewTab id="awsdiagram" label="AWS Diagram"  active={viewMode === 'awsdiagram'} onClick={() => setViewMode('awsdiagram')} c={c} />
             <ViewTab id="vars"  label="Vars & Outputs"   active={viewMode === 'vars'}  onClick={() => setViewMode('vars')}  c={c} />
             <ViewTab id="learn" label={`Learn${activeResource ? ' - ' + (activeResource.label || '').split(' ')[0] : ''}`} active={viewMode === 'learn'} onClick={() => setViewMode('learn')} c={c} badge="✨ AI" />
             <ViewTab id="labs"  label="Labs & Interview" active={viewMode === 'labs'}  onClick={() => setViewMode('labs')}  c={c} />
@@ -1265,6 +1331,13 @@ export default function Builder() {
             </div>
           )}
 
+          {/* -- AWS Architecture Diagram view --------------------------------- */}
+          {viewMode === 'awsdiagram' && (
+            <div style={{ flex: 1, overflow: 'hidden', display: 'flex', minHeight: 0 }}>
+              <ArchitectureDiagram c={c} hcl={fullHCL} />
+            </div>
+          )}
+
           {/* -- Vars & Outputs view ------------------------------------------ */}
           {viewMode === 'vars' && (
             <div style={{ flex: 1, overflow: 'auto', padding: 20 }}>
@@ -1353,12 +1426,7 @@ export default function Builder() {
       )}
       {showModuleRegistry && (
         <ModuleRegistry c={c}
-          onImport={(hcl) => {
-            // Append imported module HCL directly to the full HCL output
-            setFullHCL(prev => sanitizeHcl((prev ? prev + '\n\n' : '') + hcl));
-            setShowModuleRegistry(false);
-            show('Module imported — visible in Code view', 'success');
-          }}
+          onImport={handleImportModule}
           onClose={() => setShowModuleRegistry(false)} />
       )}
       {showMultiEnv && (

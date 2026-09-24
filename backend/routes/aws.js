@@ -11,6 +11,16 @@ const { STSClient, GetCallerIdentityCommand } = require('@aws-sdk/client-sts');
 const { authMiddleware, optionalAuth } = require('../middleware/auth');
 const db = require('../db/connection');
 const { DEFAULT_AWS_REGION } = require('../config/region');
+const { audit, attachAuditResponseHook } = require('../middleware/audit');
+
+// SECURITY FIX (L-12 follow-up): saving/rotating/removing AWS credentials is
+// exactly the kind of sensitive action that should leave an audit trail —
+// it wasn't previously wrapped with audit() at all, so no record of who
+// changed a project's AWS credentials (or when) existed. Enabling the hook
+// here means the /credentials mutations below get logged through the same,
+// already-hardened sanitizeBodyForAudit() redaction (see middleware/audit.js
+// for the REDACT_KEYS fix covering access_key_id and friends).
+router.use(attachAuditResponseHook);
 
 // ─── STS verification config ──────────────────────────────────────────────────
 // Set SKIP_STS_VERIFY=true in .env when the backend has no outbound internet
@@ -176,7 +186,7 @@ router.get('/credentials', authMiddleware, async (req, res) => {
 });
 
 // POST /api/aws/credentials
-router.post('/credentials', authMiddleware, async (req, res) => {
+router.post('/credentials', authMiddleware, audit('aws.credentials.save'), async (req, res) => {
   const { access_key_id, secret_access_key, aws_region, label } = req.body;
   if (!access_key_id || !secret_access_key || !aws_region)
     return res.status(400).json({ error: 'access_key_id, secret_access_key and aws_region are required' });
@@ -340,7 +350,7 @@ router.post('/credentials', authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/aws/credentials
-router.delete('/credentials', authMiddleware, async (req, res) => {
+router.delete('/credentials', authMiddleware, audit('aws.credentials.delete'), async (req, res) => {
   try {
     await db.query('DELETE FROM user_aws_credentials WHERE user_id=$1', [req.user.id]);
     res.json({ success: true });

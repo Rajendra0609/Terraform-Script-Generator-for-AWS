@@ -77,7 +77,22 @@ function attachAuditResponseHook(req, res, next) {
 
 function sanitizeBodyForAudit(body) {
   if (!body || typeof body !== 'object') return {};
-  const REDACT_KEYS = ['password', 'password_hash', 'secret', 'token', 'hcl', 'hcl_output', 'full_hcl'];
+  // SECURITY FIX (L-12): POST /api/aws/credentials's body includes
+  // access_key_id, which matched none of the original substrings
+  // ('password', 'secret', 'token', ...) and was therefore logged
+  // UNREDACTED into audit_logs.meta.body on every credential save. An
+  // Access Key ID isn't independently exploitable without the matching
+  // secret, but it's still credential material that shouldn't sit
+  // unredacted in a log table — and it's exactly what automated
+  // secret-scanners flag. Broadened to catch credential-shaped field names
+  // generically ('key', 'credential', 'api_key', etc.) rather than only the
+  // exact names known today, so the next similarly-named field doesn't
+  // require remembering to come back and update this list again.
+  const REDACT_KEYS = [
+    'password', 'password_hash', 'secret', 'token', 'hcl', 'hcl_output', 'full_hcl',
+    'access_key', 'accesskey', 'key_id', 'keyid', 'api_key', 'apikey',
+    'private_key', 'privatekey', 'credential', 'authorization',
+  ];
   const safe = {};
   for (const [k, v] of Object.entries(body)) {
     if (REDACT_KEYS.some(r => k.toLowerCase().includes(r))) {

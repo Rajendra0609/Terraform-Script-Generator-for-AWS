@@ -5,7 +5,10 @@ WORKDIR /app
 
 # Copy only manifests first so Docker can cache the npm install layer
 COPY package*.json ./
-RUN npm install --verbose
+# PRODUCTION FIX: `npm ci` (not `npm install`) — installs exactly what's
+# pinned in package-lock.json, fails if the lockfile is out of sync with
+# package.json, and is faster/more reproducible in CI than `npm install`.
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # ─── Stage 2: Download Terraform & terraform-ls binaries ──────────────────────
 FROM alpine:3.21 AS tools
@@ -55,41 +58,82 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 # ── System tools ──────────────────────────────────────────────────────────────
-# docker-cli  → lets the backend run checkov/infracost via the host Docker daemon
-#               (daemon is NOT running inside the container; the socket is bind-mounted
-#                in docker-compose.yml using /var/run/docker.sock)
+# docker-cli  → lets the backend run checkov/infracost/terraform-sandbox
+#               containers. SECURITY FIX: this used to talk to a raw
+#               /var/run/docker.sock bind-mounted straight into this
+#               container (equivalent to host root for anything that could
+#               reach it). It now talks over TCP to a locked-down
+#               `docker-socket-proxy` service instead — see DOCKER_HOST in
+#               docker-compose.yml and the comments on that service. This
+#               container never mounts the real socket and does not need
+#               (and no longer has) membership in a `docker` group.
 # ca-certificates, wget → needed by the HEALTHCHECK and HTTPS calls
 RUN apk add --no-cache \
       docker-cli \
       ca-certificates \
-      wget
+      wget \
+      tini
 
 # ── Copy Terraform binaries from the tools stage ──────────────────────────────
 COPY --from=tools /usr/local/bin/terraform      /usr/local/bin/terraform
 COPY --from=tools /usr/local/bin/terraform-ls   /usr/local/bin/terraform-ls
 
 # ── Non-root user ─────────────────────────────────────────────────────────────
-# appuser runs the Node process.
-# We also add appuser to the 'docker' group (created by the docker-cli package)
-# so it can talk to /var/run/docker.sock when the socket is bind-mounted.
+# appuser runs the Node process. It is NOT a member of any docker-socket
+# group — DOCKER_HOST points the `docker` CLI at the docker-socket-proxy
+# service over TCP, so no local socket permissions are needed at all.
 #
-# NOTE: on Linux hosts the Docker socket GID is typically 999 (same as the
-# Alpine docker group).  If your host uses a different GID, override at runtime:
-#   docker-compose run --group-add <HOST_DOCKER_GID> backend
-RUN addgroup -S appgroup \
- && addgroup -S docker \
- && adduser  -S appuser -G appgroup \
- && adduser  appuser docker
+# KUBERNETES FIX: this used to be `adduser -S appuser -G appgroup` with no
+# explicit uid/gid. That's fine for plain `docker run`/Compose (nothing
+# there needs to know the number), but it breaks under Kubernetes'
+# `runAsNonRoot: true` pod security context in two ways:
+#   1. Immediately: kubelet validates that check by reading the image's
+#      numeric USER. A *named* user with no pinned uid can't be resolved
+#      that way, so the pod is rejected outright — "cannot verify user is
+#      non-root" (the exact same failure class hit on the frontend image's
+#      unpinned `USER nginx`).
+#   2. Even after working around that in the k8s manifest by forcing a
+#      specific runAsUser number: Alpine's `adduser -S` with no `-u` assigns
+#      the next free system uid at BUILD time, which depends on exactly
+#      which system accounts already exist in that image layer at that
+#      point — not something you can reliably determine by reading this
+#      Dockerfile alone, only by inspecting the actual built image. Guessing
+#      wrong doesn't just fail to schedule (which would be an obvious,
+#      loud failure); it schedules fine and then hits confusing EACCES
+#      errors reading /app or writing /tfgen-scratch, because those were
+#      chowned at build time to whatever number actually got assigned.
+# Pinning explicit uid/gid here removes that ambiguity for good. 1001 is
+# used (not 1000) specifically to avoid colliding with the `node` user that
+# node:20-alpine already ships at uid/gid 1000.
+RUN addgroup -g 1001 -S appgroup \
+ && adduser  -u 1001 -S appuser -G appgroup
 
 # ── Application files ─────────────────────────────────────────────────────────
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN chown -R appuser:appgroup /app
 
+# ── Shared scratch volume mount point ─────────────────────────────────────────
+# See backend/utils/dockerScratch.js + docker-compose.yml (tfgen_scratch
+# volume). Pre-created with appuser ownership so that when Compose mounts
+# the (initially empty) named volume here, Docker seeds the volume with this
+# directory's ownership instead of defaulting to root:root — appuser needs
+# to create session subdirectories under this mount at runtime.
+RUN mkdir -p /tfgen-scratch && chown appuser:appgroup /tfgen-scratch
+
 USER appuser
 
 EXPOSE 4000
 
-# Health-check — pings the /health endpoint (defined in server.js)
+# BUG FIX: this HEALTHCHECK was documented in a comment but never actually
+# written — `docker ps` / orchestrators had no way to detect a hung/crashed
+# Node process short of the container exiting outright. Pings the real
+# /api/health route (see backend/server.js).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -q -O /dev/null --tries=1 http://127.0.0.1:4000/api/health || exit 1
 
+# tini as PID 1 so SIGTERM/SIGINT from `docker stop` / Kubernetes actually
+# reach the Node process (and get forwarded to any children) instead of
+# being swallowed — Node is not a real init system.
+ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "server.js"]

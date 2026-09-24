@@ -1,6 +1,7 @@
 'use strict';
 const router = require('express').Router();
 const db = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { v4: uuidv4 } = require('uuid');
 const { stripHtml, detectSecrets } = require('../utils/sanitize');
 const { authMiddleware, requireRole, optionalAuth } = require('../middleware/auth');
@@ -53,6 +54,53 @@ async function ensureResourceColumns() {
 
 // Kick off the startup migration (fire-and-forget; errors are logged above).
 ensureResourceColumns();
+
+// ─── M-03 fix: same pattern as ensureResourceColumns(), applied to
+// project_versions ────────────────────────────────────────────────────────
+// GET /:id/versions and POST /:id/versions each used to run their own
+// (nearly identical) block of 6-7 `ALTER TABLE project_versions ADD COLUMN
+// IF NOT EXISTS ...` statements on EVERY request — even though server.js's
+// startup autoMigrate() already guarantees these columns exist, and even
+// though this exact anti-pattern was already fixed once for `resources`
+// a few lines above. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` still takes
+// a Postgres ACCESS EXCLUSIVE lock even when the column already exists, so
+// concurrent version-history reads/writes were needlessly serializing
+// against each other under load. Checked once at module load (like
+// resources above); the per-request handlers now just await the readiness
+// flag instead of re-running DDL.
+const VERSION_MIGRATE_COLS = [
+  { col: 'full_hcl',          type: 'TEXT',          def: "''" },
+  { col: 'resource_count',    type: 'INT',           def: '0' },
+  { col: 'cost_estimate_usd', type: 'NUMERIC(12,4)', def: null },
+  { col: 'checkov_passed',    type: 'INT',           def: '0' },
+  { col: 'checkov_failed',    type: 'INT',           def: '0' },
+  { col: 'change_summary',    type: 'TEXT',          def: "''" },
+  { col: 'saved_by',          type: 'UUID',          def: null },
+];
+let _versionColumnsReady = false;
+
+async function ensureVersionColumns() {
+  if (_versionColumnsReady) return;
+  try {
+    const existing = await db.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'project_versions'`
+    );
+    const present = new Set(existing.rows.map(r => r.column_name));
+    for (const { col, type, def } of VERSION_MIGRATE_COLS) {
+      if (!present.has(col)) {
+        const defClause = def !== null ? ` DEFAULT ${def}` : '';
+        await db.query(`ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS ${col} ${type}${defClause}`);
+      }
+    }
+    _versionColumnsReady = true;
+  } catch (err) {
+    console.error('[projects] ensureVersionColumns error:', err.message);
+  }
+}
+
+// Kick off the startup migration (fire-and-forget; errors are logged above).
+ensureVersionColumns();
 
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -131,7 +179,7 @@ router.get('/', authMiddleware, async (req, res) => {
       offset: safeOff,
       has_more: safeOff + result.rows.length < total,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to fetch projects'); }
 });
 
 // ─── Pending invitations for the current user ─────────────────────────────────
@@ -151,7 +199,7 @@ router.get('/invitations/pending', authMiddleware, async (req, res) => {
       [req.user.id]
     );
     res.json(result.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to fetch pending invitations'); }
 });
 
 // ─── Get single project with resources ───────────────────────────────────────
@@ -176,7 +224,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
       return out;
     };
     res.json({ ...project, resources: resources.rows.map(parseJsonbRow) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to fetch project'); }
 });
 
 // ─── Create project ───────────────────────────────────────────────────────────
@@ -189,12 +237,12 @@ router.post('/', authMiddleware, requireRole('user'), audit('project.create'), a
       [name.trim(), description || '', aws_region || DEFAULT_AWS_REGION, environment || 'dev', JSON.stringify(backend_config || {}), req.user.id]
     );
     res.status(201).json(result.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to create project'); }
 });
 
 // ─── Update project ───────────────────────────────────────────────────────────
 router.put('/:id', authMiddleware, audit('project.update'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   const { name, description, aws_region, environment, backend_config } = req.body;
   // BE-07 fix: validate required fields — mirrors the validation already present on POST /
@@ -229,7 +277,7 @@ router.put('/:id', authMiddleware, audit('project.update'), async (req, res) => 
       ]
     );
     res.json(result.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to update project'); }
 });
 
 // ─── Delete project ───────────────────────────────────────────────────────────
@@ -248,12 +296,12 @@ router.delete('/:id', authMiddleware, audit('project.delete'), async (req, res) 
   try {
     await db.query('DELETE FROM projects WHERE id = $1', [req.params.id]);
     res.json({ deleted: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to delete project'); }
 });
 
 // ─── Save resources ───────────────────────────────────────────────────────────
 router.post('/:id/resources', authMiddleware, audit('project.resources.save'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
 
   const { resources, full_hcl } = req.body;
@@ -470,8 +518,7 @@ router.post('/:id/resources', authMiddleware, audit('project.resources.save'), a
     res.json({ saved: true, count: resources.length });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('[projects] Save resources error:', e.message);
-    res.status(500).json({ error: 'Failed to save resources: ' + e.message });
+    handleDbError(e, res, 'Failed to save resources');
   } finally { client.release(); }
 });
 
@@ -480,51 +527,31 @@ router.get('/:id/versions', authMiddleware, async (req, res) => {
   const project = await authoriseProject(req, res);
   if (!project) return;
   try {
-    // Ensure the extended columns exist before selecting them.
-    // The POST (save) route auto-adds them on first write, but a user may visit
-    // the history page on a fresh DB before ever saving — this prevents a
-    // "column does not exist" 500 that would surface as an empty history view.
-    const versionReadCols = [
-      { col: 'full_hcl',          type: 'TEXT',          def: "''" },
-      { col: 'resource_count',    type: 'INT',           def: '0' },
-      { col: 'cost_estimate_usd', type: 'NUMERIC(12,4)', def: null },
-      { col: 'checkov_passed',    type: 'INT',           def: '0' },
-      { col: 'checkov_failed',    type: 'INT',           def: '0' },
-      { col: 'change_summary',    type: 'TEXT',          def: "''" },
-    ];
-    for (const { col, type, def } of versionReadCols) {
-      const defClause = def !== null ? ` DEFAULT ${def}` : '';
-      await db.query(`ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS ${col} ${type}${defClause}`).catch(() => {});
-    }
+    // SECURITY/PERF FIX (M-03): this used to re-run 6 ALTER TABLE ADD COLUMN
+    // IF NOT EXISTS statements on every single request (each taking an
+    // ACCESS EXCLUSIVE lock even when the column already exists). Replaced
+    // with the one-time module-load check in ensureVersionColumns() above —
+    // mirrors the BUG-019 fix already applied to `resources`.
+    await ensureVersionColumns();
 
     const result = await db.query(
       `SELECT id, version_number, full_hcl, resource_count, cost_estimate_usd, checkov_passed, checkov_failed, change_summary, saved_at FROM project_versions WHERE project_id=$1 ORDER BY version_number DESC LIMIT 50`,
       [req.params.id]
     );
     res.json(result.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to fetch version history'); }
 });
 
 // ─── Save version snapshot ────────────────────────────────────────────────────
 router.post('/:id/versions', authMiddleware, audit('project.version.save'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   const { full_hcl, resource_count, cost_estimate_usd, checkov_passed, checkov_failed, change_summary } = req.body;
   try {
-    // Auto-migrate: ensure version columns exist
-    const versionCols = [
-      { col: 'full_hcl',          type: 'TEXT',          def: "''" },
-      { col: 'cost_estimate_usd', type: 'NUMERIC(12,4)', def: null },
-      { col: 'checkov_passed',    type: 'INT',           def: '0' },
-      { col: 'checkov_failed',    type: 'INT',           def: '0' },
-      { col: 'change_summary',    type: 'TEXT',          def: "''" },
-      { col: 'saved_by',          type: 'UUID',          def: null },
-      { col: 'resource_count',    type: 'INT',           def: '0' },
-    ];
-    for (const { col, type, def } of versionCols) {
-      const defClause = def !== null ? ` DEFAULT ${def}` : '';
-      await db.query(`ALTER TABLE project_versions ADD COLUMN IF NOT EXISTS ${col} ${type}${defClause}`).catch(() => {});
-    }
+    // SECURITY/PERF FIX (M-03): see ensureVersionColumns() above — this used
+    // to re-run 7 ALTER TABLE ADD COLUMN IF NOT EXISTS statements on every
+    // save, each taking an ACCESS EXCLUSIVE lock even when a no-op.
+    await ensureVersionColumns();
 
     // BUG-007 fix: atomic version number assignment using INSERT...SELECT to eliminate
     // the race condition where two concurrent saves both read the same MAX and insert
@@ -556,8 +583,7 @@ router.post('/:id/versions', authMiddleware, audit('project.version.save'), asyn
         error: 'Version number conflict — another save is in progress. Please retry.',
       });
     }
-    console.error('[projects] Save version error:', e.message);
-    res.status(500).json({ error: 'Failed to save version: ' + e.message });
+    handleDbError(e, res, 'Failed to save version');
   }
 });
 
@@ -579,7 +605,7 @@ router.get('/:id/versions/diff', authMiddleware, async (req, res) => {
     const map = Object.fromEntries(result.rows.map(r => [r.version_number, r.full_hcl]));
     if (!map[parsedA] || !map[parsedB]) return res.status(404).json({ error: 'One or both versions not found' });
     res.json({ a: parsedA, b: parsedB, hcl_a: map[parsedA], hcl_b: map[parsedB] });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to compute version diff'); }
 });
 
 // ─── Project members ──────────────────────────────────────────────────────────
@@ -595,11 +621,11 @@ router.get('/:id/members', authMiddleware, async (req, res) => {
       [req.params.id]
     );
     res.json(result.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to fetch project members'); }
 });
 
 router.post('/:id/members', authMiddleware, requireRole('user'), audit('project.member.invite'), async (req, res) => {
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   if (project.user_id !== req.user.id && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Only the project owner or admin can invite members' });
@@ -633,7 +659,7 @@ router.post('/:id/members', authMiddleware, requireRole('user'), audit('project.
     }).catch(() => {});
 
     res.json({ invited: true, email, role });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to invite member'); }
 });
 
 router.delete('/:id/members/:userId', authMiddleware, audit('project.member.remove'), async (req, res) => {
@@ -648,10 +674,10 @@ router.delete('/:id/members/:userId', authMiddleware, audit('project.member.remo
     try {
       await db.query('DELETE FROM project_members WHERE project_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
       return res.json({ removed: true });
-    } catch (e) { return res.status(500).json({ error: e.message }); }
+    } catch (e) { return handleDbError(e, res, 'Failed to remove member'); }
   }
 
-  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin', 'user']);
+  const project = await authoriseProject(req, res, ['editor', 'deployer', 'admin']);
   if (!project) return;
   if (project.user_id !== req.user.id && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Only the project owner or admin can remove members' });
@@ -659,7 +685,7 @@ router.delete('/:id/members/:userId', authMiddleware, audit('project.member.remo
   try {
     await db.query('DELETE FROM project_members WHERE project_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
     res.json({ removed: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to remove member'); }
 });
 
 // BE-11 fix: the invitation flow inserts a project_members row with accepted_at = NULL,
@@ -692,7 +718,7 @@ router.put('/:id/members/:userId/accept', authMiddleware, audit('project.member.
       if (existing.rows[0].accepted_at) return res.status(409).json({ error: 'Invitation already accepted' });
     }
     res.json({ accepted: true, role: result.rows[0]?.role });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { handleDbError(e, res, 'Failed to accept invitation'); }
 });
 
 module.exports = router;

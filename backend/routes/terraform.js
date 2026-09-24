@@ -5,10 +5,11 @@ const rateLimit = require('express-rate-limit');
 const { runFmt, runInit } = require('../terraform/runner');
 const { runCheckov }   = require('../services/checkov');
 const { runInfracost } = require('../services/infracost');
-const { stripHtml, detectSecrets, lintNetworkRules, hasMarkup } = require('../utils/sanitize');
+const { stripHtml, detectSecrets, detectDangerousConstructs, lintNetworkRules, hasMarkup } = require('../utils/sanitize');
 const { authMiddleware, optionalAuth } = require('../middleware/auth');
 const { audit, attachAuditResponseHook } = require('../middleware/audit');
 const db = require('../db/connection');
+const { handleDbError } = require('../utils/errorHandler');
 const { enqueue, getJobStatus } = require('../services/jobQueue');
 const { dispatchAndPersist } = require('../services/terraformJobs');
 const { authoriseProjectById, UUID_RE } = require('../utils/projectAccess');
@@ -45,6 +46,24 @@ function guardHcl(req, res) {
     res.status(413).json({ error: 'HCL payload too large (max 1 MB)' }); return null;
   }
   const clean = stripHtml(hcl);
+
+  // SECURITY FIX (critical, was missing entirely): reject Terraform code-
+  // execution primitives (provisioner "local-exec"/"remote-exec", data
+  // "external") BEFORE any HCL reaches `terraform` — whether that's fmt,
+  // validate, plan, cost, scan, init, or apply. This runs first, ahead of
+  // secret detection, because these constructs are dangerous independent of
+  // whether they also happen to contain a literal secret. See CHANGELOG for
+  // the full writeup of why this was critical (RCE + credential exfil via
+  // a single "read-only" plan request).
+  const dangerous = detectDangerousConstructs(clean);
+  if (dangerous.length > 0) {
+    res.status(400).json({
+      error: 'HCL contains a Terraform construct that executes code and is not permitted: ' +
+        dangerous.map(d => d.name).join(', ') + '.',
+      details: dangerous.map(d => d.hint),
+    });
+    return null;
+  }
 
   // Secret detection — block if literal AWS keys found
   const secrets = detectSecrets(clean);
@@ -154,7 +173,7 @@ router.post('/fmt', authMiddleware, terraformComputeLimiter, audit('terraform.fm
     const result = await runFmt(hcl, null, mode);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform fmt failed');
   }
 });
 
@@ -190,7 +209,7 @@ router.post('/validate', authMiddleware, terraformComputeLimiter, audit('terrafo
     // poll GET /api/terraform/jobs/:jobId for the result.
     return res.status(202).json({ jobId, status: 'queued' });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform validate failed');
   }
 });
 
@@ -211,7 +230,7 @@ router.post('/suggest', optionalAuth, audit('terraform.suggest'), async (req, re
       },
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to generate suggestions');
   }
 });
 
@@ -227,21 +246,45 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
   const mode = readRunnerMode(req);
   const projectId = isValidProjectId(req.body.project_id) ? req.body.project_id : null;
 
-  // Optionally attach real AWS credentials so the plan runs against the
-  // user's real account (non-mock provider). If the user hasn't saved
-  // credentials we fall back to mock/offline plan (existing behaviour).
-  let awsCredentials = null;
+  // SECURITY FIX (critical): use_real_credentials used to be gated by nothing
+  // more than authMiddleware (any authenticated user, any role). Attaching
+  // real credentials also flips the Docker sandbox network from `none` to
+  // `bridge` (see runner.js), which is a materially higher-privilege action
+  // than a normal offline/mock plan. Now that guardHcl() always blocks
+  // local-exec/remote-exec/data-external (see above), the direct RCE path is
+  // closed — but "plan with real credentials + network access" still now
+  // requires the same project role gate as /apply, instead of only auth.
+  //
+  // SECURITY FIX (critical — C-06): this handler used to call
+  // getDecryptedAwsCredentials() right here and put the resulting plaintext
+  // accessKeyId/secretAccessKey/sessionToken directly into the object handed
+  // to enqueue(). enqueue() -> jobQueue.js's queue.add() serializes that
+  // entire object into a BullMQ job in Redis, and with the default
+  // removeOnComplete:100 / removeOnFail:200, Redis ends up holding a rolling
+  // window of up to 300 sets of plaintext AWS credentials — made far worse
+  // by Redis previously having no auth at all (see docker-compose.yml fix).
+  // Fix: never let credential material enter the job payload at all — only
+  // a boolean flag is enqueued, and the job processor (services/
+  // terraformJobs.js) fetches + decrypts credentials itself, inside the
+  // worker, at the moment it's about to call runPlan() — so secrets are
+  // decrypted once, held only in local process memory for the duration of
+  // that call, and never serialized anywhere.
+  let useRealCredentials = false;
   if (req.body.use_real_credentials) {
-    try {
-      const { getDecryptedAwsCredentials } = require('../utils/awsCrypto');
-      awsCredentials = await getDecryptedAwsCredentials(req.user.id);
-    } catch (_) { /* fall back to mock plan */ }
+    if (!projectId) {
+      return res.status(400).json({
+        error: 'project_id is required to plan with real AWS credentials.',
+      });
+    }
+    const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin']);
+    if (!project) return; // authoriseProjectById already sent 403/404
+    useRealCredentials = true;
   }
 
   try {
     const jobId = await createExecutionJobRow({ projectId, userId: req.user.id, type: 'plan', hcl });
     const { result } = await enqueue(
-      { jobId, type: 'plan', hcl, mode, projectId, userId: req.user.id, awsCredentials },
+      { jobId, type: 'plan', hcl, mode, projectId, userId: req.user.id, useRealCredentials },
       dispatchAndPersist
     );
 
@@ -253,24 +296,31 @@ router.post('/plan', authMiddleware, audit('terraform.plan'), async (req, res) =
     }
     return res.status(202).json({ jobId, status: 'queued' });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform plan failed');
   }
 });
 
 // ── POST /api/terraform/cost ─────────────────────────────────────
-router.post('/cost', optionalAuth, async (req, res) => {
+// SECURITY FIX (H-02): was optionalAuth with no dedicated rate limiter —
+// unlike /fmt and /validate, an anonymous caller could repeatedly trigger
+// Infracost subprocess spawns to exhaust host CPU. Now matches the
+// authMiddleware + terraformComputeLimiter treatment already given to /fmt.
+router.post('/cost', authMiddleware, terraformComputeLimiter, audit('terraform.cost'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
   try {
     const result = await runInfracost(hcl);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Cost estimation failed');
   }
 });
 
 // ── POST /api/terraform/scan ─────────────────────────────────────
-router.post('/scan', optionalAuth, async (req, res) => {
+// SECURITY FIX (H-02): was optionalAuth with no dedicated rate limiter —
+// an anonymous caller could repeatedly trigger Checkov Docker container
+// spawns to exhaust host CPU/memory. Now matches /fmt's treatment.
+router.post('/scan', authMiddleware, terraformComputeLimiter, audit('terraform.scan'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
   try {
@@ -280,13 +330,16 @@ router.post('/scan', optionalAuth, async (req, res) => {
     ]);
     res.json({ checkov, networkWarnings });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Security scan failed');
   }
 });
 
 
 // ── POST /api/terraform/init ──────────────────────────────────────────────────
-router.post('/init', optionalAuth, audit('terraform.init'), async (req, res) => {
+// SECURITY FIX (H-02): was optionalAuth with no dedicated rate limiter — same
+// unauthenticated Docker-spawn DoS vector as /cost and /scan above. Now
+// matches /fmt's treatment.
+router.post('/init', authMiddleware, terraformComputeLimiter, audit('terraform.init'), async (req, res) => {
   const hcl = guardHcl(req, res);
   if (hcl === null) return;
   const mode = readRunnerMode(req);
@@ -294,7 +347,7 @@ router.post('/init', optionalAuth, audit('terraform.init'), async (req, res) => 
     const result = await runInit(hcl, null, mode);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform init failed');
   }
 });
 
@@ -329,18 +382,35 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
   }
 
   // Role check — only deployer / owner may apply
-  const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin', 'user']);
+  // SECURITY FIX (L-02): this list used to include 'user' too, which is
+  // backwards from ROLE_LEVELS (user=1 ranks below editor=2) and contradicts
+  // the comment above ("'editor' can plan but not apply") — editor wasn't
+  // even in the list. Currently dead code (no endpoint ever assigns
+  // project_members.role='user' — POST /:id/members only allows 'viewer',
+  // 'editor', 'deployer'), but removed so it can't become a live
+  // privilege-escalation path if that invite-role allowlist is ever
+  // loosened later without this file being revisited.
+  const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin']);
   if (!project) return; // authoriseProjectById already sent 403/404
 
-  // Credential check — must have saved real AWS credentials
-  let awsCredentials;
+  // Credential check — must have saved real AWS credentials.
+  // SECURITY FIX (critical — C-06): this used to call
+  // getDecryptedAwsCredentials() here and stash the plaintext result in
+  // `awsCredentials`, which was then put straight into the job payload
+  // passed to enqueue() — and from there into the BullMQ job in Redis (see
+  // the matching comment on POST /plan above for the full writeup). This
+  // route only needs to know WHETHER credentials exist, not what they are,
+  // so it now uses the cheap existence check hasAwsCredentials() (no
+  // decryption at all) and defers the actual decrypt to the job processor,
+  // at execution time, inside the worker.
+  let credentialsExist;
   try {
-    const { getDecryptedAwsCredentials } = require('../utils/awsCrypto');
-    awsCredentials = await getDecryptedAwsCredentials(req.user.id);
+    const { hasAwsCredentials } = require('../utils/awsCrypto');
+    credentialsExist = await hasAwsCredentials(req.user.id);
   } catch (credErr) {
-    return res.status(500).json({ error: 'Failed to retrieve AWS credentials: ' + credErr.message });
+    return res.status(500).json({ error: 'Failed to check AWS credentials: ' + credErr.message });
   }
-  if (!awsCredentials) {
+  if (!credentialsExist) {
     return res.status(422).json({
       error: 'No AWS credentials saved. Go to Settings → AWS Credentials and connect your account before running apply.',
       code: 'NO_CREDENTIALS',
@@ -354,9 +424,10 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
 
     // Always enqueue — never run apply inline on the HTTP request
     // (apply is too slow; even the in-process fallback fires the processor
-    //  asynchronously and returns immediately here).
+    //  asynchronously and returns immediately here). Note: no credential
+    // material in this payload — see SECURITY FIX comment above.
     await enqueue(
-      { jobId, type: 'apply', hcl, mode, projectId, userId: req.user.id, awsCredentials },
+      { jobId, type: 'apply', hcl, mode, projectId, userId: req.user.id, useRealCredentials: true },
       dispatchAndPersist
     );
 
@@ -367,7 +438,7 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
       wsUrl: `/ws/jobs?id=${jobId}`,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Terraform apply failed');
   }
 });
 
@@ -401,7 +472,7 @@ router.get('/jobs/:jobId', authMiddleware, async (req, res) => {
     }
     res.json(row.rows[0]);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch job status');
   }
 });
 
@@ -446,7 +517,7 @@ router.get('/jobs', authMiddleware, async (req, res) => {
     );
     res.json({ jobs: rows.rows, total: rows.rows.length });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    handleDbError(e, res, 'Failed to fetch jobs');
   }
 });
 

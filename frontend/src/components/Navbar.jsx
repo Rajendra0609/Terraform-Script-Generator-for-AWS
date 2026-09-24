@@ -5,6 +5,8 @@ import GlobalSearch from './GlobalSearch';
 import { useAuth } from '../contexts/AuthContext';
 import { awsAPI, projectsAPI } from '../api/client';
 import AwsCredentialsModal from './AwsCredentialsModal';
+import { getLastProjectId } from '../utils/lastProjectStorage';
+import { APP_VERSION } from '../version';
 
 export default function Navbar() {
   const { user, logout } = useAuth();
@@ -29,15 +31,11 @@ export default function Navbar() {
   }, [user]);
 
   // Read the last active projectId so the History link can go directly to that
-  // project's version history.  The Builder writes 'tfgen.lastProjectId' to
-  // localStorage whenever a project is successfully loaded.
-  const UUID_RE_NAV = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const lastProjectId = (() => {
-    try {
-      const id = localStorage.getItem('tfgen.lastProjectId');
-      return id && UUID_RE_NAV.test(id) ? id : null;
-    } catch { return null; }
-  })();
+  // project's version history. The Builder writes this per-user-namespaced
+  // key whenever a project is successfully loaded (see L-04 fix in
+  // utils/lastProjectStorage.js — this used to be a single global key shared
+  // across every account on the browser).
+  const lastProjectId = getLastProjectId(user?.id);
   const historyHref = lastProjectId ? `/history/${lastProjectId}` : '/history';
   const isAdmin = user?.role === 'admin';
 
@@ -142,7 +140,7 @@ export default function Navbar() {
       </Link>
 
       <span style={{ padding: '2px 8px', background: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 99, fontSize: 9, fontWeight: 700, color: '#059669', letterSpacing: '0.06em', textTransform: 'uppercase', marginRight: 20, flexShrink: 0 }}>
-        {process.env.REACT_APP_APP_VERSION || '0.0.1'}
+        {APP_VERSION}
       </span>
 
       {user && (

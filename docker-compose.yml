@@ -2,14 +2,30 @@ version: '3.9'
 services:
 
   # ── Postgres ─────────────────────────────────────────────────────────────────
+  # SECURITY FIX (critical — C-06): this service used to publish 5432 straight
+  # to the host with a weak default password (`tfgen123` via `:-tfgen123`
+  # fallback), so anything that could reach the host on 5432 got a full
+  # read/write shot at the application database with a guessable password.
+  # The backend already reaches Postgres over the internal Compose network by
+  # service name (`postgres:5432`) — there is no legitimate reason to publish
+  # this port to the host at all, so `ports:` is removed entirely. If you
+  # genuinely need external access (e.g. a one-off admin query with a GUI
+  # client), open a tunnel on demand — `docker compose exec postgres psql` or
+  # `docker compose port postgres 5432` + an SSH tunnel — instead of leaving
+  # it published permanently.
+  #
+  # POSTGRES_PASSWORD now uses `${VAR:?err}` (no fallback): Compose will
+  # refuse to start ANY service with a clear error if this isn't set in your
+  # .env, mirroring the same fail-fast principle applied to ENCRYPT_KEY /
+  # JWT_SECRET in the backend code. See .env.example.
   postgres:
     image: daggu1997/tfgen_postgres:v0.0.1
     environment:
       POSTGRES_USER:     ${POSTGRES_USER:-tfgen}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfgen123}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env — see .env.example. Do not use a weak/default value.}
       POSTGRES_DB:       ${POSTGRES_DB:-terraform_generator}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+    # No `ports:` — intentionally not published to the host. Only reachable
+    # by other containers on this Compose network, via the service name.
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,46 +37,168 @@ services:
     restart: unless-stopped
 
   # ── Redis ────────────────────────────────────────────────────────────────────
+  # SECURITY FIX (critical — C-06): this service used to publish 6379 to the
+  # host with NO `requirepass` at all — completely unauthenticated. Combined
+  # with plaintext AWS credentials that used to flow through the BullMQ job
+  # payload (see routes/terraform.js / services/terraformJobs.js SECURITY FIX
+  # comments), that meant `redis-cli -h <host> ping` from anywhere that could
+  # reach the host was enough to read every recent job, including plaintext
+  # AWS keys, with zero authentication. Two independent fixes, both required:
+  #   1. `ports:` removed — not published to the host at all, same reasoning
+  #      as Postgres above.
+  #   2. `--requirepass` now set from a required REDIS_PASSWORD env var (no
+  #      fallback — Compose refuses to start without it), and REDIS_URL below
+  #      is updated to include it.
   redis:
     image: redis:7-alpine
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
+    # No `ports:` — intentionally not published to the host.
     volumes:
       - redisdata:/data
-    command: ["redis-server", "--appendonly", "yes"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env — see .env.example}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # --no-auth-warning suppresses redis-cli's "password on command line"
+      # warning, which is harmless here (this runs inside the container /
+      # Compose network, not over a public shell history).
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env — see .env.example}
+    restart: unless-stopped
+
+  # ── Docker socket proxy ───────────────────────────────────────────────────────
+  # SECURITY FIX (critical): the backend used to bind-mount the host's raw
+  # /var/run/docker.sock directly (see git history / CHANGELOG_AUDIT_FIXES.md).
+  # That is equivalent to giving the backend container root on the HOST — any
+  # process that can reach the socket can `docker run --privileged -v /:/host`
+  # and escape. This proxy (tecnativa/docker-socket-proxy) sits in front of the
+  # real socket and exposes only the narrow subset of the Docker Engine API the
+  # backend actually needs (spawning ephemeral terraform/checkov/infracost
+  # containers), over a plain TCP endpoint that is only reachable from other
+  # containers in this compose network — it is never published to the host.
+  #
+  # NOTE — residual risk, read before trusting this as a complete fix:
+  # this proxy filters by API *endpoint category* (CONTAINERS/IMAGES/etc.), not
+  # by the JSON body of each request. A backend process that is itself
+  # compromised (e.g. a future dependency RCE, unrelated to Terraform HCL) can
+  # still ask the proxy to start a container with `--privileged` or a host bind
+  # mount, because POST+CONTAINERS is enabled (it has to be — that's how
+  # `docker run` works). This config is real defense-in-depth (removes the
+  # "any RCE = instant host root" property, blocks EXEC/VOLUMES/NETWORKS/
+  # SWARM/SYSTEM/etc. entirely) but it is not a substitute for the follow-up
+  # item tracked in CHANGELOG_AUDIT_FIXES.md: move sandboxed Terraform
+  # execution to a dedicated microservice with a narrow custom RPC (or a
+  # managed executor — ECS Fargate RunTask / restricted Kubernetes Jobs) that
+  # never accepts arbitrary docker args from the backend at all.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    environment:
+      # Required for this app's actual usage (spawn ephemeral tf/checkov/
+      # infracost containers, check daemon availability):
+      CONTAINERS: 1   # create/start/wait/logs/rm/inspect containers
+      IMAGES:     1   # inspect/pull images
+      POST:       1   # without this the proxy is read-only — required to `docker run`
+      INFO:       1   # `docker info` (used by dockerAvailable() health check)
+      # Explicitly denied — no legitimate use in this app, and each of these
+      # is a known privilege-escalation surface if left open:
+      NETWORKS:      0
+      VOLUMES:       0
+      EXEC:          0
+      SWARM:         0
+      SYSTEM:        0
+      SERVICES:      0
+      NODES:         0
+      PLUGINS:       0
+      SECRETS:       0
+      CONFIGS:       0
+      BUILD:         0
+      COMMIT:        0
+      DISTRIBUTION:  0
+      SESSION:       0
+      TASKS:         0
+      AUTH:          0
+      ALLOW_RESTARTS: 0
+    volumes:
+      # Real host socket is mounted read-only into the PROXY only — never
+      # into the backend (or any other app) container.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # No `ports:` — intentionally not published to the host. Only reachable
+    # by other containers on this compose network, via the service name.
     restart: unless-stopped
 
   # ── Backend (Node / Express) ─────────────────────────────────────────────────
+  # SECURITY FIX (critical — C-10): this service used to publish 4000 straight
+  # to the host IN ADDITION to being reachable through nginx. Any client that
+  # connected directly to :4000 became the "trusted proxy hop" Express relies
+  # on (`app.set('trust proxy', 1)`), so it could set
+  # `X-Forwarded-For: 127.0.0.1` and Express would believe it — trivially
+  # defeating both the global and auth rate limiters (unlimited login
+  # brute-force) and falsifying `audit_logs.ip` for every logged action. All
+  # external traffic now goes through nginx (see frontend/nginx.conf, fixed
+  # to overwrite rather than append X-Forwarded-For) and reaches the backend
+  # only over the internal Compose network at `backend:4000` — never
+  # published to the host. If you need to hit the API directly while
+  # debugging locally, use `docker compose exec backend curl localhost:4000/...`
+  # or a `docker-compose.override.yml` that re-adds the port mapping for your
+  # own machine only — don't re-add it here.
   backend:
     image: daggu1997/tfgen_backend:v0.0.1
-    ports:
-      - "${BACKEND_PORT:-4000}:4000"
+    # No `ports:` — reachable only via nginx (frontend service) or other
+    # containers on this Compose network, by service name.
     env_file:
+      # SECURITY FIX (critical): every secret below used to be hardcoded
+      # directly under `environment:`, which OVERRIDES anything from .env and
+      # is what actually ends up committed. A real Gmail address + App
+      # Password and a real EC2 IP were leaked this way. Secrets now live
+      # ONLY in .env (git-ignored — see .gitignore), referenced below via
+      # ${VAR} interpolation, matching the pattern already used correctly for
+      # POSTGRES_*. If this repo/zip was ever shared with the old hardcoded
+      # values in place, treat that Gmail App Password as already compromised
+      # and revoke it in Google Account → Security → App Passwords immediately
+      # — rotating the code does not by itself revoke a leaked credential.
       - .env
     environment:
       NODE_ENV:     production
       PORT:         4000
       HOST:         0.0.0.0
-      CORS_ORIGIN:  http://localhost:3000,http://127.0.0.1:3000,http://13.232.187.242:3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:-tfgen123}@postgres:5432/${POSTGRES_DB:-terraform_generator}
-      REDIS_URL:    redis://redis:6379
-      SMTP_USER:  srirajendraprasaddaggubati@gmail.com
-      SMTP_PASS:  ohul sitk qapy hmzl       # Gmail app password (16 chars)
-      SMTP_FROM:  TFGen <tfgenadmin@gmail.com>
-      FRONTEND_URL:  http://13.232.187.242:3000
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      CORS_ORIGIN:  ${CORS_ORIGIN}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tfgen}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:-terraform_generator}
+      # SECURITY FIX (C-06): includes the now-required Redis password —
+      # previously `redis://redis:6379` with no credential at all, matching
+      # the unauthenticated `redis-server` command this connects to.
+      REDIS_URL:    redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379
+      SMTP_USER:    ${SMTP_USER}
+      SMTP_PASS:    ${SMTP_PASS}
+      SMTP_HOST:    ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT:    ${SMTP_PORT:-587}
+      SMTP_FROM:    ${SMTP_FROM}
+      FRONTEND_URL: ${FRONTEND_URL}
+      # SECURITY FIX: points the `docker` CLI at the locked-down proxy
+      # instead of a raw socket mounted into this container. See
+      # docker-socket-proxy service above for what's allowed/denied.
+      DOCKER_HOST:  tcp://docker-socket-proxy:2375
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    volumes:
+      # SECURITY FIX (critical — see backend/utils/dockerScratch.js): this
+      # backend spawns sibling terraform/checkov/infracost containers via
+      # the Docker socket. A shared NAMED VOLUME (not a host bind mount) is
+      # required so files this container writes are actually visible inside
+      # those sibling containers — see the comment in dockerScratch.js for
+      # the full "why", including the fact that Checkov's critical-finding
+      # gate was previously a structural no-op because of this exact bug.
+      - tfgen_scratch:/tfgen-scratch
     restart: on-failure:5
   frontend:
     image: daggu1997/tfgen_frontend:v0.0.1
@@ -72,3 +210,8 @@ services:
 volumes:
   pgdata:
   redisdata:
+  tfgen_scratch:
+    # Explicit fixed name (not Compose's default <project>_<key> prefixing)
+    # so backend/utils/dockerScratch.js can reference it by a stable name
+    # regardless of COMPOSE_PROJECT_NAME.
+    name: tfgen_scratch

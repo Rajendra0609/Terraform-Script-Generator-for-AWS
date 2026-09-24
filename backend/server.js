@@ -16,11 +16,57 @@ const logger = winston.createLogger({
 
 const isDev = (process.env.NODE_ENV || 'development') !== 'production';
 
-// CORS: use a strict whitelist. In dev we allow common local origins including
-// localhost:3000 and the host IP used in your environment. Set `CORS_ORIGIN`
-// in `backend/.env` to a comma-separated list of allowed origins in production.
+// SECURITY FIX (M-01): neither the backend nor nginx set any HTTP security
+// headers previously — no CSP, no X-Frame-Options/frame-ancestors, no HSTS,
+// no Referrer-Policy. helmet() adds sane defaults for all of those; CSP is
+// tuned below for what this app actually needs (Monaco Editor's tokenizer
+// workers load via blob: URLs, and the CRA build injects the app's own
+// inline runtime chunk hash — everything else stays locked to 'self').
+// This is defense-in-depth alongside the equivalent nginx `add_header`
+// directives (see frontend/nginx.conf) — the two are redundant on purpose:
+// nginx protects static/SPA responses, helmet protects the API responses
+// nginx proxies straight through.
+const helmet = require('helmet');
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc: ["'self'"],
+      // Monaco's syntax highlighting/language workers are spun up from
+      // blob: URLs generated at runtime by monaco-editor's AMD loader.
+      workerSrc: ["'self'", 'blob:'],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"], // Monaco injects <style> tags for themes
+      imgSrc: ["'self'", 'data:', 'https:'],   // OAuth avatar_url values (Google/GitHub CDNs)
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'", 'data:'],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"], // clickjacking protection (belt-and-suspenders with X-Frame-Options)
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+    },
+  },
+  // Backend is not the TLS terminator here (nginx/ALB is) — still safe to
+  // send HSTS; browsers only honour it once they've seen it over HTTPS.
+  hsts: { maxAge: 15552000, includeSubDomains: true },
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // API is called cross-origin by the frontend
+}));
+
+// CORS: use a strict whitelist. Set `CORS_ORIGIN` in `backend/.env` to a
+// comma-separated list of allowed origins for your environment/deployment
+// (e.g. your dev machine's LAN IP, or your production domain).
+//
+// SECURITY FIX (L-08): the dev fallback used to include a specific
+// internal-looking IP address (10.244.24.67) baked directly into source —
+// environment-specific and meaningless (or actively misleading/wrong) on
+// anyone else's machine, plus the same class of issue as the public IP
+// that used to be hardcoded in docker-compose.yml (see C-05). No
+// environment-specific IPs ship in source defaults now — only localhost,
+// which is the one origin that's actually valid on every machine. Anything
+// else (a LAN IP for testing from another device, a real domain in
+// production) must be set explicitly via CORS_ORIGIN.
 const cors = require('cors');
-const defaultDevOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://10.244.24.67:3000'];
+const defaultDevOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000'];
 const allowedOrigins = (process.env.CORS_ORIGIN || defaultDevOrigins.join(',')).split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
@@ -40,13 +86,75 @@ app.use(cors({
 // (e.g., Nginx/ALB). express-rate-limit validates that X-Forwarded-For is
 // only used when trust proxy is enabled.
 // Use a safe default: only trust the first proxy hop.
-app.set('trust proxy', process.env.TRUST_PROXY || 1);
+//
+// SECURITY FIX (C-10): TRUST_PROXY used to be read as
+// `process.env.TRUST_PROXY || 1`, which — because `||` only falls through on
+// falsy values — meant setting `TRUST_PROXY=false` in .env actually set
+// Express's trust-proxy option to the STRING `"false"`, not the boolean
+// `false` (a non-empty string is truthy). Express's trust-proxy setting
+// treats an unrecognised string as a hostname/subnet to trust, which is not
+// what anyone setting `TRUST_PROXY=false` intended. Parse it explicitly.
+function parseTrustProxy(raw) {
+  if (raw === undefined || raw === '') return 1; // safe default: trust exactly one hop
+  if (raw === 'false') return false;
+  if (raw === 'true') return true;
+  const n = Number(raw);
+  return Number.isInteger(n) ? n : raw; // allow a hostname/subnet/CSV list to pass through as-is
+}
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
 
 // Rate limiting
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || String(15 * 60 * 1000), 10);
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || (isDev ? '1000' : '100'), 10);
-// Comma-separated list of trusted IP fragments (e.g. '127.0.0.1,::1,10.244.24.67')
-const TRUSTED_IPS = (process.env.RATE_LIMIT_TRUSTED_IPS || '127.0.0.1,::1,10.244.24.67').split(',').map(s => s.trim()).filter(Boolean);
+
+// SECURITY FIX (critical — C-10): TRUSTED_IPS used to be matched with
+// `ip.includes(t)` — a SUBSTRING check, not equality. Any spoofed
+// X-Forwarded-For value that merely CONTAINED a trusted fragment anywhere in
+// it (e.g. an attacker-chosen string embedding "127.0.0.1") was exempted
+// from rate limiting entirely, including the strict authLimiter meant to
+// stop login brute-forcing — reproducible with
+// `curl -H "X-Forwarded-For: 127.0.0.1" ...` on every request. Fixed by
+// parsing each configured entry as an exact IP or CIDR range with ipaddr.js
+// (already a dependency — see utils/ssrfGuard.js) and comparing structurally
+// instead of by string containment. This closes the bypass on its own, but
+// it's paired with two other required fixes: nginx now overwrites (rather
+// than appends to) X-Forwarded-For at the true network edge, and the backend
+// port is no longer published directly to the host — see nginx.conf and
+// docker-compose.yml.
+const ipaddr = require('ipaddr.js');
+
+function parseTrustedEntry(raw) {
+  try {
+    if (raw.includes('/')) return ipaddr.parseCIDR(raw);
+    return ipaddr.process(raw); // normalises IPv4-mapped IPv6 (::ffff:a.b.c.d) too
+  } catch (_) {
+    console.warn(`[rate-limit] ignoring malformed RATE_LIMIT_TRUSTED_IPS entry: ${raw}`);
+    return null;
+  }
+}
+const TRUSTED_ENTRIES = (process.env.RATE_LIMIT_TRUSTED_IPS || '127.0.0.1,::1')
+  .split(',').map(s => s.trim()).filter(Boolean)
+  .map(parseTrustedEntry).filter(Boolean);
+
+function isTrustedIp(rawIp) {
+  if (!rawIp) return false;
+  let addr;
+  try {
+    addr = ipaddr.process(rawIp);
+  } catch (_) {
+    return false;
+  }
+  return TRUSTED_ENTRIES.some((entry) => {
+    try {
+      if (Array.isArray(entry)) { // parsed CIDR: [rangeAddr, prefixBits]
+        return addr.kind() === entry[0].kind() && addr.match(entry);
+      }
+      return addr.kind() === entry.kind() && addr.toString() === entry.toString();
+    } catch (_) {
+      return false;
+    }
+  });
+}
 
 const limiter = rateLimit({
   windowMs: RATE_LIMIT_WINDOW_MS,
@@ -59,7 +167,7 @@ const limiter = rateLimit({
     // prevent DoS via stolen/compromised admin tokens.
     // Skip for trusted local/dev IPs
     const ip = req.ip || req.connection?.remoteAddress || '';
-    if (TRUSTED_IPS.some(t => t && ip.includes(t))) return true;
+    if (isTrustedIp(ip)) return true;
     // In dev, be more permissive
     if (isDev) return false; // dev uses a higher RATE_LIMIT_MAX already
     return false;
@@ -84,7 +192,7 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => {
     const ip = req.ip || req.connection?.remoteAddress || '';
-    return TRUSTED_IPS.some(t => t && ip.includes(t));
+    return isTrustedIp(ip);
   },
   handler: (req, res) => {
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
@@ -95,6 +203,37 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login',    authLimiter);
 app.use('/api/auth/register', authLimiter);
+
+// SECURITY FIX (defense-in-depth — C-10): authLimiter above is keyed by
+// (trust-proxy-derived) IP, so it's only as strong as X-Forwarded-For
+// handling — which the other C-10 fixes (nginx, backend port, trust-proxy
+// parsing, exact-match TRUSTED_IPS) close, but a second, independent layer
+// keyed by the ACCOUNT being targeted means a brute-force against one
+// victim's account is still bounded even if some future proxy
+// misconfiguration lets IP-based limiting be bypassed again. Deliberately
+// does not consult TRUSTED_IPS/isTrustedIp at all — this is about
+// protecting the target account, not about who's asking.
+const loginPerAccountLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const email = String(req.body?.email || '').toLowerCase().trim();
+    return email ? `acct:${email}` : (req.ip || 'unknown');
+  },
+  handler: (req, res) => {
+    logger.warn(`[login-account-rate-limit] 429 for account lookup on ${req.method} ${req.originalUrl}`);
+    res.set('Retry-After', String(15 * 60));
+    res.status(429).json({ error: 'Too many login attempts for this account — try again later', retryAfter: 15 * 60 });
+  },
+});
+// NOTE: express.json() is mounted globally further below (after these
+// limiters), but keyGenerator here needs req.body.email — so parse the body
+// for this one route now. body-parser is idempotent (it no-ops if the body
+// was already parsed), so this doesn't double-consume the request when the
+// global parser runs again later.
+app.use('/api/auth/login', express.json({ limit: '10mb' }), loginPerAccountLimiter);
 
 // Dev-only request logger: log incoming requests to help trace whether
 // the browser's requests reach the backend. Enabled only in development.
@@ -151,6 +290,7 @@ app.use('/api/notifications',   require('./routes/notifications'));   // Phase 4
 app.use('/api/search',          require('./routes/search'));          // Phase 4: global search
 app.use('/api/hcl-explain',     require('./routes/hcl-explain'));     // Phase 4: AI HCL explainer
 app.use('/api/hcl-assist',      require('./routes/hcl-assist'));      // AI HCL writer/editor for Studio
+app.use('/api/diagram',         require('./routes/diagram'));         // AWS architecture diagram generator
 
 // BE-09: return only { status: 'ok' } — no server clock, no fingerprinting surface.
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
@@ -170,7 +310,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: message });
 });
 
-// Troubleshooting note: "Cannot reach backend at http://10.244.24.67:4000"
+// Troubleshooting note: "Cannot reach backend at http://<your-host-ip>:4000"
 // If the backend process is running but the frontend (browser) still reports
 // that it cannot reach the backend, common causes include:
 // - Frontend still using an old environment/build: Create-react-app reads
@@ -198,7 +338,7 @@ app.use((err, req, res, next) => {
 // the backend may be hosted):
 // From Windows PowerShell / CMD:
 //   curl -v http://localhost:4000/api/health
-//   curl -v http://10.244.24.67:4000/api/health
+//   curl -v http://<your-host-ip>:4000/api/health
 //   netstat -an | findstr :4000
 //   Test-NetConnection -ComputerName localhost -Port 4000
 // From WSL / Linux:
@@ -223,10 +363,10 @@ const PORT = process.env.PORT || 4000;
 const HOST = process.env.HOST || '0.0.0.0';
 
 // NOTE: If `ss -tlnp` / `netstat` shows the server listening on a specific
-// IP (e.g. `10.244.24.67:4000`) rather than `0.0.0.0:4000`, the Node process is
+// IP (e.g. `<your-host-ip>:4000`) rather than `0.0.0.0:4000`, the Node process is
 // bound to a single interface. In that case the browser on the host may not be
 // able to reach that internal/container IP and you'll see the frontend error
-// "Cannot reach backend at http://10.244.24.67:4000" even though the server
+// "Cannot reach backend at http://<your-host-ip>:4000" even though the server
 // process is running. Common causes and quick remedies:
 //  - The server was started before `.env` was changed; restart the backend so
 //    it picks up `HOST=0.0.0.0`.
@@ -252,6 +392,8 @@ const { WebSocketServer } = require('ws');
 const { initQueue, enqueue, jobEvents } = require('./services/jobQueue');
 const { attachTerraformLspSession } = require('./services/terraformLsp');
 const { dispatchAndPersist } = require('./services/terraformJobs');
+const { verifyAccessToken } = require('./middleware/auth');
+const { hasJobAccess, UUID_RE } = require('./utils/projectAccess');
 
 // BUG-004 fix: initQueue was never called, so the BullMQ worker was never
 // started and all jobs ran synchronously, blocking the event loop.
@@ -268,26 +410,87 @@ initQueue(dispatchAndPersist);
 
 const server = http.createServer(app);
 
-// Handle WebSocket upgrades before Express middleware
-server.on('upgrade', (req, socket, head) => {
-  // Extract path for routing
-  const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
-  logger.info && logger.info(`[ws-upgrade] ${req.method} ${req.url} origin=${req.headers.origin || ''} host=${req.headers.host || ''}`);
+/**
+ * Write a minimal HTTP response and close the socket, so a rejected upgrade
+ * gets a real status code/reason instead of a bare connection reset.
+ */
+function rejectUpgrade(socket, statusCode, reason) {
   try {
-    if (pathname === '/ws/jobs' || pathname.startsWith('/ws/jobs')) {
+    socket.write(
+      `HTTP/1.1 ${statusCode} ${reason}\r\n` +
+      'Connection: close\r\n' +
+      'Content-Length: 0\r\n\r\n'
+    );
+  } catch (_) { /* socket may already be gone */ }
+  try { socket.destroy(); } catch (_) {}
+}
+
+// SECURITY FIX (critical): /ws/jobs and /ws/terraform-lsp previously had NO
+// authentication at all.
+//  - /ws/jobs?id=<jobId>: any client that supplied a jobId immediately
+//    received that job's live terraform plan/apply output — no check that
+//    the caller owned or was a member of the associated project. jobId is a
+//    UUID, but it's returned in plain JSON from POST /plan|/apply, logged,
+//    etc., so anything that leaked a jobId handed a stranger a live read of
+//    that job's terraform output (resource ARNs, IPs, infra details).
+//  - /ws/terraform-lsp: every connection unconditionally spawned a new
+//    terraform-ls process + temp workspace with no auth and no concurrency
+//    limit — an unauthenticated, unbounded resource-exhaustion vector.
+//
+// Fix, applied at the upgrade itself (before either WebSocketServer ever
+// accepts the connection):
+//  1. Validate Origin against the same allow-list used for HTTP CORS, to
+//     close the cross-site WebSocket hijacking angle.
+//  2. Require a short-lived access token as `?token=...` (browsers cannot
+//     set custom headers — e.g. Authorization — during a WS handshake, so a
+//     query-string token is the standard pattern) and verify it with the
+//     exact same JWT check used by authMiddleware.
+// Per-connection authorization (job ownership, LSP session caps) happens in
+// the 'connection' handlers below, once we know who the caller is.
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = url.pathname;
+  logger.info && logger.info(`[ws-upgrade] ${req.method} ${req.url} origin=${req.headers.origin || ''} host=${req.headers.host || ''}`);
+
+  // Origin allow-list — mirrors the Express CORS origin check above. Missing
+  // Origin is allowed (non-browser clients, e.g. server-to-server or CLI
+  // tools); a present-but-disallowed Origin is rejected outright.
+  const origin = req.headers.origin;
+  if (origin && !allowedOrigins.includes(origin)) {
+    logger.warn && logger.warn(`[ws-upgrade] rejected — origin not allowed: ${origin}`);
+    return rejectUpgrade(socket, 403, 'Forbidden');
+  }
+
+  if (pathname !== '/ws/jobs' && pathname !== '/ws/terraform-lsp') {
+    logger.warn && logger.warn(`[ws-upgrade] Unknown websocket path: ${pathname}`);
+    return rejectUpgrade(socket, 404, 'Not Found');
+  }
+
+  const token = url.searchParams.get('token');
+  if (!token) {
+    logger.warn && logger.warn(`[ws-upgrade] rejected — no token provided for ${pathname}`);
+    return rejectUpgrade(socket, 401, 'Unauthorized');
+  }
+  let user;
+  try {
+    user = verifyAccessToken(token);
+  } catch (e) {
+    logger.warn && logger.warn(`[ws-upgrade] rejected — invalid/expired token: ${e.message}`);
+    return rejectUpgrade(socket, 401, 'Unauthorized');
+  }
+  req.tfgenUser = user;
+
+  try {
+    if (pathname === '/ws/jobs') {
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
       });
       return;
     }
-    if (pathname === '/ws/terraform-lsp' || pathname.startsWith('/ws/terraform-lsp')) {
-      lspWss.handleUpgrade(req, socket, head, (ws) => {
-        lspWss.emit('connection', ws, req);
-      });
-      return;
-    }
-    logger.warn && logger.warn(`[ws-upgrade] Unknown websocket path: ${pathname}`);
-    socket.destroy();
+    // pathname === '/ws/terraform-lsp'
+    lspWss.handleUpgrade(req, socket, head, (ws) => {
+      lspWss.emit('connection', ws, req);
+    });
   } catch (err) {
     logger.error && logger.error('[ws-upgrade] error handling upgrade: ' + (err && err.message));
     try { socket.destroy(); } catch (_) {}
@@ -297,11 +500,25 @@ server.on('upgrade', (req, socket, head) => {
 const wss = new WebSocketServer({ noServer: true });
 const lspWss = new WebSocketServer({ noServer: true });
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
+  const user = req.tfgenUser;
+  if (!user) { ws.close(1008, 'Unauthorized'); return; } // defensive — upgrade handler already enforces this
+
   // Extract jobId from URL: /ws/jobs?id=<jobId>
   const url = new URL(req.url, `http://${req.headers.host}`);
   const jobId = url.searchParams.get('id');
-  if (!jobId) { ws.close(1008, 'jobId required'); return; }
+  if (!jobId || !UUID_RE.test(jobId)) { ws.close(1008, 'Invalid or missing jobId'); return; }
+
+  // SECURITY FIX: re-run the same ownership/membership check used by
+  // GET /api/terraform/jobs/:jobId — do NOT wire up log/done listeners
+  // (i.e. do not leak anything) until access is confirmed.
+  let allowed = false;
+  try {
+    allowed = await hasJobAccess(jobId, user.id);
+  } catch (e) {
+    logger.error && logger.error('[ws-jobs] access check failed: ' + e.message);
+  }
+  if (!allowed) { ws.close(1008, 'Access denied'); return; }
 
   // Stream log lines to client
   const onLog = (data) => {
@@ -323,7 +540,43 @@ wss.on('connection', (ws, req) => {
   ws.send(JSON.stringify({ type: 'connected', jobId }));
 });
 
-lspWss.on('connection', (ws) => {
+// SECURITY FIX: per-user + global concurrent session caps for terraform-ls.
+// Previously unbounded — any (unauthenticated) client could spawn unlimited
+// terraform-ls processes. Now every session is authenticated (see upgrade
+// handler above) AND capped. This is in-memory/per-process; a multi-replica
+// deployment would need a shared store (e.g. Redis) for a global cap that
+// holds across instances — noted here as a scaling follow-up, not required
+// at this app's current single-instance scale.
+const MAX_LSP_SESSIONS_PER_USER = parseInt(process.env.MAX_LSP_SESSIONS_PER_USER || '2', 10);
+const MAX_LSP_SESSIONS_GLOBAL   = parseInt(process.env.MAX_LSP_SESSIONS_GLOBAL   || '50', 10);
+const lspSessionCountByUser = new Map();
+let lspSessionCountTotal = 0;
+
+lspWss.on('connection', (ws, req) => {
+  const user = req.tfgenUser;
+  if (!user) { ws.close(1008, 'Unauthorized'); return; } // defensive — upgrade handler already enforces this
+
+  if (lspSessionCountTotal >= MAX_LSP_SESSIONS_GLOBAL) {
+    logger.warn && logger.warn(`[ws-lsp] rejected — global session cap (${MAX_LSP_SESSIONS_GLOBAL}) reached`);
+    ws.close(1013, 'Server busy — try again shortly');
+    return;
+  }
+  const userCount = lspSessionCountByUser.get(user.id) || 0;
+  if (userCount >= MAX_LSP_SESSIONS_PER_USER) {
+    logger.warn && logger.warn(`[ws-lsp] rejected — user ${user.id} at session cap (${MAX_LSP_SESSIONS_PER_USER})`);
+    ws.close(1008, 'Too many concurrent editor sessions — close another tab and retry');
+    return;
+  }
+
+  lspSessionCountByUser.set(user.id, userCount + 1);
+  lspSessionCountTotal += 1;
+  ws.once('close', () => {
+    lspSessionCountTotal = Math.max(0, lspSessionCountTotal - 1);
+    const remaining = (lspSessionCountByUser.get(user.id) || 1) - 1;
+    if (remaining <= 0) lspSessionCountByUser.delete(user.id);
+    else lspSessionCountByUser.set(user.id, remaining);
+  });
+
   attachTerraformLspSession(ws, logger);
 });
 
@@ -335,6 +588,31 @@ server.listen(PORT, HOST, () => {
   if (!process.env.TF_LSP_PATH) {
     logger.warn('TF_LSP_PATH is not set in the loaded environment. Please ensure backend/.env is loaded by this process.');
   }
+
+  // ── Verify the pinned Terraform Docker image digest (L-06 fix) ─────────────
+  // Only meaningful if Docker is actually available — if it isn't, the
+  // 'local' binary path is what's in play and this pin is irrelevant. Never
+  // blocks startup: this is a loud warning, not a crash, since the app is
+  // still fully usable via the local-binary path even if the Docker image
+  // pin is stale. See runner.js's TF_DOCKER_IMAGE comment and
+  // scripts/verify-docker-images.sh for the CI-side half of this fix.
+  (async function verifyTerraformDockerImage() {
+    try {
+      const { isDockerAvailable, verifyDockerImage } = require('./utils/dockerAvailable');
+      if (!(await isDockerAvailable())) return;
+      const { TF_DOCKER_IMAGE, TF_DOCKER_IMAGE_TAG_HINT } = require('./terraform/runner');
+      const result = await verifyDockerImage(TF_DOCKER_IMAGE);
+      if (result.ok) {
+        logger.info(`✅ Terraform Docker image verified: ${TF_DOCKER_IMAGE} (tag: ${TF_DOCKER_IMAGE_TAG_HINT})`);
+      } else {
+        logger.warn(`⚠️  TF_DOCKER_IMAGE does not resolve against its registry: ${TF_DOCKER_IMAGE}`);
+        logger.warn('   Docker-fallback terraform/checkov/infracost operations will fail until this is fixed.');
+        logger.warn(`   Detail: ${result.error}`);
+      }
+    } catch (_) {
+      // Best-effort — never let this check block or crash startup.
+    }
+  })();
 
   // ── Auto-migration: ensure all required tables and columns exist ───────────
   // This runs at startup and silently creates anything missing. Safe to run
@@ -555,6 +833,27 @@ server.listen(PORT, HOST, () => {
         // the UPDATE in POST /api/auth/forgot-password silently touches 0 rows.
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT',
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMP',
+        // SECURITY FIX (C-13): oauth_provider/oauth_subject/display_name/
+        // avatar_url/last_login_at were previously defined ONLY in migration
+        // 011, which never actually ran against the shipped Postgres image
+        // (see database/Dockerfile + CHANGELOG). Every "Sign in with Google/
+        // GitHub" attempt failed with a masked "column does not exist" error.
+        // Re-asserting them here means the backend self-heals this on every
+        // restart, independent of which migration mechanism the operator
+        // actually runs — see also database/012_security_hardening_c11_c13.sql
+        // and database/Dockerfile for the belt-and-suspenders fixes.
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_provider VARCHAR(50)',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_subject TEXT',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMP',
+        // SECURITY FIX (C-12): email verification gate — see backend/routes/auth.js
+        // (POST /register, GET /verify-email) and backend/routes/oauth.js
+        // (upsertOAuthUser only auto-links by email when email_verified=true).
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_token TEXT',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_token_expires_at TIMESTAMP',
       ];
       for (const sql of alterStatements) {
         await db.query(sql).catch(() => {});
@@ -578,9 +877,51 @@ server.listen(PORT, HOST, () => {
         'CREATE INDEX IF NOT EXISTS idx_project_versions_project ON project_versions(project_id)',
         // FIX: partial index for reset-token lookups (sparse column, WHERE avoids indexing NULLs)
         'CREATE INDEX IF NOT EXISTS idx_users_reset_token ON users(reset_token) WHERE reset_token IS NOT NULL',
+        // SECURITY FIX (C-13 / C-12): supporting indexes for the OAuth and
+        // email-verification columns added above.
+        'CREATE INDEX IF NOT EXISTS idx_users_oauth ON users(oauth_provider, oauth_subject) WHERE oauth_provider IS NOT NULL',
+        'CREATE INDEX IF NOT EXISTS idx_users_email_verify_token ON users(email_verify_token) WHERE email_verify_token IS NOT NULL',
       ];
       for (const sql of indexes) {
         await db.query(sql).catch(() => {});
+      }
+
+      // SECURITY FIX (C-13): one user per (oauth_provider, oauth_subject) —
+      // without this, upsertOAuthUser()'s "check by subject" fast path can
+      // race under concurrent first-time OAuth logins from the same provider
+      // account and create duplicate rows.
+      await db.query(
+        'ALTER TABLE users ADD CONSTRAINT uq_oauth_provider_subject UNIQUE (oauth_provider, oauth_subject)'
+      ).catch(() => {}); // no-op if it already exists
+
+      // SECURITY FIX (C-12): grandfather every account that existed BEFORE
+      // email-verification was enforced, so upgrading an existing deployment
+      // doesn't silently lock current users out of OAuth auto-linking
+      // (upsertOAuthUser requires email_verified=true to link-by-email — see
+      // routes/oauth.js). This must run ONLY ONCE — not on every restart, or
+      // it would grandfather (and thus silently un-gate) every brand-new
+      // unverified registration too, defeating the point of C-12 on every
+      // subsequent deploy. Guarded by a row in schema_migrations (the same
+      // table migrate.js uses) so it is safe to leave in autoMigrate()
+      // permanently without re-running.
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version    VARCHAR(255) PRIMARY KEY,
+          filename   TEXT NOT NULL,
+          applied_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+      `).catch(() => {});
+      const backfillMarker = 'auto_012_email_verified_backfill';
+      const alreadyBackfilled = await db.query(
+        'SELECT 1 FROM schema_migrations WHERE version = $1', [backfillMarker]
+      ).catch(() => ({ rows: [] }));
+      if (!alreadyBackfilled.rows.length) {
+        await db.query('UPDATE users SET email_verified = true WHERE email_verified = false')
+          .catch((e) => logger.warn('C-12 one-time email_verified backfill failed:', e.message));
+        await db.query(
+          'INSERT INTO schema_migrations (version, filename) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [backfillMarker, '(autoMigrate one-time backfill, not a file)']
+        ).catch(() => {});
       }
 
       // ── Phase 2-5 table auto-creation ──────────────────────────────────────
