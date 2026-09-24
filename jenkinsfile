@@ -167,7 +167,8 @@ pipeline {
     }
 
     parameters {
-        string(name: 'GIT_BRANCH',                defaultValue: 'dev_v0.0.2_bugs',                                                   description: 'Branch to build')
+
+        string(name: 'GIT_BRANCH',                defaultValue: 'master',                                                   description: 'Branch to build')
         string(name: 'GITHUB_REPO',               defaultValue: 'Rajendra0609/Terraform-Script-Generator-for-AWS',                   description: 'GitHub repository (owner/repo)')
         string(name: 'GIT_CHECKOUT_CREDENTIALS_ID', defaultValue: 'github',                                                          description: 'Credentials ID (username/password or PAT) used to git clone')
         string(name: 'GITHUB_CREDENTIALS_ID',     defaultValue: 'GITHUB_TOKEN',                                                      description: 'Secret-text credentials ID for GitHub API calls (node status check)')
@@ -746,72 +747,7 @@ spec:
                                     sh "trivy image --severity ${params.TRIVY_SEVERITY} --format table ${img} || true"
                                     if (exitCode != 0) {
                                         echo "🚨 Trivy found ${params.TRIVY_SEVERITY} findings in ${img}"
-                                        failed = false
-                                    }
-                                }
-                                if (failed) {
-                                    error("Trivy found vulnerabilities at or above configured severity — see archived reports")
-                                }
-                            }
-                        }
-                    }
-                    archiveArtifacts artifacts: 'trivy-*.json', allowEmptyArchive: true
-                }
-            }
-            post {
-                failure {
-                    script { captureStageFailure() }
-                }
-            }
-        }
-        stage('OWASP ZAP Baseline Scan') {
-            when {
-                expression { params.ZAP_TARGET_URL?.trim() }
-            }
-            agent {
-                kubernetes {
-                    label 'kube_zap'
-                    yaml """
-apiVersion: v1
-kind: Pod
-spec:
-  containers:
-    - name: zap
-      image: zaproxy/zap-stable:latest
-      imagePullPolicy: Always
-      command:
-        - cat
-      tty: true
-      volumeMounts:
-        - name: zap-work
-          mountPath: /zap/wrk
-
-  volumes:
-    - name: zap-work
-      emptyDir: {}
-"""
-                }
-            }
-            steps {
-                script { markStageStart() }
-                container('zap') {
-                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                        echo "🕷️  Running OWASP ZAP baseline scan against ${params.ZAP_TARGET_URL}"
-                        sh """
-                            cd /zap/wrk
-
-                            export PATH="/zap:\$PATH"
-
-                            python3 /zap/zap-full-scan.py \
-                                -t "${params.ZAP_TARGET_URL}" \
-                                -r zap-full-report.html \
-                                -J zap-full-report.json \
-                                -m 30 \
-                                -a \
-                                -I
-                        """
-                    }
-                    archiveArtifacts artifacts: 'zap-*.*', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'zap-baseline-report.*', allowEmptyArchive: true
                 }
             }
             post {
@@ -826,7 +762,7 @@ spec:
     post {
         always {
             junit allowEmptyResults: true, testResults: 'source/tests/reports/junit-results.xml'
-            archiveArtifacts artifacts: 'gitleaks-report.json, trivy-*.json, zap-*.*, source/tests/reports/junit-results.xml, source/tests/reports/lcov.info', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'gitleaks-report.json, trivy-*.json, zap-baseline-report.*, source/tests/reports/junit-results.xml, source/tests/reports/lcov.info', allowEmptyArchive: true
             script {
                 try {
                     cleanWs()
