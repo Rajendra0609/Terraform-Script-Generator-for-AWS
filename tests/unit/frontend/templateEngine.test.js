@@ -2,18 +2,19 @@
  * tests/unit/frontend/templateEngine.test.js
  *
  * Validation fix regression tests for templateEngine.js.
- * Uses Node 18+ native dynamic import() — no babel/jest transform required.
+ * Now a Jest suite (it was a standalone script whose process.exit() aborted
+ * the whole Jest run). The ES-module engine is loaded via tests/babel.config.js.
  *
- * Run: node tests/unit/frontend/templateEngine.test.js
+ * Run: npx jest --config jest.unit.config.js unit/frontend/templateEngine
  */
 'use strict';
 
 const path = require('path');
 const assert = require('assert').strict;
 
-const MODULE_PATH = `file://${path.resolve(
+const MODULE_PATH = path.resolve(
   __dirname, '../../../frontend/src/engine/templateEngine.js'
-)}`;
+);
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 function mk_expect(val) {
@@ -52,26 +53,14 @@ const RDS_RESOURCE = {
   config: { name: 'my_rds' },
 };
 
-// ── main ──────────────────────────────────────────────────────────────────────
-(async () => {
-  const e = await import(MODULE_PATH);
-
-  let passed = 0, failed = 0;
+describe('templateEngine (frontend/src/engine)', () => {
+  const e = require(MODULE_PATH);
 
   function run(name, fn) {
-    try {
-      fn(e);
-      console.log(`  ✅  ${name}`);
-      passed++;
-    } catch (err) {
-      console.error(`  ❌  ${name}`);
-      console.error(`       ${err.message}`);
-      failed++;
-    }
+    test(name, () => fn(e));
   }
 
   // ─── generateHCL ──────────────────────────────────────────────────────────
-  console.log('\ngenerateHCL()');
 
   run('BUG-TF-02: undefined placeholder → empty string, not {{token}}', ({ generateHCL }) => {
     const tpl = 'resource "aws_subnet" "{{name}}" {\n  vpc_id = {{vpc_id}}\n  cidr = "10.0.1.0/24"\n}';
@@ -94,7 +83,6 @@ const RDS_RESOURCE = {
   });
 
   // ─── generateProviderBlock ────────────────────────────────────────────────
-  console.log('\ngenerateProviderBlock()');
 
   run('BUG-TF-01: no terraform{} wrapper block', ({ generateProviderBlock }) => {
     const block = generateProviderBlock('ap-south-1');
@@ -113,7 +101,6 @@ const RDS_RESOURCE = {
   });
 
   // ─── generateTerraformBlock ───────────────────────────────────────────────
-  console.log('\ngenerateTerraformBlock()');
 
   run('without backend: single terraform{} with required_version + required_providers', ({ generateTerraformBlock }) => {
     const block = generateTerraformBlock(null);
@@ -133,7 +120,6 @@ const RDS_RESOURCE = {
   });
 
   // ─── extractImplicitVariables ─────────────────────────────────────────────
-  console.log('\nextractImplicitVariables()');
 
   run('BUG-TF-03: detects var.db_password reference', ({ extractImplicitVariables }) => {
     const hcl = 'resource "aws_db_instance" "rds" {\n  password = var.db_password\n}';
@@ -161,7 +147,6 @@ const RDS_RESOURCE = {
   });
 
   // ─── buildSplitHCL ───────────────────────────────────────────────────────
-  console.log('\nbuildSplitHCL() — BUG-TF-01');
 
   run('providers.tf has NO required_providers', ({ buildSplitHCL }) => {
     const f = buildSplitHCL(MOCK_RESOURCES, 'ap-south-1', 'dev', {}, {}, {}, 'test');
@@ -208,7 +193,6 @@ const RDS_RESOURCE = {
   });
 
   // ─── buildFullHCL ────────────────────────────────────────────────────────
-  console.log('\nbuildFullHCL() — BUG-TF-04');
 
   run('BUG-TF-04: with backend → exactly ONE terraform{} block', ({ buildFullHCL }) => {
     const hcl = buildFullHCL(
@@ -239,13 +223,4 @@ const RDS_RESOURCE = {
     mk_expect(hcl).toContain('variable "db_password"');
   });
 
-  // ─── summary ─────────────────────────────────────────────────────────────
-  console.log(`\n${'─'.repeat(50)}`);
-  console.log(`  ${passed} passed  ${failed} failed`);
-  console.log(`${'─'.repeat(50)}\n`);
-  process.exit(failed > 0 ? 1 : 0);
-
-})().catch(err => {
-  console.error('\nFatal error loading engine:', err.message);
-  process.exit(1);
 });

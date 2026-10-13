@@ -1,0 +1,12 @@
+# Loads the TFGen dashboards from /var/lib/grafana/dashboards on Grafana start.
+# Mounted by docker-compose.observability.yml.
+apiVersion: 1
+providers:
+  - name: tfgen
+    orgId: 1
+    folder: TFGen
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

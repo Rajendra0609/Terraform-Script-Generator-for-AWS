@@ -1,0 +1,28 @@
+# Filebeat: ships the backend container's stdout to Logstash.
+#
+# Containers are discovered through docker-socket-proxy, which the base compose
+# file already runs with only CONTAINERS/IMAGES/POST/INFO enabled. The raw Docker
+# socket is therefore never mounted into this container.
+#
+# Only the backend's logs are collected (selected by its Compose service label).
+filebeat.autodiscover:
+  providers:
+    - type: docker
+      host: "tcp://docker-socket-proxy:2375"
+      templates:
+        - condition:
+            equals:
+              docker.container.labels.com.docker.compose.service: backend
+          config:
+            - type: container
+              paths:
+                - /var/lib/docker/containers/${data.docker.container.id}/*.log
+
+processors:
+  - add_docker_metadata:
+      host: "tcp://docker-socket-proxy:2375"
+
+output.logstash:
+  hosts: ["logstash:5044"]
+
+logging.level: warning

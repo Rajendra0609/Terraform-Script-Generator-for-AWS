@@ -7,7 +7,7 @@
 'use strict';
 
 const path = require('path');
-const { sanitizeHcl } = require(path.join(__dirname, '../../../frontend/src/utils/sanitizeHcl'));
+const sanitizeHcl = require(path.join(__dirname, '../../../frontend/src/utils/sanitizeHcl')).default; // ES default export
 
 describe('sanitizeHcl()', () => {
   test('strips <script> injection from HCL string', () => {
@@ -17,8 +17,11 @@ describe('sanitizeHcl()', () => {
     expect(result).toMatch(/aws_vpc/);
   });
 
-  test('removes inline CSS style attributes', () => {
-    const input  = 'resource "aws_s3_bucket" "b" { color: red; bucket = "x" }';
+  // Realistic leak: colorized HTML copied out of the editor. Bare text with no
+  // markup deliberately takes sanitizeHcl's fast path and is returned unchanged,
+  // because `color: "x"` can be valid HCL object syntax.
+  test('removes inline CSS style attributes leaked from highlighted HTML', () => {
+    const input  = 'resource "aws_s3_bucket" "b" { <span style="color: red;">bucket = "x"</span> }';
     const result = sanitizeHcl(input);
     expect(result).not.toMatch(/color:\s*red/i);
     expect(result).toMatch(/aws_s3_bucket/);

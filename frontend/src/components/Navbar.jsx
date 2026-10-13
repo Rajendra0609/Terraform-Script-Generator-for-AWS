@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
-import NotificationCenter from './NotificationCenter';
-import GlobalSearch from './GlobalSearch';
 import { useAuth } from '../contexts/AuthContext';
 import { awsAPI, projectsAPI } from '../api/client';
 import AwsCredentialsModal from './AwsCredentialsModal';
@@ -17,6 +15,29 @@ export default function Navbar() {
   const [awsConnected, setAwsConnected] = useState(false);
   const [liveStatus, setLiveStatus] = useState('checking');
   const [pendingInvites, setPendingInvites] = useState(0);
+
+  // UI/UX FIX: this Navbar previously had zero responsive handling anywhere
+  // (confirmed by grepping the whole frontend during this audit — no
+  // `@media`, `isMobile`, or `innerWidth` check existed in this file, or in
+  // any component besides one media query in Login.jsx), so on a phone-width
+  // viewport the five nav links + AWS button + registry icon + avatar would
+  // simply overflow the fixed-height 52px bar with no way to scroll to the
+  // clipped items (index.css sets `overflow: hidden` on the app root). This
+  // collapses everything but the brand and avatar into a single hamburger
+  // menu below a width threshold, mirroring the pattern already used for the
+  // existing avatar dropdown (a fixed overlay + an absolutely positioned
+  // panel) rather than introducing a new UI idiom.
+  const [isMobile, setIsMobile] = useState(() => (typeof window !== 'undefined' ? window.innerWidth <= 860 : false));
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth <= 860);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  // Any navigation change (a link inside the mobile menu was clicked, or the
+  // user switched between mobile/desktop, e.g. by rotating a tablet) should
+  // close whichever menu is open rather than leaving a stale one on screen.
+  useEffect(() => { setMobileMenuOpen(false); setMenuOpen(false); }, [loc.pathname, isMobile]);
 
   useEffect(() => {
     if (!user) { setPendingInvites(0); return; }
@@ -59,7 +80,6 @@ export default function Navbar() {
   const isActive = (path) => loc.pathname === path || loc.pathname.startsWith(path + '/');
 
   const handleLogout = () => { logout(); nav('/login'); };
-  const handleNavigate = (href) => { nav(href); };
 
   const s = {
     nav: {
@@ -125,9 +145,108 @@ export default function Navbar() {
       transition: 'all 0.12s', textDecoration: 'none',
       border: 'none', background: 'none', width: '100%', textAlign: 'left',
     },
+    // UI/UX FIX: styles for the new mobile hamburger menu — deliberately
+    // reuse the same visual language (colors, radii, shadow) as the
+    // existing desktop dropdown above rather than introducing a new style.
+    hamburgerBtn: {
+      width: 36, height: 36,
+      background: 'transparent', border: '1px solid #E5E7EB',
+      borderRadius: 8, cursor: 'pointer',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: '#374151', fontSize: 18, flexShrink: 0,
+    },
+    mobilePanel: {
+      position: 'absolute', top: 52, left: 0, right: 0,
+      background: '#FFFFFF', borderBottom: '1px solid #E5E7EB',
+      boxShadow: '0 12px 36px rgba(0,0,0,0.10)',
+      zIndex: 200, padding: 10,
+      maxHeight: 'calc(100vh - 52px)', overflowY: 'auto',
+    },
   };
 
   const initials = user?.email?.slice(0, 2).toUpperCase() || '??';
+
+  // UI/UX FIX: mobile layout — kept as a fully separate return branch
+  // (rather than threading isMobile checks through the desktop JSX below)
+  // so the existing, working desktop layout has zero chance of regressing;
+  // the two share only the precomputed styles/handlers above.
+  if (isMobile) {
+    const navItems = user ? [
+      { icon: '🏠', label: 'Dashboard', to: '/dashboard' },
+      { icon: '🧪', label: 'Studio', to: '/studio' },
+      { icon: '🕘', label: 'History', to: historyHref },
+      { icon: '👥', label: 'Team', to: '/team', badge: pendingInvites > 0 ? pendingInvites : null },
+      ...(isAdmin ? [{ icon: '🛠', label: 'Admin', to: '/admin' }] : []),
+    ] : [];
+
+    return (
+      <nav style={{ ...s.nav, position: 'relative' }}>
+        <Link to="/" style={s.brand}>
+          <div style={s.logo}>{'\u2B21'}</div>
+          <span style={{ fontSize: 14, fontWeight: 800, color: '#111827', letterSpacing: '-0.03em' }}>TFGen</span>
+        </Link>
+
+        <div style={{ flex: 1 }} />
+
+        {user && (
+          <span style={{ position: 'relative', marginRight: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', position: 'absolute', top: -1, right: -1, background: liveStatus === 'live' ? '#059669' : '#9CA3AF', border: '1.5px solid #fff' }} />
+            <span style={{ ...s.iconBtn, border: '1px solid #E5E7EB' }} onClick={() => { setMobileMenuOpen(false); setShowAwsModal(true); }} title="AWS connection status">☁️</span>
+          </span>
+        )}
+
+        <button
+          aria-label={mobileMenuOpen ? 'Close menu' : 'Open menu'}
+          aria-expanded={mobileMenuOpen}
+          style={s.hamburgerBtn}
+          onClick={() => setMobileMenuOpen(v => !v)}
+        >
+          {mobileMenuOpen ? '\u2715' : '\u2630'}
+        </button>
+
+        {mobileMenuOpen && (
+          <>
+            <div style={{ position: 'fixed', inset: 0, top: 52, zIndex: 199 }} onClick={() => setMobileMenuOpen(false)} />
+            <div style={s.mobilePanel}>
+              {user ? (
+                <>
+                  <div style={{ padding: '8px 12px 10px', borderBottom: '1px solid #E5E7EB', marginBottom: 6 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: '#111827' }}>{user.email}</div>
+                    <div style={{ fontSize: 10, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 600 }}>{user.role || 'editor'}</div>
+                  </div>
+                  {navItems.map(item => (
+                    <Link key={item.to} to={item.to} style={s.dropItem} onClick={() => setMobileMenuOpen(false)}>
+                      <span>{item.icon}</span> {item.label}
+                      {item.badge && (
+                        <span style={{ marginLeft: 'auto', background: '#EF4444', color: '#fff', borderRadius: 99, fontSize: 10, fontWeight: 700, padding: '1px 6px' }}>{item.badge}</span>
+                      )}
+                    </Link>
+                  ))}
+                  <div style={{ height: 1, background: '#E5E7EB', margin: '6px 0' }} />
+                  <a href="https://registry.terraform.io/browse/providers" target="_blank" rel="noreferrer" style={s.dropItem}>
+                    <span>{'\u2295'}</span> Terraform Registry
+                  </a>
+                  <div style={{ height: 1, background: '#E5E7EB', margin: '6px 0' }} />
+                  <button style={{ ...s.dropItem, color: '#DC2626' }} onClick={() => { setMobileMenuOpen(false); handleLogout(); }}>
+                    <span>{'\u2296'}</span> Sign out
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button style={{ ...s.dropItem }} onClick={() => { setMobileMenuOpen(false); nav('/login'); }}>Sign in</button>
+                  <button style={{ ...s.dropItem, fontWeight: 700, color: '#059669' }} onClick={() => { setMobileMenuOpen(false); nav('/register'); }}>Get Started</button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+
+        {showAwsModal && (
+          <AwsCredentialsModal onClose={() => { setShowAwsModal(false); checkAwsStatus(); }} />
+        )}
+      </nav>
+    );
+  }
 
   return (
     <nav style={s.nav}>

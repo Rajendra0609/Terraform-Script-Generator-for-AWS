@@ -179,6 +179,37 @@ services:
       SMTP_PORT:    ${SMTP_PORT:-587}
       SMTP_FROM:    ${SMTP_FROM}
       FRONTEND_URL: ${FRONTEND_URL}
+      # BUG-OAUTH-01 FIX ("sign-in redirect is blocked"): OAUTH_REDIRECT_BASE
+      # is the origin the user's BROWSER lands back on after Google/GitHub
+      # redirect — that's nginx's published origin in this topology, NOT
+      # this backend's own :4000 (which the C-10 fix above intentionally
+      # does not publish to the host). The explicit default here derives it
+      # from FRONTEND_PORT so it's still correct even if `.env` doesn't
+      # define OAUTH_REDIRECT_BASE at all (e.g. an `.env` created before
+      # this fix was added to .env.example) — previously an unset value fell
+      # through to routes/oauth.js's own bare-metal-dev-oriented default of
+      # http://localhost:4000, which is unreachable from the host here.
+      # Explicit `environment:` entries always win over `env_file`, so a
+      # value you DO set in `.env` (e.g. a real https://your-domain.com for
+      # a non-localhost deployment) still takes priority over this default.
+      OAUTH_REDIRECT_BASE:  ${OAUTH_REDIRECT_BASE:-http://localhost:${FRONTEND_PORT:-3000}}
+      GOOGLE_CLIENT_ID:     ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GITHUB_CLIENT_ID:     ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN}
+      ANTHROPIC_API_KEY:    ${ANTHROPIC_API_KEY}
+      # OBSERVABILITY: structured logs and the internal-only Prometheus
+      # /metrics port (see backend/observability/metrics.js for why this is
+      # a separate port docker-compose does NOT publish below, same as the
+      # backend's main port) always run; tracing is opt-in. Bring up
+      # `docker-compose.observability.yml` alongside this file for a ready
+      # -made Jaeger/Prometheus/Grafana stack — see that file's header.
+      LOG_LEVEL:                    ${LOG_LEVEL:-info}
+      OTEL_ENABLED:                 ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT:  ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+      OTEL_TRACES_SAMPLER_RATIO:    ${OTEL_TRACES_SAMPLER_RATIO:-1}
+      METRICS_PORT:                ${METRICS_PORT:-9464}
       # SECURITY FIX: points the `docker` CLI at the locked-down proxy
       # instead of a raw socket mounted into this container. See
       # docker-socket-proxy service above for what's allowed/denied.

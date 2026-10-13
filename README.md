@@ -4,6 +4,9 @@
 
 <h1 align="center">TFGen v3 — Terraform AWS Studio</h1>
 
+> **Release 0.0.4.** Adds a module analyzer, automated code review with safe auto-fixes, GitHub integration (review pull requests and open them from a project), an opt-in approval gate for `apply`, Grafana and alerting configuration, an optional ELK stack, and a CI workflow. See [`CHANGELOG.md`](CHANGELOG.md), [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+
 <p align="center">
   <strong>Infrastructure as Code, without the YAML headaches.</strong><br/>
   Design AWS infrastructure visually → get production-ready Terraform HCL in seconds.

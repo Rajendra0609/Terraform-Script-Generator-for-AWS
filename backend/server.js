@@ -1,3 +1,8 @@
+// OBSERVABILITY: must be required FIRST, before express/pg/ioredis/etc. are
+// ever loaded anywhere in this process — see the comment at the top of
+// observability/tracing.js for exactly why require-order matters here.
+require('./observability/tracing');
+
 require('dotenv').config();
 const express = require('express');
 const winston = require('winston');
@@ -6,9 +11,24 @@ const { DEFAULT_AWS_REGION } = require('./config/region');
 const app = express();
 
 // Logger
+// OBSERVABILITY FIX: previously just winston.format.json() with no
+// timestamp field at all — every log line looked like
+// {"level":"info","message":"..."} with no indication of when it happened,
+// relying entirely on the log collector's own ingestion time (fragile the
+// moment anything buffers/batches). format.errors({ stack: true }) is added
+// defensively too: winston's JSON formatter silently drops a raw Error
+// object's message/stack (they're non-enumerable) unless this is present —
+// server.js's own error handler already works around this by passing
+// err.stack manually (see the trust-proxy/global error handler below), but
+// other call sites (and future ones) shouldn't have to remember to.
 const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: 'tfgen-backend' },
   transports: [
     new winston.transports.Console(),
   ],
@@ -180,6 +200,13 @@ const limiter = rateLimit({
     res.status(429).json({ error: 'Too many requests — slow down', retryAfter: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000) });
   }
 });
+const { httpMetricsMiddleware } = require('./observability/metrics');
+// Correlation IDs and access logging run FIRST, before rate limiting and body
+// parsing, so every response (including 400 for malformed JSON and 429 from the
+// limiter) carries the X-Correlation-Id a support report can quote.
+const { requestLogger } = require('./middleware/requestLogger');
+app.use(httpMetricsMiddleware);
+app.use(requestLogger(logger));
 app.use(limiter);
 
 // BUG-006 fix: dedicated stricter rate limiter for auth endpoints to prevent
@@ -235,19 +262,13 @@ const loginPerAccountLimiter = rateLimit({
 // global parser runs again later.
 app.use('/api/auth/login', express.json({ limit: '10mb' }), loginPerAccountLimiter);
 
-// Dev-only request logger: log incoming requests to help trace whether
-// the browser's requests reach the backend. Enabled only in development.
-if (isDev) {
-  app.use((req, res, next) => {
-    try {
-      logger.info(`[req] ${req.method} ${req.originalUrl} ip=${req.ip || req.connection?.remoteAddress} origin=${req.headers.origin || ''} host=${req.headers.host || ''}`);
-    } catch (e) {
-      // best-effort logging
-      logger.debug && logger.debug('Request logger error', e.message);
-    }
-    next();
-  });
-}
+// OBSERVABILITY: the dev-only request logger that used to live here
+// ("help trace whether the browser's requests reach the backend" — exactly
+// the kind of thing that would have caught the OAuth redirect bug sooner)
+// is now superseded by middleware/requestLogger.js, mounted below — it does
+// the same job but always-on (not just NODE_ENV=development), with a
+// correlation ID, duration, status code, and trace ID when tracing is
+// enabled. Removed here to avoid double-logging every request in dev.
 
 
 app.use(express.json({ limit: '10mb' }));
@@ -255,8 +276,21 @@ app.use(express.json({ limit: '10mb' }));
 const cookieParser = require('cookie-parser');
 app.use(cookieParser());
 
+// OBSERVABILITY: HTTP metrics + structured access log for EVERY request,
+// mounted before any route so nothing is missed — including anonymous,
+// read-only, and failed requests, which is exactly what the audit-log
+// middleware (middleware/audit.js) does not cover. See
+// observability/metrics.js and middleware/requestLogger.js for the full
+// rationale (both were written to close a gap that made the OAuth redirect
+// bug in routes/oauth.js invisible in production logs).
+
 app.use('/api/auth',      require('./routes/auth'));
-app.use('/api/projects',  require('./routes/projects'));
+// Kept as a named reference (rather than an inline require like the routes
+// around it) so autoMigrate() below can explicitly await
+// projectsRouter.ensureResourceColumns()/ensureVersionColumns() once the
+// base tables exist — see BUG-STARTUP-RACE fix there for why.
+const projectsRouter = require('./routes/projects');
+app.use('/api/projects',  projectsRouter);
 app.use('/api/templates', require('./routes/templates'));
 app.use('/api/terraform', require('./routes/terraform'));
 
@@ -291,23 +325,42 @@ app.use('/api/search',          require('./routes/search'));          // Phase 4
 app.use('/api/hcl-explain',     require('./routes/hcl-explain'));     // Phase 4: AI HCL explainer
 app.use('/api/hcl-assist',      require('./routes/hcl-assist'));      // AI HCL writer/editor for Studio
 app.use('/api/diagram',         require('./routes/diagram'));         // AWS architecture diagram generator
+app.use('/api/github',          require('./routes/github'));          // GitHub: connect, browse, review PRs, open PR from project
+app.use('/api/modules',         require('./routes/modules'));         // Module analyzer, code review, autofix, docs (no GitHub needed)
 
 // BE-09: return only { status: 'ok' } — no server clock, no fingerprinting surface.
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 // 404 fallback
-app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
+app.use((req, res) => res.status(404).json({ error: 'Route not found', correlationId: req.correlationId }));
 
 // Global error handler
 // BUG-021 fix: previously returned err.message directly, leaking DB table/column
 // names, SQL fragments, and file paths to callers. In production we return a
 // generic message; the full stack is logged server-side only.
 app.use((err, req, res, next) => {
-  logger.error(err.stack);
+  // Caller errors are not server faults. Malformed JSON, an oversized body and
+  // a disallowed CORS origin used to fall through to the 500 handler below,
+  // which both mislabelled them and echoed parser internals back to the client.
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Malformed JSON in request body', correlationId: req.correlationId });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body is too large', correlationId: req.correlationId });
+  }
+  if (err && err.message === 'Origin not allowed by CORS') {
+    return res.status(403).json({ error: 'Origin not allowed', correlationId: req.correlationId });
+  }
+  // OBSERVABILITY: correlationId ties this exact log line back to the
+  // requestLogger.js access-log entry for the same request (and to a trace
+  // if OpenTelemetry is enabled), and is also returned to the caller so a
+  // user/support ticket can quote one ID an engineer can grep for directly
+  // instead of correlating on approximate timestamps.
+  logger.error('unhandled_error', { correlationId: req.correlationId, path: req.path, method: req.method, stack: err.stack });
   const message = process.env.NODE_ENV !== 'production'
     ? (err.message || 'Internal server error')
     : 'Internal server error';
-  res.status(500).json({ error: message });
+  res.status(500).json({ error: message, correlationId: req.correlationId });
 });
 
 // Troubleshooting note: "Cannot reach backend at http://<your-host-ip>:4000"
@@ -532,9 +585,14 @@ wss.on('connection', async (ws, req) => {
   jobEvents.on(`log:${jobId}`, onLog);
   jobEvents.once(`done:${jobId}`, onDone);
 
+  // OBSERVABILITY: see observability/metrics.js — websocket_active_connections{channel="jobs"}
+  const { websocketConnections } = require('./observability/metrics');
+  websocketConnections.inc({ channel: 'jobs' });
+
   ws.on('close', () => {
     jobEvents.off(`log:${jobId}`, onLog);
     jobEvents.off(`done:${jobId}`, onDone);
+    websocketConnections.dec({ channel: 'jobs' });
   });
 
   ws.send(JSON.stringify({ type: 'connected', jobId }));
@@ -570,8 +628,11 @@ lspWss.on('connection', (ws, req) => {
 
   lspSessionCountByUser.set(user.id, userCount + 1);
   lspSessionCountTotal += 1;
+  // OBSERVABILITY: see observability/metrics.js — websocket_active_connections{channel="lsp"}
+  require('./observability/metrics').websocketConnections.inc({ channel: 'lsp' });
   ws.once('close', () => {
     lspSessionCountTotal = Math.max(0, lspSessionCountTotal - 1);
+    require('./observability/metrics').websocketConnections.dec({ channel: 'lsp' });
     const remaining = (lspSessionCountByUser.get(user.id) || 1) - 1;
     if (remaining <= 0) lspSessionCountByUser.delete(user.id);
     else lspSessionCountByUser.set(user.id, remaining);
@@ -588,6 +649,10 @@ server.listen(PORT, HOST, () => {
   if (!process.env.TF_LSP_PATH) {
     logger.warn('TF_LSP_PATH is not set in the loaded environment. Please ensure backend/.env is loaded by this process.');
   }
+
+  // OBSERVABILITY: Prometheus metrics on their own internal-only port —
+  // see observability/metrics.js for why this isn't just a route on `app`.
+  require('./observability/metrics').startMetricsServer();
 
   // ── Verify the pinned Terraform Docker image digest (L-06 fix) ─────────────
   // Only meaningful if Docker is actually available — if it isn't, the
@@ -617,7 +682,31 @@ server.listen(PORT, HOST, () => {
   // ── Auto-migration: ensure all required tables and columns exist ───────────
   // This runs at startup and silently creates anything missing. Safe to run
   // multiple times — uses CREATE IF NOT EXISTS and ADD COLUMN IF NOT EXISTS.
-  (async function autoMigrate() {
+  //
+  // BUG-STARTUP-RACE fix: this used to be a bare fire-and-forget IIFE with no
+  // way for anything else to know when it finished. Three OTHER pieces of
+  // startup code each independently queried tables this function creates,
+  // with no ordering guarantee against it finishing first:
+  //   1. routes/projects.js's ensureResourceColumns()/ensureVersionColumns()
+  //      run at `require()` time — i.e. when the line above mounting
+  //      '/api/projects' executes — which happens before server.listen() is
+  //      even called, let alone before this callback runs.
+  //   2. sanitizePersistedHcl() just below queries the same two tables.
+  // On a completely fresh database (first-ever startup, e.g. a new
+  // `docker compose up` or a fresh CI run) this is a genuine race: reproduced
+  // live during this audit as
+  //   [projects] ensureResourceColumns error: relation "resources" does not exist
+  //   [projects] ensureVersionColumns error: relation "project_versions" does not exist
+  // printed at ERROR level on an otherwise-clean boot, before "Auto-migration
+  // complete" even logs. It is harmless in practice ONLY because
+  // ensureResourceColumns/ensureVersionColumns lazily retry on the first real
+  // request (see routes/projects.js) and a real client is virtually always
+  // slower to arrive than autoMigrate() is to finish — but it is not
+  // guaranteed (a fast readiness probe or CI smoke test hitting the API
+  // immediately could lose the race for real), and it prints a false-positive
+  // error on every single clean install regardless. The promise below lets
+  // both dependents explicitly wait instead of racing.
+  const autoMigrateReady = (async function autoMigrate() {
     const db = require('./db/connection');
     try {
       // Enable pgcrypto extension
@@ -810,6 +899,13 @@ server.listen(PORT, HOST, () => {
         'ALTER TABLE projects ADD COLUMN IF NOT EXISTS environment VARCHAR(50) DEFAULT \'dev\'',
         'ALTER TABLE projects ADD COLUMN IF NOT EXISTS backend_config JSONB DEFAULT \'{}\'',
         'ALTER TABLE projects ADD COLUMN IF NOT EXISTS user_id UUID',
+        // BUG-LASTHCL fix: this used to run as its own `ALTER TABLE ... ADD
+        // COLUMN IF NOT EXISTS last_hcl` inside routes/projects.js's POST
+        // /:id/resources handler, on EVERY request, taking the same
+        // ACCESS EXCLUSIVE lock that BUG-019/M-03 (see routes/projects.js)
+        // already fixed for every other column below — this one was just
+        // missed. Asserted here once at startup like the rest instead.
+        'ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_hcl TEXT DEFAULT \'\'',
         'ALTER TABLE resources ADD COLUMN IF NOT EXISTS variables JSONB DEFAULT \'{}\'',
         'ALTER TABLE resources ADD COLUMN IF NOT EXISTS outputs JSONB DEFAULT \'{}\'',
         'ALTER TABLE resources ADD COLUMN IF NOT EXISTS is_module BOOLEAN DEFAULT false',
@@ -1008,10 +1104,25 @@ server.listen(PORT, HOST, () => {
     }
   })();
 
+  // BUG-STARTUP-RACE fix: block on autoMigrate() finishing before touching
+  // any table it creates/alters. This call site is the third of the three
+  // dependents described in the comment above — see there for the
+  // reproduced fresh-database failure this prevents (this one showed up as
+  // "Sanitize persisted HCL failed: relation ... does not exist").
+  autoMigrateReady.then(async () => {
+    try {
+      await projectsRouter.ensureResourceColumns();
+      await projectsRouter.ensureVersionColumns();
+    } catch (e) {
+      logger.warn('Post-migration column readiness check failed:', e.message);
+    }
+  });
+
   // sanitize any persisted HCL that may contain color/style fragments
   const { stripHtml } = require('./utils/sanitize');
   (async function sanitizePersistedHcl() {
     try {
+      await autoMigrateReady; // BUG-STARTUP-RACE fix: wait for tables to exist first
       const db = require('./db/connection');
       // resources.hcl_output
       const r = await db.query("SELECT id, hcl_output FROM resources WHERE hcl_output IS NOT NULL AND (hcl_output LIKE '%<%' OR hcl_output LIKE '%color:%')");
@@ -1041,3 +1152,22 @@ server.listen(PORT, HOST, () => {
     }
   })();
 });
+
+// OBSERVABILITY: flush pending trace spans and close the metrics server
+// cleanly on shutdown. Containers are normally stopped with SIGTERM; an
+// OpenTelemetry BatchSpanProcessor buffers spans in memory rather than
+// sending them one at a time, so exiting abruptly can silently drop
+// whatever hadn't been flushed yet — this ensures the last batch goes out.
+async function gracefulShutdown(signal) {
+  logger.info(`${signal} received — shutting down gracefully`);
+  try { await require('./observability/metrics').stopMetricsServer(); } catch (_) { /* best-effort */ }
+  try { await require('./observability/tracing').shutdownTracing(); } catch (_) { /* best-effort */ }
+  server.close(() => {
+    logger.info('HTTP server closed');
+    process.exit(0);
+  });
+  // Force-exit if close() hangs (e.g. a stuck keep-alive/WebSocket connection)
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));

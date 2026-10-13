@@ -1,0 +1,61 @@
+# Alert rules for the TFGen backend. Validate with:
+#   promtool check rules observability/prometheus-alerts.yml
+# Thresholds are starting points: tune them against your own traffic.
+# Guards (the `and` clauses) stop low-traffic noise, such as one failed job
+# out of one, from paging anyone.
+groups:
+  - name: tfgen-backend
+    rules:
+      - alert: TFGenBackendDown
+        expr: up{job="tfgen-backend"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "TFGen backend is not being scraped"
+          description: "Prometheus has failed to scrape tfgen-backend for 2 minutes. Check the backend container and its logs (correlationId-tagged)."
+
+      - alert: TFGenHighErrorRatio
+        expr: |
+          (sum(rate(http_requests_total{status_code=~"5.."}[10m]))
+            / clamp_min(sum(rate(http_requests_total[10m])), 1e-9)) > 0.05
+          and sum(rate(http_requests_total[10m])) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 5% of requests are failing with 5xx"
+          description: "5xx responses have exceeded 5% of traffic for 10 minutes. Break the error down by route in the golden-signals dashboard."
+
+      - alert: TFGenHighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[10m]))) > 2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 request latency above 2 seconds"
+          description: "p95 latency has been above 2 s for 10 minutes. Check event-loop lag and Terraform job load."
+
+      - alert: TFGenTerraformJobFailures
+        expr: |
+          (sum(increase(terraform_jobs_total{status="failed"}[1h]))
+            / clamp_min(sum(increase(terraform_jobs_total[1h])), 1)) > 0.2
+          and sum(increase(terraform_jobs_total[1h])) >= 5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Over 20% of Terraform jobs failed in the last hour"
+          description: "At least five jobs ran and more than a fifth failed. Check the runner mode (host binary or Docker sandbox) and recent plan errors."
+
+      - alert: TFGenJobQueueBacklog
+        expr: sum(job_queue_depth{state="waiting"}) > 50
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 50 Terraform jobs waiting for a worker"
+          description: "Workers are not keeping up, or Redis connectivity is degraded. Check the jobQueue connection errors in the backend log."
+
+      - alert: TFGenEventLoopLag
+        expr: max(nodejs_eventloop_lag_p99_seconds{job="tfgen-backend"}) > 0.5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Node.js event loop is saturated"
+          description: "p99 event-loop lag above 500 ms for 5 minutes. Look for long synchronous work in request handlers."

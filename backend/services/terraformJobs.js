@@ -299,6 +299,13 @@ async function dispatch(data, logFn) {
  */
 async function dispatchAndPersist(data, logFn) {
   const { jobId } = data;
+  // OBSERVABILITY: single choke point for every job type (fmt/validate/
+  // plan/apply), reached from both the BullMQ-worker path and the
+  // no-Redis synchronous fallback (see this function's own doc comment
+  // above) — recording metrics here means every execution path is covered
+  // by one line rather than needing to be wired into each separately.
+  const { terraformJobDuration, terraformJobsTotal } = require('../observability/metrics');
+  const metricsStart = process.hrtime.bigint();
 
   if (jobId) {
     await db.query(
@@ -309,9 +316,14 @@ async function dispatchAndPersist(data, logFn) {
 
   try {
     const result = await dispatch(data, logFn);
+    const failed = !!(result && (result.success === false || result.valid === false || result.blocked === true));
+    terraformJobDuration.observe(
+      { job_type: data.type, status: failed ? 'failed' : 'succeeded' },
+      Number(process.hrtime.bigint() - metricsStart) / 1e9
+    );
+    terraformJobsTotal.inc({ job_type: data.type, status: failed ? 'failed' : 'succeeded' });
 
     if (jobId) {
-      const failed = !!(result && (result.success === false || result.valid === false || result.blocked === true));
       await db.query(
         `UPDATE execution_jobs
             SET status = $2, plan_summary = $3, checkov_summary = $4, error = $5, finished_at = NOW()
@@ -347,6 +359,16 @@ async function dispatchAndPersist(data, logFn) {
 
     return result;
   } catch (err) {
+    // OBSERVABILITY: dispatch() itself threw (as opposed to returning a
+    // {success:false} result, handled above) — record this distinctly as
+    // "errored" so a spike in unhandled exceptions is visible separately
+    // from ordinary plan/apply failures or policy blocks in Grafana.
+    terraformJobDuration.observe(
+      { job_type: data.type, status: 'errored' },
+      Number(process.hrtime.bigint() - metricsStart) / 1e9
+    );
+    terraformJobsTotal.inc({ job_type: data.type, status: 'errored' });
+
     if (jobId) {
       await db.query(
         "UPDATE execution_jobs SET status = 'failed', error = $2, finished_at = NOW() WHERE id = $1",

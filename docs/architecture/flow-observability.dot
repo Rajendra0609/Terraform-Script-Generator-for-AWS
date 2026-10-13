@@ -1,0 +1,44 @@
+// Observability: metrics, traces and logs, and how they meet in one place.
+// Render: dot -Tsvg flow-observability.dot -o flow-observability.svg
+// Metrics and logs need no flag. Tracing is enabled with OTEL_ENABLED=true.
+digraph observability {
+  graph [rankdir=LR, fontname="Helvetica", fontsize=13, bgcolor="white", nodesep=0.28, ranksep=0.7, pad=0.3,
+         label=<<B>Observability — metrics, traces and logs</B><BR/><FONT POINT-SIZE="10">Every log line and error response carries the same correlationId, so one ID links a support report to logs and traces.</FONT>>, labelloc=t];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#1e40af", fillcolor="#dbeafe", margin="0.14,0.07"];
+  edge [fontname="Helvetica", fontsize=8, color="#374151", arrowsize=0.7];
+
+  app [shape=oval, fillcolor="#e0e7ff", color="#4338ca", label="Express API\nrequests · jobs · WebSockets"];
+
+  subgraph cluster_metrics {
+    label="Metrics (always on)"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1"; fontsize=11;
+    prommod [label="prom-client registry\nhttp_request_duration_seconds · terraform_jobs_total\njob_queue_depth · websocket_active_connections", tooltip="backend/observability/metrics.js"];
+    scrape  [label="GET :9464/metrics\ninternal network only — not published or proxied", fillcolor="#fef3c7", color="#b45309"];
+    prom    [label="Prometheus\nscrape every 15 s · evaluates alert rules", tooltip="observability/prometheus.yml, prometheus-alerts.yml"];
+    alerts  [label="Alert rules (NEW)\nerror ratio · p95 latency · job failure ratio\nqueue backlog · no metrics scraped", fillcolor="#dcfce7", color="#15803d", tooltip="observability/prometheus-alerts.yml"];
+    graf    [label="Grafana (NEW dashboard)\ndatasource uid = prometheus\nGolden signals: traffic · errors · latency · saturation", fillcolor="#dcfce7", color="#15803d", tooltip="observability/grafana/"];
+    prommod -> scrape -> prom; prom -> alerts; prom -> graf;
+  }
+
+  subgraph cluster_traces {
+    label="Traces (OTEL_ENABLED=true)"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1"; fontsize=11;
+    otel  [label="OpenTelemetry auto-instrumentation\nhttp · express · pg · ioredis", tooltip="backend/observability/tracing.js"];
+    otlp  [label="OTLP/HTTP exporter\nfails open: dropped spans, no request errors", fillcolor="#fef3c7", color="#b45309"];
+    jaeg  [label="Jaeger all-in-one (bundled)\nGrafana Tempo: documented option, not wired", style="rounded,filled,dashed", color="#64748b"];
+    otel -> otlp -> jaeg;
+  }
+
+  subgraph cluster_logs {
+    label="Logs (JSON)"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1"; fontsize=11;
+    wlog  [label="winston JSON\ntimestamp · level · service · correlationId · status · duration", tooltip="backend/server.js logger, middleware/requestLogger.js"];
+    cstd  [label="Container stdout\n(docker json-file)", fillcolor="#fef3c7", color="#b45309"];
+    fb    [label="Filebeat (NEW)\ncontainer input, adds docker metadata", fillcolor="#dcfce7", color="#15803d", tooltip="observability/elk/filebeat.yml"];
+    ls    [label="Logstash (NEW)\nJSON decode · timestamp · drops health probes", fillcolor="#dcfce7", color="#15803d", tooltip="observability/elk/logstash/pipeline/tfgen.conf"];
+    es    [label="Elasticsearch (NEW)\nindex tfgen-logs-YYYY.MM.dd", fillcolor="#fef3c7", color="#b45309"];
+    kib   [label="Kibana (NEW)\nsearch by correlationId · error dashboards", fillcolor="#dcfce7", color="#15803d"];
+    wlog -> cstd -> fb -> ls -> es -> kib;
+  }
+
+  app -> prommod [label="instrumented"];
+  app -> otel;
+  app -> wlog;
+}

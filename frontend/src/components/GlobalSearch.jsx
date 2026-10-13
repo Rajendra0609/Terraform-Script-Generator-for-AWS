@@ -170,7 +170,7 @@ export default function GlobalSearch({ onNavigate }) {
               )}
               <button
                 onClick={() => setOpen(false)}
-                style={{ border: 'none', background: 'none', fontSize: 12, color: '#9CA3AF', cursor: 'pointer', padding: '2px 6px', borderRadius: 5, border: '1px solid #E5E7EB' }}
+                style={{ background: 'none', fontSize: 12, color: '#9CA3AF', cursor: 'pointer', padding: '2px 6px', borderRadius: 5, border: '1px solid #E5E7EB' }}
               >Esc</button>
             </div>
 

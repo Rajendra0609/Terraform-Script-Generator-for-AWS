@@ -1,0 +1,23 @@
+# Prometheus scrape config for the optional observability add-on
+# (docker-compose.observability.yml). Scrapes the backend's internal-only
+# metrics port directly by its compose service name — no host port needed,
+# since Prometheus runs on the same compose network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Relative path: resolves next to this file both on the host (promtool) and
+# inside the container, where docker-compose.observability.yml mounts it beside
+# prometheus.yml. No Alertmanager is deployed, so rules are evaluated and shown
+# in the Prometheus UI only, not routed to a pager.
+rule_files:
+  - prometheus-alerts.yml
+
+scrape_configs:
+  - job_name: 'tfgen-backend'
+    static_configs:
+      - targets: ['backend:9464']
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
