@@ -404,7 +404,7 @@ export default function Builder() {
   const [planDiff, setPlanDiff]           = useState(null);
   const [applyResult, setApplyResult]     = useState(null); // tracks last apply outcome
   const [policyResults, setPolicyResults] = useState(null);  // Phase 2: OPA policy eval results
-  const [versions, setVersions]           = useState([]);    // Phase 2: CR version list
+  const [versions]                        = useState([]);    // Phase 2: CR version list
   // Phase 4: reorderable panel tab order persisted to localStorage
   const DEFAULT_TAB_ORDER = ['output','diff','security','cost','logs','policy','changes','apply'];
   const [tabOrder, setTabOrder] = useState(() => {
@@ -1230,10 +1230,17 @@ export default function Builder() {
                     <div style={{ display: 'flex', flex: 1 }}>
                       {panelTabs.map(t => (
                         <button key={t.id} onClick={() => setPanelTab(t.id)}
+                          draggable
+                          onDragStart={() => onTabDragStart(t.id)}
+                          onDragOver={(e) => onTabDragOver(e, t.id)}
+                          onDrop={(e) => onTabDrop(e, t.id)}
+                          onDragEnd={() => { setDragTabId(null); setDragOverId(null); }}
+                          title="Drag to reorder"
                           style={{
                             padding: '6px 12px', fontSize: 11, fontWeight: 600, border: 'none',
-                            cursor: 'pointer', fontFamily: 'inherit',
-                            background: 'transparent', color: panelTab === t.id ? '#059669' : '#9CA3AF',
+                            cursor: 'grab', fontFamily: 'inherit',
+                            background: dragOverId === t.id ? '#ECFDF5' : 'transparent',
+                            color: panelTab === t.id ? '#059669' : '#9CA3AF',
                             borderBottom: panelTab === t.id ? '2px solid #059669' : '2px solid transparent',
                             transition: 'all 0.1s',
                           }}>

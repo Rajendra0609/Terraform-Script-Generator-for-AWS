@@ -1,0 +1,132 @@
+// TFGen system architecture — release 0.0.4 (dev_v0.0.3 + enhancements)
+// Render:  dot -Tpng -Gdpi=110 architecture.dot -o architecture.png
+//          dot -Tsvg architecture.dot -o architecture.svg
+// Colour legend:  blue = existing component · green = added in this release
+//                 amber = data store · dashed grey = optional / external system
+digraph architecture {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=13, bgcolor="white",
+         nodesep=0.35, ranksep=0.55, compound=true, pad=0.3,
+         label=<<B>TFGen — system architecture (release 0.0.4)</B><BR/><FONT POINT-SIZE="10">Green = added in this release · Blue = existing · Amber = data · Dashed = optional or external</FONT>>, labelloc=t];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#1e40af", fillcolor="#dbeafe", margin="0.14,0.07"];
+  edge  [fontname="Helvetica", fontsize=8, color="#374151", arrowsize=0.7];
+
+  subgraph cluster_client {
+    label="Engineer"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1";
+    engineer [label="Engineer\n(browser)", shape=oval, fillcolor="#e0e7ff", color="#4338ca", tooltip="The person using TFGen"];
+  }
+
+  subgraph cluster_edge {
+    label="Edge"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1";
+    nginx [label="nginx :3000\nserves the SPA · proxies /api and /ws", tooltip="frontend/nginx.conf"];
+  }
+
+  subgraph cluster_frontend {
+    label="React SPA  (frontend/src)"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1";
+    spa_pages   [label="Pages\nLogin · Dashboard · Builder (Studio) · History · Team · Admin", tooltip="frontend/src/App.jsx, pages/*"];
+    spa_api     [label="api/client.js\nREST calls · useJobStream (WebSocket)", tooltip="frontend/src/api/client.js, hooks/useJobStream.js"];
+    spa_author  [label="Infrastructure authoring\nresource graph · ConfigPanel · templateEngine.js (HCL)", tooltip="frontend/src/components/ResourceGraph.jsx, engine/templateEngine.js"];
+    spa_learn   [label="Learning\nHCL explainer · scenario labs · interview practice", tooltip="components/HclExplainer.jsx, ScenarioLabs.jsx, InterviewPanel.jsx"];
+    spa_mod     [label="Module & PR tools (API ready, UI pending)", fillcolor="#dcfce7", color="#15803d", tooltip="Served by /api/modules and /api/github"];
+  }
+
+  subgraph cluster_api {
+    label="Express API  (backend/server.js)"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1";
+    mw [label="Cross-cutting middleware\nhelmet · CORS · rate limits · authMiddleware / requireRole\naudit log · request logger with correlation ID · metrics", tooltip="backend/server.js, middleware/*"];
+    r_auth [label="Auth & OAuth\n/api/auth · /api/auth/oauth", tooltip="routes/auth.js, routes/oauth.js"];
+    r_proj [label="Projects\nprojects · versions · members · change requests · notifications", tooltip="routes/projects.js, change-requests.js, notifications.js"];
+    r_tf   [label="Terraform\n/api/terraform: fmt · validate · plan · apply · scan · cost · jobs", tooltip="routes/terraform.js"];
+    r_aws  [label="AWS & IAM\n/api/aws (credentials) · /api/iam · /api/envconfig", tooltip="routes/aws.js, iam.js, envconfig.js"];
+    r_gov  [label="Governance & admin\n/api/policies (OPA) · /api/audit · /api/admin · /api/search", tooltip="routes/policies.js, audit.js, admin.js, search.js"];
+    r_learn[label="Authoring & learning aids\n/api/learn · hcl-explain · hcl-assist · diagram · templates · export", tooltip="routes/learn.js, hcl-explain.js, diagram.js, export.js"];
+    r_mod  [label="Modules  (NEW)\n/api/modules: analyze · review · autofix · docs\nregistry browser /api/registry", fillcolor="#dcfce7", color="#15803d", tooltip="routes/modules.js, routes/registry.js"];
+    r_gh   [label="GitHub  (NEW)\n/api/github: connection · repos · PR review · PR from project", fillcolor="#dcfce7", color="#15803d", tooltip="routes/github.js"];
+    ws     [label="WebSockets\n/ws/jobs (live job logs) · /ws/terraform-lsp", tooltip="backend/server.js upgrade handler"];
+  }
+
+  subgraph cluster_services {
+    label="Domain services"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1";
+    s_jobs  [label="terraformJobs + jobQueue\ndispatch fmt / validate / plan / apply · BullMQ worker", tooltip="services/terraformJobs.js, jobQueue.js"];
+    s_lsp   [label="terraformLsp\nlanguage-server sessions", tooltip="services/terraformLsp.js"];
+    s_static[label="Security rules  (REWRITTEN)\nhclScan → staticSecurityRules · checkov.js wrapper", fillcolor="#dcfce7", color="#15803d", tooltip="services/hclScan.js, staticSecurityRules.js, checkov.js"];
+    s_modan [label="Module analyzer  (NEW)\ninventory · dependency graph · cycles · issues · docs", fillcolor="#dcfce7", color="#15803d", tooltip="services/moduleAnalyzer.js"];
+    s_review[label="Code review  (NEW)\nverdict · safe autofix · PR diff line mapping", fillcolor="#dcfce7", color="#15803d", tooltip="services/codeReview.js"];
+    s_gh    [label="GitHub client + token store  (NEW)\nvalidated REST calls · AES-256-GCM token storage", fillcolor="#dcfce7", color="#15803d", tooltip="services/githubClient.js, githubStore.js"];
+    s_misc  [label="Cost (infracost) · policy (OPA) · notify / mailer / webhooks\nAWS architecture diagram generator (hclArchParser → SVG / draw.io)", tooltip="services/infracost.js, opaEval.js, notify.js, mailer.js, architectureSvg.js"];
+  }
+
+  subgraph cluster_exec {
+    label="Terraform execution"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1";
+    runner [label="terraform/runner.js\nauto: host binary if present, otherwise Docker sandbox", tooltip="terraform/runner.js"];
+    proxy  [label="docker-socket-proxy\nCONTAINERS · IMAGES · POST only; NETWORKS / VOLUMES / EXEC denied", tooltip="docker-compose.yml"];
+    sandbox[label="Ephemeral containers (--rm)\nterraform · checkov · infracost", tooltip="utils/dockerScratch.js"];
+  }
+
+  subgraph cluster_data {
+    label="Data"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1";
+    pg    [shape=cylinder, fillcolor="#fef3c7", color="#b45309", label="PostgreSQL\nusers · projects · resources · project_versions · execution_jobs\naudit_logs · change_requests · notifications · user_aws_credentials (encrypted)\ngithub_connections (NEW, encrypted)", tooltip="database/*.sql, 013_github_connections.sql"];
+    redis [shape=cylinder, fillcolor="#fef3c7", color="#b45309", label="Redis\nBullMQ queues · job events", tooltip="services/jobQueue.js"];
+  }
+
+  subgraph cluster_obs {
+    label="Observability  (optional add-ons)"; style="rounded,filled,dashed"; fillcolor="#fafafa"; color="#94a3b8";
+    prom  [label="Prometheus\nscrapes backend :9464 every 15 s", style="rounded,filled,dashed", color="#64748b", tooltip="observability/prometheus.yml"];
+    alerts[label="Alert rules  (NEW)\nerror rate · latency · job failures · queue depth", fillcolor="#dcfce7", color="#15803d", tooltip="observability/prometheus-alerts.yml"];
+    graf  [label="Grafana  (dashboard added)\nPrometheus datasource · golden-signals dashboard", fillcolor="#dcfce7", color="#15803d", tooltip="observability/grafana/"];
+    jaeger[label="Jaeger  (or Grafana Tempo)\ndistributed traces via OTLP", style="rounded,filled,dashed", color="#64748b", tooltip="docker-compose.observability.yml"];
+    elk   [label="ELK  (NEW, optional)\nFilebeat → Logstash → Elasticsearch → Kibana", fillcolor="#dcfce7", color="#15803d", tooltip="docker-compose.elk.yml, observability/elk/"];
+  }
+
+  subgraph cluster_ext {
+    label="External systems"; style="rounded,filled,dashed"; fillcolor="#fafafa"; color="#94a3b8";
+    aws   [label="AWS APIs (SDK)\nSTS identity · EC2", style="rounded,filled,dashed", color="#64748b", fillcolor="#f1f5f9", tooltip="routes/aws.js"];
+    gh    [label="GitHub REST API\nrepos · pulls · reviews · contents", style="rounded,filled,dashed", color="#64748b", fillcolor="#f1f5f9", tooltip="services/githubClient.js"];
+    oauth [label="Google / GitHub OAuth", style="rounded,filled,dashed", color="#64748b", fillcolor="#f1f5f9", tooltip="routes/oauth.js"];
+    hibp  [label="Have I Been Pwned\npassword check (fails open)", style="rounded,filled,dashed", color="#64748b", fillcolor="#f1f5f9", tooltip="utils/passwordPolicy.js"];
+    smtp  [label="SMTP", style="rounded,filled,dashed", color="#64748b", fillcolor="#f1f5f9", tooltip="services/mailer.js"];
+    tfreg [label="Terraform Registry", style="rounded,filled,dashed", color="#64748b", fillcolor="#f1f5f9", tooltip="routes/registry.js"];
+  }
+
+  // ── request path ────────────────────────────────────────────────────────────
+  engineer -> nginx [label="HTTPS"];
+  nginx -> spa_pages [label="static assets"];
+  spa_pages -> spa_api; spa_pages -> spa_author; spa_pages -> spa_learn; spa_pages -> spa_mod [style=dashed, color="#15803d"];
+  spa_api -> nginx [label="/api/*  /ws/*"];
+  nginx -> mw;
+  mw -> r_auth; mw -> r_proj; mw -> r_tf; mw -> r_aws; mw -> r_gov; mw -> r_learn;
+  mw -> r_mod [color="#15803d"]; mw -> r_gh [color="#15803d"];
+  nginx -> ws [label="upgrade"];
+
+  // ── execution ───────────────────────────────────────────────────────────────
+  r_tf -> s_jobs [label="enqueue / run"];
+  s_jobs -> runner;
+  runner -> proxy [label="docker run"];
+  proxy -> sandbox;
+  s_jobs -> s_static [label="block on CRITICAL"];
+  s_jobs -> s_misc [label="cost · policy"];
+  ws -> s_lsp; ws -> redis [label="job events"];
+  s_jobs -> redis [label="BullMQ"];
+  runner -> aws [label="apply with the user's saved credentials", style=dashed];
+
+  // ── modules and GitHub (new) ────────────────────────────────────────────────
+  r_mod -> s_modan [color="#15803d"];
+  r_mod -> s_review [color="#15803d"];
+  r_gh -> s_review [color="#15803d"];
+  r_gh -> s_gh [color="#15803d"];
+  s_review -> s_static [color="#15803d", label="rules"];
+  s_review -> s_modan [color="#15803d", label="module context"];
+  s_gh -> gh [label="HTTPS, token in Authorization header", color="#15803d"];
+  s_gh -> pg [label="encrypted token", color="#15803d"];
+
+  // ── data and identity ───────────────────────────────────────────────────────
+  r_proj -> pg; r_tf -> pg [label="execution_jobs"]; mw -> pg [label="audit_logs"];
+  r_auth -> pg; r_auth -> oauth; r_auth -> hibp [label="password check"];
+  r_aws -> aws; r_aws -> pg [label="encrypted credentials"];
+  s_misc -> smtp;
+  r_mod -> tfreg [style=dashed];
+
+  // ── observability ───────────────────────────────────────────────────────────
+  mw -> prom [label="metrics :9464\n(internal only)", style=dashed];
+  prom -> graf; prom -> alerts [style=dashed];
+  mw -> jaeger [label="OTLP (OTEL_ENABLED)", style=dashed];
+  mw -> elk [label="JSON logs via\ncontainer stdout", style=dashed];
+}

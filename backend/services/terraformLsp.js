@@ -3,7 +3,7 @@ const { spawn }        = require('child_process');
 const fs               = require('fs');
 const os               = require('os');
 const path             = require('path');
-const { v4: uuidv4 }  = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto'); // built-in; replaces ESM-only 'uuid' pkg
 const { pathToFileURL } = require('url');
 
 // ── Workspace base ────────────────────────────────────────────────────────────

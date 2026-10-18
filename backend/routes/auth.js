@@ -49,6 +49,9 @@ function constantTimeEqual(a, b) {
 router.post('/register', async (req, res) => {
   const { email, password, adminBootstrapToken } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  if (typeof email !== 'string' || email.length > 254) {
+    return res.status(400).json({ error: 'Email address is too long (maximum 254 characters)' });
+  }
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (password.length < PASSWORD_MIN_LENGTH) {
     return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters` });

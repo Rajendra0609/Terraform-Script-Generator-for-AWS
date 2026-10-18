@@ -9,19 +9,59 @@
  *   4. Server exchanges code → tokens → user info → issues TFGen JWT
  *   5. Redirect to frontend with access token in URL fragment
  *
- * Prerequisites (set in backend/.env):
+ * Prerequisites (set in backend/.env for bare-metal dev, or in the repo-root
+ * .env for docker-compose — see BUG-OAUTH-01 below for why these differ):
  *   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
  *   GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
- *   OAUTH_REDIRECT_BASE  — e.g. http://localhost:4000  (where backend lives)
+ *   OAUTH_REDIRECT_BASE  — the origin THE USER'S BROWSER can reach to land
+ *                          back on this route after the provider redirects.
+ *                          This is *not* always "where the backend lives":
+ *                            • Bare dev (backend run directly, no nginx):
+ *                              http://localhost:4000 — the backend's own
+ *                              address, since the browser talks to it
+ *                              directly.
+ *                            • docker-compose (nginx fronts everything on
+ *                              FRONTEND_PORT, backend's port 4000 is
+ *                              intentionally NOT published to the host):
+ *                              http://localhost:<FRONTEND_PORT> — nginx's
+ *                              published origin, which proxies /api/* to
+ *                              this backend. Using :4000 here will look
+ *                              fine until the provider redirects the
+ *                              browser straight at a port nothing on the
+ *                              host is listening on.
  *   FRONTEND_URL         — e.g. http://localhost:3000  (where frontend lives)
  *
  * To register your app:
  *   Google:  https://console.cloud.google.com/apis/credentials
  *   GitHub:  https://github.com/settings/developers
  *
- * Set the callback URIs:
+ * Set the callback URIs (must match OAUTH_REDIRECT_BASE exactly, including
+ * port — Google/GitHub do an exact string match):
  *   Google callback: {OAUTH_REDIRECT_BASE}/api/auth/oauth/google/callback
  *   GitHub callback: {OAUTH_REDIRECT_BASE}/api/auth/oauth/github/callback
+ * Google Cloud Console also has a separate "Authorized JavaScript origins"
+ * field on the same credential — set that to FRONTEND_URL (the page the
+ * button is clicked from), not OAUTH_REDIRECT_BASE.
+ *
+ * BUG-OAUTH-01 (found in production audit, fixed here) — "sign-in redirect
+ * is blocked": OAUTH_REDIRECT_BASE defaulted to http://localhost:4000
+ * everywhere, including the docker-compose deployment where that port is
+ * deliberately not published to the host (see docker-compose.yml's backend
+ * service — only nginx's port is). Google/GitHub would redirect the browser
+ * straight at localhost:4000 after consent and the browser could not reach
+ * it (ERR_CONNECTION_REFUSED), or — if the client only registered nginx's
+ * origin with the provider — the provider would reject with
+ * redirect_uri_mismatch before consent was even shown. Root-caused by
+ * running this backend directly against a real Google/GitHub app and
+ * observing the redirect_uri the server actually sent (see the startup log
+ * line below). Fixed by: (1) docker-compose.yml now passes an explicit
+ * OAUTH_REDIRECT_BASE that defaults to the nginx-published origin instead
+ * of relying on this file's bare-dev-oriented fallback, (2) the root
+ * .env.example now documents these vars at all (they were previously only
+ * in backend/.env.example, which docker-compose never reads), and (3) the
+ * startup log below prints the exact callback URLs this process will send,
+ * so a mismatch against the provider console is visible immediately instead
+ * of only surfacing when a real user clicks the button.
  *
  * ── Round-3 security audit fixes applied in this file ─────────────────────
  *   C-11 — OAuth signup no longer ever auto-grants admin (that path now
@@ -338,6 +378,46 @@ router.get('/google/callback', async (req, res) => {
 const GITHUB_CLIENT_ID     = process.env.GITHUB_CLIENT_ID;
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
 const GITHUB_REDIRECT_URI  = `${OAUTH_REDIRECT_BASE}/api/auth/oauth/github/callback`;
+
+// BUG-OAUTH-01 fix: print the exact callback URLs this process will send to
+// each provider at startup, and flag the specific misconfiguration that
+// causes "the sign-in redirect is blocked" — OAUTH_REDIRECT_BASE pointing at
+// a port other than FRONTEND_URL's while running behind a reverse proxy
+// (nginx/docker-compose), which the provider will happily redirect the
+// browser to even though nothing on the host is listening there. This is
+// deliberately a plain console.log/warn (not the winston logger) so it is
+// impossible to miss in `docker compose logs backend` on first boot, before
+// anyone has gone looking for an OAuth-specific problem.
+(function logOAuthRedirectConfig() {
+  const configured = [];
+  if (GOOGLE_CLIENT_ID) configured.push(['Google', GOOGLE_REDIRECT_URI]);
+  if (GITHUB_CLIENT_ID) configured.push(['GitHub', GITHUB_REDIRECT_URI]);
+
+  if (configured.length === 0) {
+    console.log('[oauth] Google and GitHub OAuth are both unconfigured (no *_CLIENT_ID set) — the buttons will return 501 until credentials are set.');
+    return;
+  }
+
+  console.log('[oauth] OAUTH_REDIRECT_BASE =', OAUTH_REDIRECT_BASE);
+  for (const [name, uri] of configured) {
+    console.log(`[oauth] ${name} callback URL (register this EXACTLY in the ${name} console): ${uri}`);
+  }
+
+  try {
+    const redirectPort  = new URL(OAUTH_REDIRECT_BASE).port || '80/443';
+    const frontendPort  = new URL(FRONTEND_URL).port || '80/443';
+    if (redirectPort !== frontendPort) {
+      console.warn(
+        `[oauth] WARNING: OAUTH_REDIRECT_BASE (port ${redirectPort}) does not match FRONTEND_URL (port ${frontendPort}). ` +
+        'If this backend sits behind nginx/a reverse proxy and only the frontend/proxy port is published to the host ' +
+        '(the shipped docker-compose.yml no longer publishes the backend port directly — see SECURITY FIX C-10), the ' +
+        "provider will redirect the browser to a port it cannot reach and sign-in will appear to hang or be \"blocked\". " +
+        'OAUTH_REDIRECT_BASE should normally match FRONTEND_URL\'s origin in that topology; it should only point at the ' +
+        "backend's own port when the backend is reachable directly (bare dev, no proxy in front)."
+      );
+    }
+  } catch (_) { /* malformed URL — auth.js/server.js startup checks already validate these */ }
+})();
 
 router.get('/github', async (req, res) => {
   if (!GITHUB_CLIENT_ID) {

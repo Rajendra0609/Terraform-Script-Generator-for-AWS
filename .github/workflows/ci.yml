@@ -1,0 +1,186 @@
+# Continuous integration for TFGen.
+#
+# Jobs:
+#   backend-tests          unit, API and integration suites against Postgres 16 and Redis 7
+#   frontend-build         production build with CI=true (warnings fail the build)
+#   terraform-checks       terraform fmt/validate and the TFGen automated review gate
+#   security               npm audit (production dependencies, critical only) and Checkov
+#   docs-and-observability diagrams render; Prometheus and Grafana configs validate
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend — unit, API and integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tfgen_test
+      TEST_ADMIN_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      TEST_REDIS_URL: redis://localhost:6379
+      TEST_PORT: '4099'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            tests/package-lock.json
+
+      - name: Syntax-check every backend file
+        run: find backend -name '*.js' -not -path '*/node_modules/*' -print0 | xargs -0 -n1 node --check
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Install test dependencies
+        working-directory: tests
+        run: npm ci
+
+      - name: Create the test database
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -c 'CREATE DATABASE tfgen_test;'
+
+      - name: Unit tests
+        working-directory: tests
+        run: npx jest --config jest.unit.config.js --forceExit
+
+      - name: API tests
+        working-directory: tests
+        run: npx jest --config jest.api.config.js --forceExit --runInBand
+
+      - name: Integration tests
+        working-directory: tests
+        run: npx jest --config jest.integration.config.js --forceExit --runInBand
+
+      - name: Upload JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-reports
+          path: tests/reports/junit-results.xml
+          if-no-files-found: ignore
+
+  frontend-build:
+    name: Frontend — production build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+      - name: Build (CI=true turns lint warnings into failures)
+        working-directory: frontend
+        env:
+          CI: 'true'
+        run: npm run build
+
+  terraform-checks:
+    name: Terraform — format, validate and automated review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+      - name: Format check
+        run: terraform fmt -check -recursive terraform
+      - name: Validate (no remote backend)
+        working-directory: terraform/oidc_federation
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: TFGen automated review (fails on high or critical findings)
+        run: node scripts/terraform-review.js terraform --fail-on high
+
+  security:
+    name: Security — dependency audit and IaC scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: "Production dependencies: fail on critical advisories"
+        working-directory: backend
+        run: |
+          npm ci --omit=dev
+          npm audit --omit=dev --audit-level=critical
+      - name: Checkov (report-only until the baseline is triaged)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: true
+
+  docs-and-observability:
+    name: Docs — diagrams render; observability configs validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Graphviz and Prometheus tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq graphviz prometheus
+      - name: Render architecture and flow diagrams
+        run: |
+          for f in docs/architecture/*.dot; do
+            dot -Tsvg "$f" -o "/tmp/$(basename "$f" .dot).svg"
+          done
+      - name: Prometheus configuration and alert rules
+        working-directory: observability
+        run: |
+          promtool check config prometheus.yml
+          promtool check rules prometheus-alerts.yml
+      - name: YAML and JSON parse
+        run: |
+          python3 -c "import sys, yaml; [yaml.safe_load(open(f)) for f in sys.argv[1:]]" \
+            docker-compose.yml docker-compose.observability.yml docker-compose.elk.yml \
+            observability/elk/filebeat.yml observability/prometheus.yml .github/workflows/ci.yml
+          python3 -m json.tool observability/grafana/dashboards/tfgen-golden-signals.json > /dev/null

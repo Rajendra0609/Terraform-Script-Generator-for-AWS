@@ -1,0 +1,70 @@
+# Optional observability stack: Prometheus (metrics) + Jaeger (distributed
+# tracing) + Grafana (dashboards over both). Nothing in this file is
+# required to run the app — see docker-compose.yml for that. Bring this up
+# ALONGSIDE the base file (both -f flags on the same command merge into one
+# project, so these services automatically join the same default network
+# and can reach the backend, and vice versa — no networks: section needed):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# Then set OTEL_ENABLED=true in your .env (see .env.example) and restart the
+# backend so it actually starts exporting traces — metrics and logs need no
+# flag, they always run (see backend/observability/metrics.js).
+#
+#   Prometheus UI : http://localhost:9090
+#   Jaeger UI     : http://localhost:16686
+#   Grafana UI    : http://localhost:3001  (default login admin / admin — you
+#                   will be prompted to change it on first login; this is
+#                   Grafana's own default and is not set by this file)
+#
+# This is a single-binary Jaeger ("all-in-one") suitable for local dev/demo
+# use — it stores traces in memory and loses them on restart. A real
+# production Jaeger deployment uses separate collector/query components
+# backed by persistent storage (Elasticsearch/Cassandra/etc.); swap the
+# image/config below for that when you outgrow this.
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: tfgen-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      # OTLP ports are intentionally NOT published to the host — the
+      # backend reaches this over the internal compose network at
+      # jaeger:4317/4318, matching the rest of this app's "don't publish
+      # ports nothing outside the compose network needs" convention (see
+      # docker-compose.yml's C-10 fix).
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: tfgen-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus-alerts.yml:/etc/prometheus/prometheus-alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: tfgen-grafana
+    restart: unless-stopped
+    volumes:
+      - ./observability/grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./observability/grafana/provisioning/dashboards/tfgen.yml:/etc/grafana/provisioning/dashboards/tfgen.yml:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:

@@ -19,7 +19,9 @@ jest.mock('child_process', () => ({
 }));
 
 // Stub isDockerAvailable → always false so static rules run
-jest.mock(path.join(__dirname, '../../../backend/utils/dockerAvailable'), () => ({
+// Jest hoists jest.mock() above require(), so the path must be a literal here
+// (referencing the `path` variable threw "Cannot access 'path' before initialization").
+jest.mock('../../../backend/utils/dockerAvailable', () => ({
   isDockerAvailable: jest.fn().mockResolvedValue(false),
 }));
 

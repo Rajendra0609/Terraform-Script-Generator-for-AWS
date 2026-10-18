@@ -1,0 +1,82 @@
+# Optional ELK stack for TFGen backend logs:
+#   Filebeat  →  Logstash  →  Elasticsearch  →  Kibana
+#
+# Use it together with the base file (both -f flags merge into one project, so
+# these services share the base network and can reach docker-socket-proxy):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.elk.yml up -d
+#
+# Kibana: http://localhost:5601  (bound to 127.0.0.1 only)
+# Search for a request by its correlationId, which the API also returns to the
+# client in the X-Correlation-Id header and in every error body.
+#
+# ─── DEVELOPMENT ONLY AS WRITTEN ────────────────────────────────────────────────
+# Elasticsearch security is disabled, so anyone who can reach port 9200 on the
+# compose network can read or delete logs. Logs can contain user IDs, IP
+# addresses and request paths. Before any shared or production use:
+#   1. enable xpack.security in Elasticsearch,
+#   2. create service accounts for Logstash, Kibana and Filebeat,
+#   3. move those credentials into the pipeline and Kibana configuration,
+#   4. apply the index lifecycle policy you need (retention).
+# Sizing: Elasticsearch is set to 1 GB heap. Allow roughly 3 GB of RAM in total.
+# ────────────────────────────────────────────────────────────────────────────────
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: tfgen-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"   # see the warning above
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    # No host port: reachable only on the compose network.
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.3
+    container_name: tfgen-logstash
+    restart: unless-stopped
+    environment:
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - ./observability/elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+    depends_on:
+      - elasticsearch
+    # Beats input on 5044 is internal to the compose network only.
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: tfgen-kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      - elasticsearch
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.3
+    container_name: tfgen-filebeat
+    restart: unless-stopped
+    user: root              # needs read access to the Docker container log files
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      - ./observability/elk/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - logstash
+
+volumes:
+  elasticsearch_data:

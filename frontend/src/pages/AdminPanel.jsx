@@ -61,7 +61,7 @@ const ROLE_COLORS = { admin: 'red', deployer: 'purple', editor: 'blue', user: 'g
 // ─── Main AdminPanel ──────────────────────────────────────────────────────────
 export default function AdminPanel() {
   const { user } = useAuth();
-  const { c }    = useTheme();
+  useTheme();
   const nav      = useNavigate();
   const [tab, setTab] = useState('metrics');
 
@@ -128,7 +128,7 @@ function MetricsTab() {
   if (loading) return <p style={{ color: '#9CA3AF', fontSize: 13 }}>Loading metrics…</p>;
   if (!data)   return <p style={{ color: '#EF4444', fontSize: 13 }}>Failed to load metrics</p>;
 
-  const { users, projects, resources, execution, audit_24h, policies, change_requests, top_services, daily_activity } = data;
+  const { users, projects, resources, execution, audit_24h, policies, change_requests, top_services } = data;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>

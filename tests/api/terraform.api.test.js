@@ -58,25 +58,25 @@ describe('Terraform API — /api/terraform', () => {
   // ─── /fmt ──────────────────────────────────────────────────────────────────
   describe('POST /terraform/fmt', () => {
     test('200 returns formatted HCL for valid input', async () => {
-      const res = await post('/terraform/fmt', { hcl: VALID_HCL });
+      const res = await post('/terraform/fmt', { hcl: VALID_HCL }, token);
       expect([200, 201]).toContain(res.status);
       expect(res.data.formatted || res.data.hcl || res.data).toBeDefined();
     });
 
     test('400 when hcl field is missing', async () => {
-      const res = await post('/terraform/fmt', {});
+      const res = await post('/terraform/fmt', {}, token);
       expect(res.status).toBe(400);
     });
 
     test('400 when HCL contains a detected secret', async () => {
-      const res = await post('/terraform/fmt', { hcl: HCL_WITH_SECRET });
+      const res = await post('/terraform/fmt', { hcl: HCL_WITH_SECRET }, token);
       expect(res.status).toBe(400);
       expect(res.data.error).toMatch(/secret/i);
     });
 
     test('413 when HCL payload exceeds 1 MB', async () => {
       const bigHcl = 'x'.repeat(1_100_000);
-      const res    = await post('/terraform/fmt', { hcl: bigHcl });
+      const res    = await post('/terraform/fmt', { hcl: bigHcl }, token);
       expect(res.status).toBe(413);
     });
   });
@@ -84,19 +84,20 @@ describe('Terraform API — /api/terraform', () => {
   // ─── /validate ─────────────────────────────────────────────────────────────
   describe('POST /terraform/validate', () => {
     test('200 or 422 validates syntactically correct HCL', async () => {
-      const res = await post('/terraform/validate', { hcl: VALID_HCL });
+      const res = await post('/terraform/validate', { hcl: VALID_HCL }, token);
       // 200 = valid, 422 = invalid with details — both are acceptable shaped responses
-      expect([200, 422]).toContain(res.status);
+      // 202 = queued as a background job (Redis available); 200/422 = synchronous path
+      expect([200, 202, 422]).toContain(res.status);
       expect(res.data).toBeDefined();
     });
 
     test('400 for missing hcl body', async () => {
-      const res = await post('/terraform/validate', {});
+      const res = await post('/terraform/validate', {}, token);
       expect(res.status).toBe(400);
     });
 
     test('400 when HCL contains a literal secret', async () => {
-      const res = await post('/terraform/validate', { hcl: HCL_WITH_SECRET });
+      const res = await post('/terraform/validate', { hcl: HCL_WITH_SECRET }, token);
       expect(res.status).toBe(400);
     });
   });
@@ -115,18 +116,18 @@ describe('Terraform API — /api/terraform', () => {
   // ─── /checkov ──────────────────────────────────────────────────────────────
   describe('POST /terraform/checkov', () => {
     test('200 with findings array for HCL with security issues', async () => {
-      const res = await post('/terraform/checkov', { hcl: HCL_WITH_SECURITY_ISSUES }, token);
+      const res = await post('/terraform/scan', { hcl: HCL_WITH_SECURITY_ISSUES }, token);
       expect([200, 201]).toContain(res.status);
-      expect(Array.isArray(res.data.findings || res.data)).toBe(true);
+      expect(Array.isArray(res.data.checkov?.findings)).toBe(true);
     });
 
     test('returns no critical findings for clean VPC HCL', async () => {
-      const res = await post('/terraform/checkov', { hcl: VALID_HCL }, token);
+      const res = await post('/terraform/scan', { hcl: VALID_HCL }, token);
       expect([200, 201]).toContain(res.status);
     });
 
     test('401 when unauthenticated (if auth required)', async () => {
-      const res = await post('/terraform/checkov', { hcl: VALID_HCL });
+      const res = await post('/terraform/scan', { hcl: VALID_HCL });
       // Some deployments allow anonymous checkov; accept 200 or 401
       expect([200, 401]).toContain(res.status);
     });
@@ -135,7 +136,7 @@ describe('Terraform API — /api/terraform', () => {
   // ─── /infracost ────────────────────────────────────────────────────────────
   describe('POST /terraform/infracost', () => {
     test('200 or 503 (if infracost not installed) with cost data', async () => {
-      const res = await post('/terraform/infracost', { hcl: VALID_HCL }, token);
+      const res = await post('/terraform/cost', { hcl: VALID_HCL }, token);
       // 200 = estimate returned, 503 = infracost CLI unavailable (acceptable in CI)
       expect([200, 503]).toContain(res.status);
     });

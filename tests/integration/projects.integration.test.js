@@ -42,8 +42,9 @@ describe('Projects Integration — /api/projects', () => {
     test('200 returns an array including the created project', async () => {
       const res = await get('/projects', token);
       expect(res.status).toBe(200);
-      expect(Array.isArray(res.data)).toBe(true);
-      expect(res.data.some(p => p.id === projectId)).toBe(true);
+      expect(Array.isArray(res.data.projects)).toBe(true);
+      expect(res.data.total).toBeGreaterThanOrEqual(1);
+      expect(res.data.projects.some(p => p.id === projectId)).toBe(true);
     });
 
     test('401 when unauthenticated', async () => {
@@ -84,23 +85,27 @@ describe('Projects Integration — /api/projects', () => {
   // ─── Resources sub-route ──────────────────────────────────────────────────────
   describe('POST /projects/:id/resources', () => {
     test('creates a resource block inside the project', async () => {
+      const hcl = 'resource "aws_s3_bucket" "test_bucket" {\n  bucket = "my-test-bucket-xyz"\n}\n';
       const res = await post(`/projects/${projectId}/resources`, {
-        type:   'aws_s3_bucket',
-        name:   'test_bucket',
-        config: { bucket: 'my-test-bucket-xyz', tags: { Env: 'test' } },
+        resources: [{
+          service_type: 's3',
+          label:        'test_bucket',
+          config:       { bucket: 'my-test-bucket-xyz', tags: { Env: 'test' } },
+          hcl_output:   hcl,
+        }],
+        full_hcl: hcl,
       }, token);
       expect([200, 201]).toContain(res.status);
     });
   });
 
   // ─── HCL generation ───────────────────────────────────────────────────────────
-  describe('GET /projects/:id/hcl', () => {
-    test('returns generated HCL string', async () => {
-      const res = await get(`/projects/${projectId}/hcl`, token);
+  describe('GET /projects/:id (saved HCL)', () => {
+    test('returns the HCL that was saved with the resources', async () => {
+      const res = await get(`/projects/${projectId}`, token);
       expect(res.status).toBe(200);
-      // HCL should contain terraform or resource blocks
-      const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-      expect(body).toMatch(/terraform|resource/i);
+      expect(res.data.last_hcl).toMatch(/resource "aws_s3_bucket" "test_bucket"/);
+      expect(Array.isArray(res.data.resources)).toBe(true);
     });
   });
 

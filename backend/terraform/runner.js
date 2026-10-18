@@ -19,7 +19,7 @@ const { exec, spawn } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto'); // built-in; replaces ESM-only 'uuid' pkg
 const { SCRATCH_MOUNT, SCRATCH_VOLUME_ARGS, ensureScratchDir } = require('../utils/dockerScratch');
 const { writeEnvFile } = require('../utils/dockerEnvFile');
 

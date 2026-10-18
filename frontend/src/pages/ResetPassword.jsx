@@ -3,7 +3,6 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import API from '../api/client';
 
 const PASSWORD_MIN = 8;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // ── Tiny spinner (matches Login.jsx style) ────────────────────────────────────
 function Spinner() {

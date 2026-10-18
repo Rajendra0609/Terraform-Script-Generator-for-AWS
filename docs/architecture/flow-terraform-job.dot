@@ -1,0 +1,60 @@
+// Plan / apply job flow — how a Terraform operation travels through TFGen.
+// Render: dot -Tsvg flow-terraform-job.dot -o flow-terraform-job.svg
+// Red dashed edges are error or refusal paths; every refusal is audited.
+digraph terraform_job {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=13, bgcolor="white", nodesep=0.3, ranksep=0.45, pad=0.3,
+         label=<<B>Terraform plan / apply — request to result</B><BR/><FONT POINT-SIZE="10">Apply additionally requires saved AWS credentials; the worker decrypts them, never the browser.</FONT>>, labelloc=t];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#1e40af", fillcolor="#dbeafe", margin="0.14,0.07"];
+  edge [fontname="Helvetica", fontsize=8, color="#374151", arrowsize=0.7];
+
+  start   [shape=oval, fillcolor="#e0e7ff", color="#4338ca", label="Builder UI\nPOST /api/terraform/plan | /apply\n{ hcl, project_id, mode }"];
+  auth    [label="authMiddleware\nJWT verified", tooltip="middleware/auth.js"];
+  rl      [label="terraformComputeLimiter\nrate limit per user", tooltip="routes/terraform.js"];
+  acl     [label="authoriseProjectById\nplan: viewer+ · apply: deployer / admin", tooltip="utils/projectAccess.js"];
+  e401    [label="401 Unauthorised", fillcolor="#fee2e2", color="#b91c1c", tooltip="Token missing or expired"];
+  e429    [label="429 Too many requests", fillcolor="#fee2e2", color="#b91c1c"];
+  e403    [label="403 / 404\nno access to project", fillcolor="#fee2e2", color="#b91c1c"];
+  hclchk  [label="Input checks\nsize ≤ 1 MB · literal-secret detection (400)", tooltip="utils/sanitize.js, services/checkov.js"];
+  e400    [label="400 / 413\nliteral secret or payload too large", fillcolor="#fee2e2", color="#b91c1c"];
+  creds   [label="Apply only:\nsaved AWS credentials exist?", tooltip="utils/awsCrypto.js hasAwsCredentials()"];
+  e409    [label="422 NO_CREDENTIALS", fillcolor="#fee2e2", color="#b91c1c"];
+  job     [label="execution_jobs row created\nstatus = queued", shape=cylinder, fillcolor="#fef3c7", color="#b45309", tooltip="routes/terraform.js createExecutionJobRow"];
+  redis   [label="Redis available?", shape=diamond, fillcolor="#f1f5f9", color="#475569", fontsize=9];
+  enq     [label="BullMQ enqueue\n202 Accepted + jobId", tooltip="services/jobQueue.js"];
+  sync    [label="Synchronous fallback\n200 with result", tooltip="services/terraformJobs.js"];
+  worker  [label="Worker: dispatch(job)\nfmt → validate → plan → (apply)", tooltip="services/terraformJobs.js"];
+  runner  [label="runner.js\nhost terraform if present, else Docker sandbox", tooltip="terraform/runner.js"];
+  plan    [label="terraform plan\nresult parsed into add / change / destroy"];
+  checkov [label="Security scan (Checkov or static rules)\nCRITICAL findings?", shape=diamond, fillcolor="#f1f5f9", color="#475569", fontsize=9, tooltip="services/staticSecurityRules.js"];
+  blocked [label="BLOCKED\nblocked_by = checkov\nproject members notified", fillcolor="#fee2e2", color="#b91c1c"];
+  appr    [label="Approval gate\nNOT enforced in this release\n(see IMPLEMENTATION_PLAN.md)", fillcolor="#fef9c3", color="#a16207", style="rounded,filled,dashed", tooltip="Change requests exist but apply does not check them"];
+  apply   [label="terraform apply\nwith the user's credentials (decrypted in worker)"];
+  fail    [label="Job status = failed\nerror and summaries stored on the job row", fillcolor="#fee2e2", color="#b91c1c"];
+  done    [label="Job status = succeeded\nplan + Checkov summaries stored · metrics · audit row", shape=box];
+  stream  [label="WebSocket /ws/jobs?id=…\nlive log lines to job owner or members", tooltip="server.js: job access check before subscribe"];
+  poll    [label="GET /api/terraform/jobs/:jobId\npoll fallback"];
+
+  start -> auth -> rl -> acl;
+  auth -> e401 [style=dashed, color="#b91c1c"];
+  rl -> e429 [style=dashed, color="#b91c1c"];
+  acl -> e403 [style=dashed, color="#b91c1c"];
+  acl -> hclchk;
+  hclchk -> e400 [style=dashed, color="#b91c1c", label="no"];
+  hclchk -> creds [label="ok"];
+  creds -> e409 [style=dashed, color="#b91c1c", label="no (apply)"];
+  creds -> job [label="plan: no credentials needed"];
+  creds -> job [label="apply: yes"];
+  job -> redis;
+  redis -> enq [label="yes"];
+  redis -> sync [label="no"];
+  enq -> worker; sync -> worker;
+  worker -> runner -> plan -> checkov;
+  checkov -> blocked [label="yes", style=dashed, color="#b91c1c"];
+  checkov -> appr [label="no, apply"];
+  checkov -> done [label="no, plan"];
+  appr -> apply -> done;
+  apply -> fail [style=dashed, color="#b91c1c", label="error"];
+  plan -> fail [style=dashed, color="#b91c1c", label="error"];
+  done -> stream [style=dashed]; enq -> stream [style=dashed, label="subscribe"];
+  done -> poll [style=dotted];
+}

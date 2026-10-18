@@ -53,7 +53,22 @@ function EyeIcon({ open }) {
 function OAuthButton({ href, icon, label, bg, border, color, disabled }) {
   return (
     <a
-      href={disabled ? undefined : href}
+      // A11Y FIX: this used to set href={undefined} while disabled, which
+      // eslint-plugin-jsx-a11y (and CRA's own `npm run build` — this file
+      // fails a strict CI build over exactly this) flags for good reason:
+      // an <a> with no href isn't part of the tab order and isn't announced
+      // as a link, so a keyboard/screen-reader user tabbing through the
+      // page during login submission (disabled={loading} — a normal,
+      // frequent state, not a rare edge case) would lose track of these
+      // buttons entirely rather than perceiving them as temporarily
+      // disabled. <a> has no native `disabled` attribute, so this follows
+      // the standard WAI-ARIA pattern for a disabled link instead: keep a
+      // real href (still perceivable/focusable), mark it aria-disabled,
+      // drop it from the tab order, and swallow the click.
+      href={href}
+      aria-disabled={disabled}
+      tabIndex={disabled ? -1 : undefined}
+      onClick={e => { if (disabled) e.preventDefault(); }}
       style={{
         display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
         padding: '11px 16px', borderRadius: 10, border: `1px solid ${border}`,

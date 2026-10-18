@@ -1,0 +1,57 @@
+// GitHub integration: connecting an account, reviewing a pull request, and opening a PR from a project.
+// Render: dot -Tsvg flow-github-review.dot -o flow-github-review.svg
+digraph github_flow {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=13, bgcolor="white", nodesep=0.3, ranksep=0.42, pad=0.3,
+         label=<<B>GitHub integration — connect · review a pull request · open a PR from a project</B><BR/><FONT POINT-SIZE="10">Nothing is posted to GitHub unless the caller sets post: true. The token never leaves the server.</FONT>>, labelloc=t];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#15803d", fillcolor="#dcfce7", margin="0.14,0.07"];
+  edge [fontname="Helvetica", fontsize=8, color="#374151", arrowsize=0.7];
+
+  subgraph cluster_connect {
+    label="1 · Connect"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1"; fontsize=11;
+    put   [shape=oval, fillcolor="#e0e7ff", color="#4338ca", label="PUT /api/github/connection\n{ token }"];
+    val   [label="GET https://api.github.com/user\nwith the token", tooltip="services/githubClient.js getViewer"];
+    bad   [label="401 Bad credentials\nnothing stored", fillcolor="#fee2e2", color="#b91c1c"];
+    store [label="AES-256-GCM encrypt (ENCRYPT_KEY)\nupsert github_connections", shape=cylinder, fillcolor="#fef3c7", color="#b45309", tooltip="services/githubStore.js"];
+    put -> val; val -> bad [style=dashed, color="#b91c1c", label="invalid"]; val -> store [label="valid"];
+  }
+
+  subgraph cluster_review {
+    label="2 · Review a pull request"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1"; fontsize=11;
+    post  [shape=oval, fillcolor="#e0e7ff", color="#4338ca", label="POST /api/github/repos/:owner/:repo/pulls/:n/review\n{ post?: boolean } — default dry run"];
+    conn  [label="Connection exists?", shape=diamond, fontsize=9, fillcolor="#f1f5f9", color="#475569"];
+    e409  [label="409 GITHUB_NOT_CONNECTED", fillcolor="#fee2e2", color="#b91c1c"];
+    names [label="Validate owner · repo · branch · path\n400 on anything unsafe", tooltip="services/githubClient.js validators"];
+    pr    [label="GET pulls/:n → head SHA\nGET pulls/:n/files (≤ 300)"];
+    tf    [label="Keep changed .tf / .tfvars files\n(drop removed files)"];
+    dirs  [label="For each changed directory:\nGET contents/<dir>?ref=<head SHA>\nthen raw file contents (≤ 150 files, ≤ 512 KB)", tooltip="Reads the whole module so cross-file rules see siblings"];
+    rev   [label="reviewFiles()\nstatic rules per directory + module analyzer\nfindings kept only for changed files", tooltip="services/codeReview.js"];
+    map   [label="buildPullRequestReview()\ncommentable lines from the patch → inline comments\nother findings → review body"];
+    dry   [label="Dry run (default)\nreturn report, markdown and payload", fillcolor="#f1f5f9", color="#475569"];
+    send  [label="post: true\nPOST pulls/:n/reviews\nevent = REQUEST_CHANGES or COMMENT\ncommit_id = head SHA"];
+    post -> conn; conn -> e409 [style=dashed, color="#b91c1c", label="no"]; conn -> names [label="yes"];
+    names -> pr -> tf -> dirs -> rev -> map;
+    map -> dry [label="dry run"]; map -> send [label="post: true"];
+  }
+
+  subgraph cluster_pr {
+    label="3 · Open a PR from a project"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1"; fontsize=11;
+    ppost [shape=oval, fillcolor="#e0e7ff", color="#4338ca", label="POST /api/github/projects/:id/pull-request\n{ owner, repo, branch, path?, baseBranch? }"];
+    role  [label="Role editor / deployer / admin?", shape=diamond, fontsize=9, fillcolor="#f1f5f9", color="#475569"];
+    e403  [label="403 / 404 from project access", fillcolor="#fee2e2", color="#b91c1c"];
+    hcl   [label="Load projects.last_hcl\n409 if empty · 413 if over 512 KB"];
+    brch  [label="Base branch exists?\nTarget branch must NOT exist (409)"];
+    rv2   [label="reviewFiles(generated HCL)\nsummary goes into the PR body"];
+    commit[label="Create branch from base SHA\nPUT contents on the new branch"];
+    open  [label="POST pulls → 201\nPR URL returned"];
+    ppost -> role; role -> e403 [style=dashed, color="#b91c1c", label="no"]; role -> hcl [label="yes"];
+    hcl -> brch -> rv2 -> commit -> open;
+  }
+
+  subgraph cluster_errors {
+    label="Errors mapped from GitHub"; style="rounded,filled,dashed"; fillcolor="#fff7ed"; color="#fdba74"; fontsize=11;
+    e429 [label="429 rate limit\nresetAt included", fillcolor="#fee2e2", color="#b91c1c"];
+    e504 [label="504 timeout (15 s)\nnetwork error", fillcolor="#fee2e2", color="#b91c1c"];
+    e502 [label="502 unexpected upstream status\ntoken scrubbed from messages", fillcolor="#fee2e2", color="#b91c1c"];
+  }
+  pr -> e429 [style=dotted, color="#b91c1c"]; val -> e504 [style=dotted, color="#b91c1c"]; send -> e502 [style=dotted, color="#b91c1c"];
+}

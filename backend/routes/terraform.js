@@ -393,6 +393,19 @@ router.post('/apply', authMiddleware, audit('terraform.apply'), async (req, res)
   const project = await authoriseProjectById(req, res, projectId, ['deployer', 'admin']);
   if (!project) return; // authoriseProjectById already sent 403/404
 
+  // Approval gate (opt-in, APPLY_REQUIRES_APPROVAL=true). Runs before the
+  // credential lookup so a refused apply never touches stored credentials.
+  {
+    const { checkApplyApproval } = require('../services/applyApproval');
+    const approval = await checkApplyApproval({
+      projectId,
+      changeRequestId: req.body.change_request_id,
+      applierId: req.user.id,
+      hcl,
+    });
+    if (!approval.ok) return res.status(approval.status).json({ error: approval.error, code: approval.code });
+  }
+
   // Credential check — must have saved real AWS credentials.
   // SECURITY FIX (critical — C-06): this used to call
   // getDecryptedAwsCredentials() here and stash the plaintext result in

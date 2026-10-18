@@ -48,6 +48,10 @@ const COMMON_PASSWORDS = new Set([
  * message string to show the user.
  */
 function checkPasswordComplexity(password) {
+  // A password made only of whitespace is technically 8+ characters but protects nothing.
+  if (!password || password.trim().length === 0) {
+    return 'Password cannot be only whitespace.';
+  }
   if (/^\d+$/.test(password)) {
     return 'Password cannot be all numbers.';
   }
